@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DSH 浏览器</title>
+  <style>
+    *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;font:13px system-ui,sans-serif;color:#292a30;background:#fafafa}
+    body{display:flex;flex-direction:column}button,input{font:inherit;color:inherit}button{border:0;border-radius:7px;background:transparent;min-width:30px;height:30px;cursor:pointer}button:hover{background:#e9e9ed}button:disabled{opacity:.35;cursor:default}button:focus-visible,input:focus-visible{outline:2px solid #8171cc;outline-offset:1px}
+    #tabs{display:flex;flex:none;gap:3px;padding:5px 6px;border-bottom:1px solid #e3e3e8;overflow-x:auto}#tabs:empty{display:none}.tab{display:flex;align-items:center;min-width:90px;max-width:180px;border-radius:7px}.tab.active{background:#ede9f6}.tab .select{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;text-align:left}.tab .close{flex:none;min-width:24px;width:24px}
+    #toolbar{display:flex;flex:none;align-items:center;gap:3px;padding:6px;border-bottom:1px solid #e3e3e8}#address{min-width:0;flex:1;border:1px solid #dedee5;border-radius:8px;height:32px;background:#fff;padding:0 9px}#open{padding:0 8px;background:#ebe6f6;color:#574d85}
+    #message{flex:none;padding:7px 10px;color:#ad3f38;background:#fff3f1;font-size:12px}#message:empty{display:none}
+    #surface{position:relative;flex:1;min-height:240px;overflow:hidden;background:white;outline:none}#screen{width:100%;height:100%;object-fit:contain;display:block;user-select:none;-webkit-user-drag:none}#screen:not([src]){display:none}#empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#888;font-size:13px;text-align:center;padding:20px}#empty strong{font-size:16px;font-weight:500;color:#555}#empty[hidden]{display:none}
+    #keyboard{position:absolute;width:1px;height:1px;left:0;bottom:0;opacity:0;padding:0;border:0;resize:none}#status{flex:none;height:23px;padding:3px 9px;border-top:1px solid #e3e3e8;color:#888;font-size:11px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+    @media(prefers-color-scheme:dark){html,body{color:#e4e4ea;background:#222329}#toolbar,#tabs,#status{border-color:#383940}button:hover{background:#393940}#address{background:#2c2d34;border-color:#44454e}.tab.active,#open{background:#40364f;color:#eee7fa}#message{background:#462c2b;color:#f6aaa4}}
+  </style>
+</head>
+<body>
+  <div id="tabs" aria-label="网页标签"></div>
+  <form id="toolbar">
+    <button id="back" type="button" title="后退" aria-label="后退" disabled>←</button>
+    <button id="forward" type="button" title="前进" aria-label="前进" disabled>→</button>
+    <button id="reload" type="button" title="刷新" aria-label="刷新" disabled>↻</button>
+    <input id="address" aria-label="网站地址" placeholder="输入网址" autocomplete="off" spellcheck="false">
+    <button id="open" type="submit">打开</button>
+    <button id="new" type="button" title="新建网页标签" aria-label="新建网页标签">＋</button>
+    <button id="login" type="button" title="打开与 DSH 共享登录的可见浏览器窗口，由你完成安全验证" aria-label="打开 DSH 登录窗口" disabled>登录窗口</button>
+  </form>
+  <div id="message" role="alert"></div>
+  <div id="surface" tabindex="0" aria-label="网页内容">
+    <img id="screen" alt="当前网页" draggable="false">
+    <div id="empty"><strong>在侧边栏浏览网站</strong><span>输入网址，按回车打开</span></div>
+    <textarea id="keyboard" aria-label="网页文字输入" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+  </div>
+  <div id="status">就绪</div>
+  <script>
+    (() => {
+      const $ = id => document.getElementById(id);
+      const panel = new URL(location.href).searchParams.get('panel') || 'default';
+      const endpoint = location.pathname.replace(/\/$/, '') + '/manage';
+      const surface = $('surface'), image = $('screen'), keyboard = $('keyboard');
+      let active = null, tabs = [], revision = 0, frameWidth = 1024, frameHeight = 768, busy = false, stopped = false, composing = false, visible = true;
+      const controller = new AbortController();
+      function controls() {
+        for (const id of ['back','forward','reload','login']) $(id).disabled = !active || busy;
+        for (const id of ['open','new']) $(id).disabled = busy;
+      }
+      async function api(method, payload = {}) {
+        const response = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ type: 'client-request', rpcId: crypto.randomUUID(), method: 'manage', payload: {panel, method, payload} }), signal: controller.signal });
+        if (!response.ok) throw Error(response.status === 401 ? '请重新打开 DSH 登录入口' : '浏览器连接失败');
+        const result = (await response.json()).result;
+        if (!result?.ok) throw Error(result?.error?.message || '浏览器连接失败');
+        return result.value;
+      }
+      function render(state) {
+        const previous = active; active = state.active; tabs = state.tabs;
+        if (previous !== active) { revision = 0; image.removeAttribute('src'); resizePage(); }
+        $('tabs').replaceChildren(...tabs.map(tab => {
+          const row = document.createElement('div'); row.className = 'tab' + (tab.id === active ? ' active' : '');
+          const select = document.createElement('button'); select.className = 'select'; select.textContent = tab.title || (tab.url === 'about:blank' ? '新标签' : tab.url); select.title = tab.title || tab.url; select.onclick = () => command('select', {id:tab.id});
+          const close = document.createElement('button'); close.className = 'close'; close.textContent = '×'; close.setAttribute('aria-label','关闭网页标签'); close.onclick = () => command('close',{id:tab.id}); row.append(select,close); return row;
+        }));
+        const selected = tabs.find(tab => tab.id === active);
+        if (document.activeElement !== $('address') && selected) $('address').value = selected.url === 'about:blank' ? '' : selected.url;
+        controls();
+        $('empty').hidden = Boolean(image.getAttribute('src'));
+        if (state.frame) { revision = state.frame.revision; frameWidth = state.frame.width; frameHeight = state.frame.height; image.src = 'data:image/jpeg;base64,' + state.frame.data; $('empty').hidden = true; }
+        $('status').textContent = selected ? (selected.title || selected.url || '新标签') : '就绪';
+      }
+      async function command(method, payload = {}, quiet = false) {
+        try {
+          if (!quiet) {$('message').textContent = '';busy = true;controls();}
+          const result = await api(method, { ...(active ? {id:active} : {}), ...payload });
+          if (result.tabs) render(result);
+          return result;
+        } catch (error) {
+          if (error.name !== 'AbortError') $('message').textContent = error.message;
+        } finally {
+          if (!quiet) {busy = false;controls();}
+        }
+      }
+      $('toolbar').onsubmit = event => {event.preventDefault(); command('open',{url:$('address').value.trim()});};
+      $('new').onclick = () => command('new');
+      $('login').onclick = async () => { const result = await command('login'); if (result) $('status').textContent = '请在新开的 DSH 登录窗口完成验证；返回后刷新原网页即可。'; };
+      for (const method of ['back','forward','reload']) $(method).onclick = () => command(method);
+      function point(event) {
+        if (!active || !image.naturalWidth) return null;
+        const rect = image.getBoundingClientRect(), scale = Math.min(rect.width / frameWidth, rect.height / frameHeight);
+        const x = (event.clientX - rect.left - (rect.width - frameWidth * scale)/2)/scale;
+        const y = (event.clientY - rect.top - (rect.height - frameHeight * scale)/2)/scale;
+        return x >= 0 && y >= 0 && x <= frameWidth && y <= frameHeight ? {x,y} : null;
+      }
+      const modifiers = event => (event.altKey?1:0)|(event.ctrlKey?2:0)|(event.metaKey?4:0)|(event.shiftKey?8:0);
+      const buttons = ['left','middle','right'];
+      surface.onmousedown = event => {const p=point(event);if(!p)return;event.preventDefault();keyboard.focus({preventScroll:true});command('pointer',{type:'mousePressed',...p,button:buttons[event.button]||'none',buttons:event.buttons,modifiers:modifiers(event)},true);};
+      surface.onmouseup = event => {const p=point(event);if(p)command('pointer',{type:'mouseReleased',...p,button:buttons[event.button]||'none',buttons:event.buttons,modifiers:modifiers(event)},true);};
+      let lastMove = 0;
+      surface.onmousemove = event => {const p=point(event),now=Date.now();if(p&&now-lastMove>60){lastMove=now;command('pointer',{type:'mouseMoved',...p,buttons:event.buttons,modifiers:modifiers(event)},true);}};
+      surface.onwheel = event => {const p=point(event);if(!p)return;event.preventDefault();command('pointer',{type:'mouseWheel',...p,deltaX:event.deltaX,deltaY:event.deltaY,modifiers:modifiers(event)},true);};
+      surface.oncontextmenu = event => event.preventDefault();
+      keyboard.oncompositionstart = () => {composing=true;};
+      let compositionText = '';
+      keyboard.oncompositionend = event => {composing=false;compositionText=event.data;if(event.data)command('text',{text:event.data},true);keyboard.value='';};
+      keyboard.oninput = event => {if(composing||event.isComposing)return;if(event.inputType==='insertFromComposition'&&event.data===compositionText){keyboard.value='';compositionText='';return;}compositionText='';if(keyboard.value)command('text',{text:keyboard.value},true);keyboard.value='';};
+      const keyCodes={Backspace:8,Tab:9,Enter:13,Escape:27,ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40,Delete:46,Home:36,End:35,PageUp:33,PageDown:34};
+      keyboard.onkeydown = event => {
+        if(composing||event.isComposing||event.key==='Process')return;
+        const modified=event.ctrlKey||event.metaKey||event.altKey;
+        if(event.key.length===1&&!modified)return;
+        if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='v')return;
+        event.preventDefault();const data={key:event.key,code:event.code,modifiers:modifiers(event),windowsVirtualKeyCode:keyCodes[event.key]||event.key.toUpperCase().charCodeAt(0)};
+        command('key',{type:'keyDown',...data},true);command('key',{type:'keyUp',...data},true);
+      };
+      let resizeTimer;
+      function resizePage(){clearTimeout(resizeTimer);resizeTimer=setTimeout(() => {if(active&&visible)command('resize',{width:Math.max(320,Math.min(2560,Math.round(surface.clientWidth))),height:Math.max(240,Math.min(2160,Math.round(surface.clientHeight)))},true);},180);}
+      new ResizeObserver(resizePage).observe(surface);
+      document.addEventListener('visibilitychange',() => {if(active)command(document.hidden?'pause':'resume',{},true);});
+      window.addEventListener('message',event => {if(event.source!==parent||event.origin!==location.origin||event.data?.type!=='dsh-browser-visibility')return;visible=event.data.visible===true;if(active)command(visible&&!document.hidden?'resume':'pause',{},true);if(visible)resizePage();});
+      window.addEventListener('pagehide',() => {
+        stopped=true;controller.abort();clearTimeout(resizeTimer);
+        fetch(endpoint,{method:'POST',credentials:'same-origin',keepalive:true,headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:crypto.randomUUID(),method:'manage',payload:{panel,method:'release'}})}).catch(() => {});
+      });
+      async function poll() {
+        if(stopped)return;
+        try {if(!document.hidden&&visible){const state=await api(active?'frame':'status',active?{id:active,revision}:{});render(state);}}
+        catch(error){if(error.name!=='AbortError')$('message').textContent=error.message;}
+        if(!stopped)setTimeout(poll,200);
+      }
+      poll();
+    })();
+  </script>
+</body>
+</html>

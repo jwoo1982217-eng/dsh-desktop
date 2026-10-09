@@ -1,0 +1,12 @@
+{
+  "name": "dsh-desktop-browser",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": { ".": "./index.mjs", "./client": "./client.js", "./package.json": "./package.json" },
+  "license": "MIT",
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "inject": ["@deepseek-ai/dsh-client-ui-sidebar-right"], "platform": "web" }
+  }
+}
