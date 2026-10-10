@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "main": "index.mjs",
-  "exports": { ".": "./index.mjs", "./client": "./client.js", "./package.json": "./package.json" },
+  "exports": { ".": "./index.mjs", "./client": "./client.js", "./isolated-login": "./isolated-login.mjs", "./package.json": "./package.json" },
   "license": "MIT",
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },

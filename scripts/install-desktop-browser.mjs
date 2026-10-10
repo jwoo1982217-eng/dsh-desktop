@@ -14,7 +14,7 @@ export async function installDesktopBrowser(profile, modules) {
   let old = false, installed = false;
   try {
     await mkdir(staging, { recursive: true, mode: 0o700 });
-    for (const name of ['package.json', 'cordis.patch.yml', 'index.mjs', 'client.js', 'browser-engine.mjs', 'browser-panel-service.mjs', 'browser-panel.html']) await cp(path.join(root, 'desktop-browser', name), path.join(staging, name));
+    for (const name of ['package.json', 'cordis.patch.yml', 'index.mjs', 'client.js', 'browser-engine.mjs', 'browser-panel-service.mjs', 'browser-panel.html', 'isolated-login.mjs', 'isolated-login-service.mjs', 'system-login-browser.mjs']) await cp(path.join(root, 'desktop-browser', name), path.join(staging, name));
     try { await rename(target, backup); old = true; } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await rename(staging, target); installed = true;
     manifest.dependencies = { ...manifest.dependencies, 'dsh-desktop-browser': 'file:./node_modules/dsh-desktop-browser' };

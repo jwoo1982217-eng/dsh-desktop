@@ -1,3 +1,5 @@
 - insert:
     - id: dsh-desktop-browser
       name: dsh-desktop-browser
+    - id: dsh-desktop-isolated-login
+      name: dsh-desktop-browser/isolated-login

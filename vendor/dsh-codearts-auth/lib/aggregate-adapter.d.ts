@@ -107,6 +107,8 @@ export declare class AggregateAdapter extends LlmAdapter {
      * ⚠️ 一分钟内临期时刻不会显著变化，故 60 秒 TTL 不破坏「临期优先」的语义。
      */
     private readonly choiceCache;
+    /** 小容量备用渠道报告超限后，让下一次压缩读取它的容量；有效期与选型缓存一致。 */
+    private readonly overflowContext;
     /**
      * 「上次**实际**转发成功的渠道」——按虚拟模型分别记录（P3，供用量徽标显示）。
      *
@@ -361,6 +363,8 @@ export declare class AggregateAdapter extends LlmAdapter {
      *    ⚠️ DSH 运行时直接调本方法时**不传**第三参，那是正常的（缓存命中时无需取消）。
      */
     resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
+    /** 与请求复用同一候选序和能力读取，按首选渠道的真实容量声明压缩预算。 */
+    private contextFor;
     /**
      * 目录为空时先推导一次（避免 resolveModel 在 listModels 之前被调用时找不到模型）。
      *
@@ -393,11 +397,9 @@ export declare class AggregateAdapter extends LlmAdapter {
      */
     private candidatesFor;
     /**
-     * 取目标模型的两项能力：**思考档位 id** 与**是否收得了图片**。
+     * 一次读取目标模型的档位、图片能力及上下文容量。
      *
-     * ⚠️ 两项**共用同一次 `resolveModelInfo` 调用** —— 不额外发请求。这是把图片
-     * 能力做成「顺带取回」而不是「另查一遍」的原因（选型路径上每次请求都会走这里，
-     * 多一次解析就是多一次上游交互）。
+     * 共用一次 `resolveModelInfo` 调用，不为上下文容量另发查询。
      *
      * ⚠️ 失败时按**保守**方向回落：档位为空（不下发该字段）、图片为 `false`
      * （不把它当带图候选）。理由见 {@link DispatchTarget.imageCapable}。

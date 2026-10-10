@@ -27,6 +27,7 @@ test('browser installation and reinstallation preserve unrelated profile configu
   assert.equal(manifest.dependencies.existing, '1.0.0');
   assert.equal(await readFile(path.join(profile, 'credentials-marker'), 'utf8'), 'keep');
   assert.match(await readFile(path.join(profile, 'node_modules/dsh-desktop-browser/browser-panel.html'), 'utf8'), /网站地址/);
+  await import(path.join(profile, 'node_modules/dsh-desktop-browser/isolated-login.mjs'));
 });
 
 test('unsupported core leaves the manifest and previous browser plugin intact', async t => {

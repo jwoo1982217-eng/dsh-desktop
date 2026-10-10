@@ -78,6 +78,8 @@ export function apply(ctx) {
     return unwrapRpcResult(raw)
   }
   const chatGptCall = createChatGptCall(ctx.connection)
+  const isolatedLoginCall = async payload => unwrapRpcResult(
+    await ctx.connection.rpc.call('/desktop-isolated-login', 'manage', payload))
 
   /**
    * zcode 内部 captcha 载体的贡献循环（二期 Task 4）。
@@ -97,7 +99,7 @@ export function apply(ctx) {
     id: 'jet-hub',
     order: 50,
     label: () => 'Jet Hub',
-    inject: () => ({ rpcCall, chatGptCall }),
+    inject: () => ({ rpcCall, chatGptCall, isolatedLoginCall }),
   }, JetHubPage))
 
   /**

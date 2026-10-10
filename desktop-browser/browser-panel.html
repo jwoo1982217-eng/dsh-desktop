@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-dsh-browser-navigation>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -40,6 +40,7 @@
       const endpoint = location.pathname.replace(/\/$/, '') + '/manage';
       const surface = $('surface'), image = $('screen'), keyboard = $('keyboard');
       let active = null, tabs = [], revision = 0, frameWidth = 1024, frameHeight = 768, busy = false, stopped = false, composing = false, visible = true;
+      let lastNavigation = -1, navigationQueue = Promise.resolve(), actionRevision = 0;
       const controller = new AbortController();
       function controls() {
         for (const id of ['back','forward','reload','login']) $(id).disabled = !active || busy;
@@ -69,7 +70,7 @@
       }
       async function command(method, payload = {}, quiet = false) {
         try {
-          if (!quiet) {$('message').textContent = '';busy = true;controls();}
+          if (!quiet) {actionRevision++;$('message').textContent = '';busy = true;controls();}
           const result = await api(method, { ...(active ? {id:active} : {}), ...payload });
           if (result.tabs) render(result);
           return result;
@@ -115,18 +116,35 @@
       function resizePage(){clearTimeout(resizeTimer);resizeTimer=setTimeout(() => {if(active&&visible)command('resize',{width:Math.max(320,Math.min(2560,Math.round(surface.clientWidth))),height:Math.max(240,Math.min(2160,Math.round(surface.clientHeight)))},true);},180);}
       new ResizeObserver(resizePage).observe(surface);
       document.addEventListener('visibilitychange',() => {if(active)command(document.hidden?'pause':'resume',{},true);});
-      window.addEventListener('message',event => {if(event.source!==parent||event.origin!==location.origin||event.data?.type!=='dsh-browser-visibility')return;visible=event.data.visible===true;if(active)command(visible&&!document.hidden?'resume':'pause',{},true);if(visible)resizePage();});
+      window.addEventListener('message',event => {
+        if(event.source!==parent||event.origin!==location.origin)return;
+        if(event.data?.type==='dsh-browser-navigate') {
+          const {url,revision:next} = event.data;
+          if(typeof url!=='string'||!Number.isSafeInteger(next)||next<0||next<=lastNavigation)return;
+          lastNavigation=next;
+          navigationQueue=navigationQueue.then(() => {
+            if(stopped)return;
+            $('address').value=url;
+            return command('open',{url});
+          });
+        } else if(event.data?.type==='dsh-browser-visibility') {
+          const next=event.data.visible===true;
+          if(next===visible)return;
+          visible=next;if(active)command(visible&&!document.hidden?'resume':'pause',{},true);if(visible)resizePage();
+        }
+      });
       window.addEventListener('pagehide',() => {
         stopped=true;controller.abort();clearTimeout(resizeTimer);
         fetch(endpoint,{method:'POST',credentials:'same-origin',keepalive:true,headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:crypto.randomUUID(),method:'manage',payload:{panel,method:'release'}})}).catch(() => {});
       });
       async function poll() {
         if(stopped)return;
-        try {if(!document.hidden&&visible){const state=await api(active?'frame':'status',active?{id:active,revision}:{});render(state);}}
+        try {if(!document.hidden&&visible&&!busy){const generation=actionRevision;const state=await api(active?'frame':'status',active?{id:active,revision}:{});if(generation===actionRevision&&!busy)render(state);}}
         catch(error){if(error.name!=='AbortError')$('message').textContent=error.message;}
         if(!stopped)setTimeout(poll,200);
       }
       poll();
+      parent.postMessage({type:'dsh-browser-ready'},location.origin);
     })();
   </script>
 </body>

@@ -28,7 +28,7 @@
  */
 // ⚠️ `contentHasImage` 是**值导入**（`auto-adapter.ts` 同款）：带图判定必须与宿主
 // capability 判据**同一函数**（它含 tool-result 递归），自己写一遍必然漂移。
-import { LlmAdapter, LlmError, ProviderRequestId, ReasoningEffortId, contentHasImage } from '@deepseek-ai/dsh-llm';
+import { LlmAdapter, LlmError, ProviderRequestId, ReasoningEffortId, contentHasImage, CONTEXT_WINDOW_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm';
 import { buildVirtualModels } from './aggregate-catalog.js';
 // ⚠️ `NEVER` / `UNUSABLE` **必须**从这里导入（Task 3 的共享底座）。它们从不在
 // `auto-adapter.ts` 里 `export` —— 从那里导入会编译失败（Task 3 复审已确认）。
@@ -91,6 +91,8 @@ export class AggregateAdapter extends LlmAdapter {
      * ⚠️ 一分钟内临期时刻不会显著变化，故 60 秒 TTL 不破坏「临期优先」的语义。
      */
     choiceCache = new Map();
+    /** 小容量备用渠道报告超限后，让下一次压缩读取它的容量；有效期与选型缓存一致。 */
+    overflowContext = new Map();
     /**
      * 「上次**实际**转发成功的渠道」——按虚拟模型分别记录（P3，供用量徽标显示）。
      *
@@ -226,6 +228,7 @@ export class AggregateAdapter extends LlmAdapter {
      */
     clearChoiceCache() {
         this.choiceCache.clear();
+        this.overflowContext.clear();
     }
     /**
      * 「上次**实际**转发成功的渠道」（P3，供用量徽标）。
@@ -660,7 +663,7 @@ export class AggregateAdapter extends LlmAdapter {
                 name: info.name,
                 ...(info.description === undefined ? {} : { description: info.description }),
                 inputModalities: ['text', 'image'],
-                context: { contextWindow: 200_000 },
+                ...await this.contextFor(model, signal),
                 reasoning: aggregateReasoningInfo(),
             };
         }
@@ -681,8 +684,28 @@ export class AggregateAdapter extends LlmAdapter {
             id: model,
             name: this.nameOf(virtual),
             inputModalities: ['text', 'image'],
-            context: { contextWindow: 200_000 },
+            ...await this.contextFor(model, signal),
             reasoning: aggregateReasoningInfo(),
+        };
+    }
+    /** 与请求复用同一候选序和能力读取，按首选渠道的真实容量声明压缩预算。 */
+    async contextFor(model, signal) {
+        const targets = await this.candidatesFor(model, signal);
+        let target = targets[0];
+        const recovery = this.overflowContext.get(model);
+        const now = this.options.now?.() ?? Date.now();
+        if (recovery !== undefined) {
+            const current = targets.find(entry => entry.provider === recovery.target.provider && entry.realId === recovery.target.realId);
+            if (now - recovery.at >= (this.options.ttlMs ?? AGGREGATE_TTL_MS) || current === undefined) {
+                this.overflowContext.delete(model);
+            }
+            else if (current.contextWindow !== undefined && current.contextWindow < (target?.contextWindow ?? 200_000)) {
+                target = current;
+            }
+        }
+        // 上游未提供容量时保留旧预算；不能借用另一个渠道的容量假装已识别。
+        return {
+            context: { contextWindow: target?.contextWindow ?? 200_000 },
         };
     }
     /**
@@ -896,11 +919,9 @@ export class AggregateAdapter extends LlmAdapter {
         return targets;
     }
     /**
-     * 取目标模型的两项能力：**思考档位 id** 与**是否收得了图片**。
+     * 一次读取目标模型的档位、图片能力及上下文容量。
      *
-     * ⚠️ 两项**共用同一次 `resolveModelInfo` 调用** —— 不额外发请求。这是把图片
-     * 能力做成「顺带取回」而不是「另查一遍」的原因（选型路径上每次请求都会走这里，
-     * 多一次解析就是多一次上游交互）。
+     * 共用一次 `resolveModelInfo` 调用，不为上下文容量另发查询。
      *
      * ⚠️ 失败时按**保守**方向回落：档位为空（不下发该字段）、图片为 `false`
      * （不把它当带图候选）。理由见 {@link DispatchTarget.imageCapable}。
@@ -911,7 +932,11 @@ export class AggregateAdapter extends LlmAdapter {
             const efforts = (info.reasoning?.efforts ?? [])
                 .map((effort) => String(effort.id))
                 .filter((id) => id.length > 0);
-            return { efforts, imageCapable: info.inputModalities?.includes('image') === true };
+            const contextWindow = info.context?.contextWindow;
+            return {
+                efforts, imageCapable: info.inputModalities?.includes('image') === true,
+                ...(Number.isSafeInteger(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
+            };
         }
         catch (error) {
             // ⚠️⚠️ **中止不得被折算成「无档位 / 不支持图片」**（真实缺陷，全分支终审 I3：
@@ -1181,6 +1206,13 @@ export class AggregateAdapter extends LlmAdapter {
                     // ⚠️ 中止/取消**不换候选**，立刻向上抛。
                     if (isAbortLike(error, options.signal))
                         throw error;
+                    // 上游确认上下文超限时交给宿主压缩，不把同一份过长请求继续转发。
+                    if (error instanceof LlmError && error.code === CONTEXT_WINDOW_EXCEEDED_CODE) {
+                        if (!emitted && openedBlocks.size === 0 && target.contextWindow !== undefined) {
+                            self.overflowContext.set(modelKey, { at: self.options.now?.() ?? Date.now(), target });
+                        }
+                        throw error;
+                    }
                     if (emitted) {
                         // 已经吐过内容：不能切换（否则把两段回答拼在一起）。
                         self.ctx.logger?.warn?.(`[aggregate] ${target.provider}（${target.realId}）在产出内容后失败，`
