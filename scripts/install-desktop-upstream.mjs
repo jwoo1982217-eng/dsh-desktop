@@ -77,7 +77,7 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
   try {
     // 核心会优先从自身安装目录解析组合包，部署时同步已审核的本地程序。
     for (const [name, source] of [['dsh-codearts-auth', 'vendor/dsh-codearts-auth'], ['@zseven-w/dsh-noema', 'vendor/dsh-noema'], ['dsh-peer', 'peer']]) {
-      for (const entry of ['package.json', 'cordis.patch.yml', 'lib', 'src', 'locale', 'vendor', 'agent-cards', 'chat-history', 'memory-isolation', 'mcp-manager', 'controlled-market', 'workflow-hub', 'index.mjs', 'protocol.mjs', 'relay.mjs', 'tunnel.mjs', 'proxy.mjs', 'ui-reuse.mjs', 'browser-session.mjs', 'config-sync.mjs', 'page.html', 'presentation.css', 'presentation.js', 'browser-compat.js', 'skill-import.js']) {
+      for (const entry of ['package.json', 'cordis.patch.yml', 'lib', 'src', 'locale', 'vendor', 'agent-cards', 'chat-history', 'chat-files', 'memory-isolation', 'mcp-manager', 'controlled-market', 'workflow-hub', 'index.mjs', 'protocol.mjs', 'relay.mjs', 'tunnel.mjs', 'proxy.mjs', 'ui-reuse.mjs', 'browser-session.mjs', 'config-sync.mjs', 'page.html', 'presentation.css', 'presentation.js', 'browser-compat.js', 'skill-import.js']) {
         const file = path.join(root, source, entry);
         try { await lstat(file); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
         const deployed = path.join(modules, name, entry);
