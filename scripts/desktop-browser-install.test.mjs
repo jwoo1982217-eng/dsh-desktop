@@ -10,7 +10,7 @@ async function fixture(t) {
   const profile = path.join(directory, 'profile'), modules = path.join(directory, 'modules');
   await mkdir(path.join(profile, 'node_modules/dsh-desktop-browser'), { recursive: true });
   await mkdir(path.join(modules, '@deepseek-ai/dsh'), { recursive: true });
-  await writeFile(path.join(modules, '@deepseek-ai/dsh/package.json'), JSON.stringify({ version: '0.2.1-alpha.1' }));
+  await writeFile(path.join(modules, '@deepseek-ai/dsh/package.json'), JSON.stringify({ version: '0.2.1-alpha.4' }));
   const manifest = JSON.stringify({ private: true, dependencies: { existing: '1.0.0' }, dsh: { profile: { bundles: ['existing'] } } });
   await writeFile(path.join(profile, 'package.json'), manifest);
   await writeFile(path.join(profile, 'node_modules/dsh-desktop-browser/previous'), 'old plugin');
