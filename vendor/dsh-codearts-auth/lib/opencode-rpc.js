@@ -204,4 +204,3 @@ export async function handleOpencodeRpc(ctx, pool, method, payload) {
         return fail(error instanceof Error ? error.message : String(error));
     }
 }
-//# sourceMappingURL=opencode-rpc.js.map

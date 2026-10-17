@@ -40,12 +40,15 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 import {
-  OPENCODE, OPENCODE_FALLBACK_MODELS, classifyOpencodeError, isFreeOpencodeModel,
-  isReachableOpencodeModel,
+  OPENCODE, OPENCODE_FALLBACK_MODELS, OPENCODE_INFERENCE_MODELS, classifyOpencodeError,
+  isFreeOpencodeModel, isReachableOpencodeModel, mergeInferenceModels, usesInferenceLane,
   type OpencodeErrorInfo, type OpencodeErrorKind, type OpencodeFallbackModel,
 } from './opencode-product.js'
 import { listIdentitySlots, type IdentitySlot } from './opencode-auth.js'
 import { deriveRequestId, deriveSessionId, opencodeHeaders, opencodeUserAgent } from './opencode.js'
+import {
+  deriveInferenceSessionId, inferenceHeaders, prepareInferencePayload,
+} from './opencode-inference.js'
 import { buildOpencodePayload } from './opencode-messages.js'
 import {
   getOpencodeCapabilitiesSync, opencodeEffortName, supportsOpencodeImage,
@@ -226,13 +229,13 @@ export class OpencodeAdapter extends LlmAdapter {
     // 完整，匿名目录看不到它们。
     const slot = slots.find((s) => s.kind === 'account') ?? slots.at(-1)
     if (this.options.fetchRemoteCatalog === undefined || slot === undefined) {
-      return OPENCODE_FALLBACK_MODELS
+      return mergeInferenceModels(OPENCODE_FALLBACK_MODELS)
     }
     // ⚠️ **不要**在适配器上再 memoize 一份：那会让目录永不过期 ——
     // 用户后加一个账号（付费模型本应随之可见）要重启 DSH 才能看到，
     // 表现为「key 明明有效却不显示付费模型」。刷新职责交给带 TTL 的
     // `loadOpencodeCatalog`（默认 5 分钟）。
-    return loadOpencodeCatalog(this.options.fetchRemoteCatalog, slot)
+    return mergeInferenceModels(await loadOpencodeCatalog(this.options.fetchRemoteCatalog, slot))
   }
 
   /**
@@ -244,7 +247,12 @@ export class OpencodeAdapter extends LlmAdapter {
    * （minimax 的同款真实缺陷，见 `minimax-adapter.ts` 的注释）。
    */
   listAllModels(): readonly { id: string; name: string; isFree?: boolean }[] {
-    return OPENCODE_FALLBACK_MODELS.map((m) => ({ id: m.id, name: m.name, isFree: m.isFree }))
+    // ⚠️ 必须把 /inference 免费模型并进来：`listAllModels` 是 Jet Hub RPC
+    // `ModelCatalogSource` 的同步来源（面板「模型」列表），漏掉就会在
+    // 面板里看不到新通道的模型，用户以为没接上。
+    return [...OPENCODE_FALLBACK_MODELS, ...OPENCODE_INFERENCE_MODELS]
+      .filter((m, index, all) => all.findIndex((x) => x.id === m.id) === index)
+      .map((m) => ({ id: m.id, name: m.name, isFree: m.isFree }))
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
@@ -432,20 +440,34 @@ export class OpencodeAdapter extends LlmAdapter {
 
         const info = classifyOpencodeFailure(error)
         if (info.kind === 'free_tier') {
-          // ⚠️⚠️ 根因是 **session id 形状**，不是「伪装不被认可」（真实报障
-          // 2026-10-01 定位）。证据：尾段写成 38 字符（12hex + 26 base62）时
-          // 一律 403；改成官方真实的 26 字符（12hex + 14 base62）后**同样的
-          // 请求立刻成功**（`tests/unit/opencode-identity.spec.ts` 有形状回归锁）。
-          //
-          // ⇒ 若这里还收到 FreeTierError，说明形状又错了（或上游加了新门禁）。
-          // **换槽/换 key 无用**（每槽发的形状完全相同），故不重试，
-          // 直接把「形状」这条线索写进文案，便于一眼定位。
+          if (usesInferenceLane(options.model)) {
+            // /inference 的 403 是**请求形态门禁**（会话编码/头集/工具定义），
+            // 不是 TLS 指纹也不是额度。`streamVia` 已用新会话重试过一次，
+            // 到这里说明形态仍未通过 —— 报真实原因，别误导用户去买 key。
+            this.options.warn?.(
+              `opencode: /inference 免费通道被 FreeTierError 拒绝（形态门禁）：${info.detail}`,
+            )
+            throw new LlmError(
+              'opencode: /inference 免费通道被拒绝（FreeTierError）。'
+              + '该入口校验请求形态（会话编码 / CLI 头集 / 官方工具定义），'
+              + '不是 key 问题；请把上游返回原文反馈给插件维护者。',
+              'AUTH',
+              { status: 403 },
+            )
+          }
+          // ⚠️⚠️ 2026-10-15 起根因 = **上游传输指纹门禁**，不是 session id 形状。
+          // 真机 1.19.0 抓包矩阵实证：官方 CLI 直连 200；Node/curl/python/
+          // npm-Bun 反代/Bun 裸 TLS + 完全复刻的头序全部 403 FreeTierError。
+          // 免费模型只认官方 CLI 的 TLS/HTTP 指纹 —— **换槽/换 key/换出口都无效**
+          // （每槽发的同一套栈），故不重试，把唯一有效动作写进文案。
           this.options.warn?.(
-            `opencode: 免费通道被 FreeTierError 拒绝 —— 检查 session id 形状（应为 ses_ + 12hex + 14base62）：${info.detail}`,
+            `opencode: 旧 /zen 免费通道被 FreeTierError 拒绝 —— 上游对免费模型启用官方客户端传输指纹门禁：${info.detail}`,
           )
           throw new LlmError(
-            `opencode: 免费通道被上游拒绝（FreeTierError）。`
-            + '该错误由请求形状触发（session id 形状不对时出现），换 API key 或换出口都无效。',
+            'opencode: 旧 /zen 免费通道被上游拒绝（FreeTierError）。'
+            + '该档只允许官方 OpenCode 客户端的传输指纹调用，第三方直发一律 403；'
+            + '请改用 /inference 免费模型（deepseek-v4.1-flash-free 等），'
+            + '或为通道绑定 Zen/Console 付费 key。',
             'AUTH',
             { status: 403 },
           )
@@ -539,22 +561,51 @@ export class OpencodeAdapter extends LlmAdapter {
         ? { reasoningEffort: String(options.reasoningEffort) }
         : {},
     })
-    const headers: Record<string, string> = {
-      ...opencodeHeaders(slot.fingerprint, sessionIdOf(options), deriveRequestId(), opencodeUserAgent(slot.userAgent)),
+    // ── 通道分流（2026-10-17）────────────────────────────────────────────
+    // 免费模型走 /inference（新匿名通道，实测 Node fetch 可直连）；
+    // 其它模型/账号槽保持旧 /zen 行为，避免影响已付费的通路。
+    const useInference = usesInferenceLane(options.model)
+    // ⚠️ /inference 闸门要求 stream=true + 官方工具定义；旧 /zen 的 bash/read
+    // 桩在 /inference 会被逐字节校验拒掉（403 FreeTierError）。
+    const wirePayload = useInference ? prepareInferencePayload(payload) : payload
+    const url = useInference
+      ? `${OPENCODE.inferenceBaseUrl}${OPENCODE.inferenceChatPath}`
+      : `${OPENCODE.baseUrl}${OPENCODE.chatPath}`
+    // ⚠️ /inference **拒绝** `x-opencode-request`（见到即 403）；会话头也要
+    // 四头同值 + 降序编码。故不能复用 `opencodeHeaders`。
+    const buildHeaders = (session: string): Record<string, string> => ({
+      ...(useInference
+        ? inferenceHeaders(slot.fingerprint, session, OPENCODE.inferenceUserAgent)
+        : opencodeHeaders(slot.fingerprint, session, deriveRequestId(), opencodeUserAgent(slot.userAgent))),
       'content-type': 'application/json',
       accept: 'text/event-stream',
-      authorization: `Bearer ${slot.apiKey}`,
-    }
-    const init: RequestInit = {
+      // ⚠️ /inference 会**校验**真实 key（无效 key 直接 401 Invalid credential），
+      // 而免费模型用字面量 `public` 才是匿名额度。故免费通道固定 `public`，
+      // 不拿账号 key 去消耗付费额度，也不让「无效/过期 key」把免费模型带崩。
+      authorization: `Bearer ${useInference ? OPENCODE.anonymousKey : slot.apiKey}`,
+    })
+    const makeInit = (headers: Record<string, string>): RequestInit => ({
       method: 'POST',
       headers,
-      body: JSON.stringify(payload),
+      body: JSON.stringify(wirePayload),
       ...options.signal !== undefined ? { signal: options.signal } : {},
       // ⚠️ per-request dispatcher：只让本 provider 的这次请求走该账号的出口，
       // **不动全局**（两个插件抢全局槽位会互相短路整个路由层）。
       ...slot.proxy === undefined ? {} : { dispatcher: buildProxyDispatcher(slot.proxy) as never },
+    })
+    let response = await fetch(
+      url,
+      makeInit(buildHeaders(useInference ? inferenceSessionIdOf(options) : sessionIdOf(options))),
+    )
+    if (!response.ok && useInference && response.status === 403) {
+      // ⚠️ /inference 的 403 是**请求形态门禁**（会话编码/头集/工具定义），
+      // 不是额度：换一个新会话再试一次即可覆盖「会话被上游判过期」这类抖动。
+      // 仍失败则原样透传，由上层给出可读错误。
+      const peek = await response.clone().text().catch(() => '')
+      if (peek.includes('FreeTierError')) {
+        response = await fetch(url, makeInit(buildHeaders(deriveInferenceSessionId())))
+      }
     }
-    const response = await fetch(`${OPENCODE.baseUrl}${OPENCODE.chatPath}`, init)
     if (!response.ok) {
       // ⚠️ **必须先读体**：Zen 的限流语义（`GoUsageLimitError`）在响应体里，
       // 而 body 只能读一次 —— 读了不传下去，轮换层就只能按状态码猜，
@@ -624,6 +675,24 @@ function sessionIdOf(options: GenerateOptions): string {
   if (existing !== undefined) return existing
   const created = deriveSessionId()
   sessionIds.set(key, created)
+  return created
+}
+
+/**
+ * /inference lane 的会话级 session id（同一 DSH 会话内稳定）。
+ *
+ * ⚠️ 与旧 lane **分开缓存**：两条 lane 的会话编码不同（降序 vs 升序），
+ * 共用一份会让其中一条拿到形状错误的值 → 403。
+ */
+const inferenceSessionIds = new WeakMap<object, string>()
+
+function inferenceSessionIdOf(options: GenerateOptions): string {
+  const key = options.messages as unknown as object
+  if (typeof key !== 'object' || key === null) return deriveInferenceSessionId()
+  const existing = inferenceSessionIds.get(key)
+  if (existing !== undefined) return existing
+  const created = deriveInferenceSessionId()
+  inferenceSessionIds.set(key, created)
   return created
 }
 

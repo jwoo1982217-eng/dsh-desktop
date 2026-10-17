@@ -33,14 +33,22 @@ export const OPENCODE = {
     baseUrl: 'https://opencode.ai/zen',
     chatPath: '/v1/chat/completions',
     modelsPath: '/v1/models',
+    // 免费模型的快通道（旧 /zen 的匿名档被 TLS 指纹门禁锁死，见 opencode-inference.ts）。
+    inferenceBaseUrl: 'https://opencode.ai/inference',
+    inferenceChatPath: '/v1/chat/completions',
+    inferenceUserAgent: 'opencode/latest/2.0.29/cli',
     // ⚠️ 与本仓库其余 provider 的流式超时常量同档（保守值）。
     chatHeaderTimeoutMs: 60_000,
     chatChunkTimeoutMs: 120_000,
     // ⚠️ 匿名凭证是**字面量** `public`：opencode 官方 CLI 在没有 key 时自己就用它
     // （其 provider.ts 的 opencode 分支：`options: ok ? {} : { apiKey: 'public' }`）。
     anonymousKey: 'public',
-    // ⚠️ 兜底 UA 版本号。接线层会用真机 `opencode --version` 的结果覆盖它。
-    defaultUserAgent: 'opencode/1.18.22',
+    // ⚠️ 兜底 UA。1.19.0 起官方 UA 是**复合串**（真机抓包 2026-10-15）：
+    //   opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14
+    // 接线层会用真机 `opencode --version` 的版本号重建前段；后两段随 CLI 构建
+    // 而变，CLI 升级后以重新抓包为准（openai-compatible 模型元数据里不带这些）。
+    defaultUserAgent: 'opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14',
+    userAgentSuffix: 'ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14',
     /**
      * 模型能力元数据源（**远端**，能力的主来源）。
      *
@@ -90,13 +98,65 @@ export const OPENCODE_FALLBACK_MODELS = [
 const FREE_IDS = new Set(OPENCODE_FALLBACK_MODELS.filter((m) => m.isFree).map((m) => m.id));
 const REACHABLE_IDS = new Set(OPENCODE_FALLBACK_MODELS.map((m) => m.id));
 /**
+ * /inference lane 承载的免费模型（2026-10-17 逐个真实回话验证）。
+ *
+ * 目录（`https://models.opencode.ai/api.json` 的 `opencode.models`）当前
+ * 127 个模型、44 个零价；这里只收 **status=active 且实测回话** 的：
+ * - `nemotron-3-ultra-free` 实测 200 但正文为空，未收；
+ * - `status=deprecated` 的一批不再保证，未收。
+ *
+ * ⚠️ 与 `OPENCODE_FALLBACK_MODELS` 有重叠（big-pickle / space-bunny 等）——
+ * 合并处按 id 去重，不要在这里删重复项：fallback 表还被旧 /zen lane 使用。
+ */
+export const OPENCODE_INFERENCE_MODELS = [
+    // ⚠️ deepseek-v4.1-flash-free：官方目录标 200000。2026-10-17 实测
+    // 1,040,101 prompt tokens 仍 200 且头/中/尾三针全对；1,850,000 chars
+    // (≈1,069k tokens) 起 400（上游透传空 body）⇒ 上限与 GLM 同网关的
+    // 1,048,576 吻合，取 1000000 留余量。
+    { id: 'deepseek-v4.1-flash-free', name: 'DeepSeek V4.1 Flash Free', isFree: true, contextWindow: 1000000 },
+    // ⚠️ glm-5.3-flash-free：官方目录标 200000，实测 998,399 prompt tokens
+    // 仍 200 且三针全对；1,109,168 tokens 时上游 400 明确回
+    // `This model's maximum context length is 1048576 tokens` ⇒ 取 1000000
+    // （留 48,576 余量给输出与工具）。
+    { id: 'glm-5.3-flash-free', name: 'GLM-5.3-Flash Free', isFree: true, contextWindow: 1000000 },
+    { id: 'longcat-2.5-preview-free', name: 'LongCat 2.5 Preview Free', isFree: true, contextWindow: 1000000 },
+    { id: 'mimo-v2.6-flash-free', name: 'MiMo-V2.6-Flash Free', isFree: true, contextWindow: 200000 },
+    { id: 'nemotron-3.5-lightning-free', name: 'Nemotron 3.5 Lightning Free', isFree: true, contextWindow: 262144 },
+    { id: 'nemotron-3.5-super-vl-free', name: 'Nemotron 3.5 Super VL Free', isFree: true, contextWindow: 1048576 },
+    { id: 'space-bunny-free', name: 'Space Bunny Free', isFree: true, contextWindow: 1048576 },
+    { id: 'beam-free', name: 'Beam Free', isFree: true, contextWindow: 1048576 },
+    { id: 'big-pickle', name: 'Big Pickle', isFree: true, contextWindow: 200000 },
+];
+const INFERENCE_FREE_IDS = new Set(OPENCODE_INFERENCE_MODELS.map((m) => m.id));
+/**
+ * 该模型是否走 /inference lane。
+ *
+ * ⚠️ 判据是**这张实测表**，不是 `isFreeOpencodeModel`：fallback 表里还有
+ * 两个旧 /zen 时代的免费模型（mimo-v2.5-free / nemotron-3-ultra-free）
+ * 没在新通道复测，不能直接甩过去。
+ */
+export function usesInferenceLane(id) {
+    return INFERENCE_FREE_IDS.has(id);
+}
+/**
+ * 把 /inference 免费模型并进目录（按 id 去重，保持原顺序在前）。
+ *
+ * 只给适配器内部用：`loadOpencodeCatalog` 的对外语义（远端/回退）保持不变，
+ * 否则现有单测与「目录来源」诊断都会被打乱。
+ */
+export function mergeInferenceModels(entries) {
+    const seen = new Set(entries.map((e) => e.id));
+    const extra = OPENCODE_INFERENCE_MODELS.filter((m) => !seen.has(m.id));
+    return extra.length === 0 ? entries : [...entries, ...extra];
+}
+/**
  * 该模型是否属免费（匿名槽只接受免费模型）。
  *
  * ⚠️ **未知模型返回 false**：远端目录可能含表外的新免费模型，
  * 但在未实测前把它们放给匿名槽只会换来 403/500；宁可要求用户加一个付费账号。
  */
 export function isFreeOpencodeModel(id) {
-    return FREE_IDS.has(id);
+    return FREE_IDS.has(id) || INFERENCE_FREE_IDS.has(id);
 }
 /**
  * 该模型在我们**已实现并实测可达**的通道里是否存在。
@@ -155,8 +215,10 @@ export function classifyOpencodeError(status, body, headers) {
         return { kind: 'go_usage_limit', ...retryAfterMs === undefined ? {} : { retryAfterMs }, detail };
     }
     if (body.includes('FreeTierError')) {
-        // 形状门禁：伪装形态被拒。**不重试也不换槽**（我们每槽发的是同一套形状，
-        // 换槽重试无意义），如实透传让人知道「伪装需跟进上游更新」。
+        // 传输指纹门禁（2026-10-15 起）：免费模型只认官方 OpenCode 客户端的
+        // TLS/HTTP 指纹，非官方栈（Node/curl/python/普通 Bun 反代）连完全复刻
+        // 的头序都过不了。**不重试也不换槽**（每槽同一套栈，换槽重试无意义），
+        // 如实透传让用户走唯一有效动作：绑定付费 key（Zen sk / Console）。
         return { kind: 'free_tier', detail };
     }
     if (status === 429 || lower.includes('too many requests') || lower.includes('rate limit')) {
@@ -183,4 +245,3 @@ export function classifyOpencodeError(status, body, headers) {
         return { kind: 'server', detail };
     return { kind: 'auth', detail };
 }
-//# sourceMappingURL=opencode-product.js.map

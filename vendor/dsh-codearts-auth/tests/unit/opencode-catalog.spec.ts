@@ -190,12 +190,16 @@ describe('目录可见性', () => {
     expect(models.map((m) => m.id)).toContain('glm-5.2')
   })
 
-  it('⚠️ 远端只有付费模型而当前只有匿名槽时：目录为空（DSH 隐藏该 provider 分组）', async () => {
+  it('⚠️ 远端只有付费模型而当前只有匿名槽时：仍列出 /inference 免费模型', async () => {
+    // 2026-10-17 起 opencode 增加 /inference lane：免费模型不再依赖远端 /zen 目录，
+    // 因此「全付费远端 + 匿名槽」不再等于空目录（原断言编码的是旧行为）。
     const only = new OpencodeAdapter({
       identitySlots: async () => [anonSlot()],
       fetchRemoteCatalog: catalogOf([{ id: 'glm-5.2', isFree: false, contextWindow: 200000 }]),
     })
-    expect((await only.listModels('opencode')).length).toBe(0)
+    const ids = (await only.listModels('opencode')).map((m) => m.id)
+    expect(ids).toContain('deepseek-v4.1-flash-free')
+    expect(ids).not.toContain('glm-5.2')
   })
 
   it('⚠️ 不可达模型永不出现在目录里（无论有没有账号）', async () => {

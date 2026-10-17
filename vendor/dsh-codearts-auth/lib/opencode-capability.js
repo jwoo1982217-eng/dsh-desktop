@@ -335,4 +335,3 @@ export async function clearOpencodeCapabilitiesCache() {
 export function supportsOpencodeImage(capability) {
     return capability?.modalities.includes('image') === true;
 }
-//# sourceMappingURL=opencode-capability.js.map

@@ -138,4 +138,3 @@ export async function ensureDefaultAnonymousSlot(addEntry, writeCredential, list
         return '';
     }
 }
-//# sourceMappingURL=opencode-auth.js.map

@@ -106,4 +106,3 @@ export function buildOpencodePayload(input) {
     };
     return ensureFreeLaneShape(base);
 }
-//# sourceMappingURL=opencode-messages.js.map
