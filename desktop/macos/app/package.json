@@ -1,0 +1,10 @@
+{
+  "name": "dsh-mac",
+  "productName": "DSH",
+  "version": "0.1.7",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs",
+  "description": "DSH 桌面应用",
+  "license": "MIT"
+}
