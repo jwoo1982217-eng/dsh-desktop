@@ -62,6 +62,7 @@ const IMPORT_SOURCE_LABELS: ReadonlyArray<readonly [string, string]> = [
   ['codex', 'Codex'],
   ['claude-code', 'Claude Code'],
   ['opencode', 'opencode'],
+  ['zcode', 'ZCode'],
   ['cursor', 'Cursor'],
   ['grok', 'Grok'],
   ['workbuddy', 'WorkBuddy'],
@@ -164,7 +165,7 @@ type CopyKey =
 
 const COPY: Record<'en' | 'zh', Record<CopyKey, string>> = {
   en: {
-    title: 'Noema Memory',
+    title: 'Memory',
     intro: 'Long-term memory for DSH, stored locally as inspectable files. Server command, working directory, and memory root changes apply after the memory server restarts.',
     enabled: 'Enable memory',
     enabledHint: 'When off, every noema_* tool fails with a clear message.',
@@ -242,8 +243,8 @@ const COPY: Record<'en' | 'zh', Record<CopyKey, string>> = {
     groups: 'Topics',
   },
   zh: {
-    title: 'Noema 记忆',
-    intro: '为 DSH 提供长期记忆，以可检查的本地文件存储。服务器命令、工作目录与记忆根目录的修改在记忆服务器重启后生效。',
+    title: '记忆',
+    intro: '统一管理新对话的记忆范围、不同 Agent 的记忆同步和待审内容。同步后的记忆经接受，并开启跨 Agent 引用、勾选来源后，才会自动引用。',
     enabled: '启用记忆',
     enabledHint: '关闭后，所有 noema_* 工具会以清晰的错误信息快速失败。',
     guidance: '记忆引导',
@@ -251,7 +252,7 @@ const COPY: Record<'en' | 'zh', Record<CopyKey, string>> = {
     autoStart: '启动时启动服务器',
     autoStartHint: 'DSH 启动时即拉起 Noema 服务器，而不是首次使用时才启动。',
     acceptByDefault: '自动接受新记忆',
-    acceptByDefaultHint: 'noema_remember 立即持久化，而不是留下待审候选。',
+    acceptByDefaultHint: '仅用于界面手动添加；Agent 和同步导入的内容仍进入待审队列。',
     command: '服务器命令',
     commandHint: '使用 bundled 启动随插件安装的 noema-mcp，也可以填写自定义可执行文件路径或命令。',
     workingDirectory: '工作目录',
@@ -284,8 +285,8 @@ const COPY: Record<'en' | 'zh', Record<CopyKey, string>> = {
     notWritable: '当前会话中设置不可写',
     loading: '正在加载设置…',
     unavailable: '当前浏览器会话中记忆设置不可用',
-    importTitle: '从其他工具导入记忆',
-    importHint: '读取其他 AI 编程工具的 AGENTS.md / CLAUDE.md / .cursor 规则文件，把每个小节保存为一条持久 Noema 记忆。重复运行会跳过已导入的内容。',
+    importTitle: '同步其他 Agent 的记忆',
+    importHint: '选择来源并同步到本机待审库；重复同步会跳过已有内容。下方接受后，相关内容才会按所选项目范围和 Agent 来源进入新对话。',
     importEnabled: '启用记忆导入',
     importEnabledHint: 'noema_import 工具与下方导入按钮的总开关。',
     importOnStartup: '启动时自动导入',
@@ -296,7 +297,7 @@ const COPY: Record<'en' | 'zh', Record<CopyKey, string>> = {
     importMaxBytesHint: '超过该大小的记忆文件在导入前被截断。',
     importSources: '来源',
     importSourcesHint: '导入时读取哪些工具的记忆文件。',
-    importNow: '立即导入',
+    importNow: '立即同步',
     importLast: '上次导入',
     importEmpty: '本会话中还没有执行过导入。',
     manageTitle: '管理记忆',
@@ -343,6 +344,10 @@ const styles: Record<string, CSSProperties> = {
   button: { boxSizing: 'border-box', height: 28, padding: '0 12px', fontSize: 12, lineHeight: '18px', borderRadius: 14, border: '1px solid var(--dsw-alias-border-l2)', background: 'transparent', color: 'var(--dsw-alias-label-primary)', cursor: 'pointer' },
   saved: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-state-success-primary)', margin: 0 },
   errorText: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-state-error-primary)', margin: 0 },
+}
+
+function AutomaticMemoryCard(): JSX.Element {
+  return <iframe title="自动记忆与历史检索" src="/knowledge-link#memory" style={{ width: '100%', height: 'min(72dvh, 740px)', minHeight: 420, border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 12 }} />
 }
 
 function dotColor(state: StatusPayload['state'], ok: boolean): string {
@@ -871,16 +876,18 @@ export function NoemaMemorySettingsPanel({ ctx }: PanelProps): JSX.Element {
   }, [refreshStatus])
 
   if (!loaded && settings === undefined) {
-    return <section className="dsh-phone-noema" style={styles.section}><p style={styles.intro}>{copy.loading}</p></section>
+    return <section className="dsh-phone-noema" style={styles.section}><AutomaticMemoryCard /><p style={styles.intro}>{copy.loading}</p></section>
   }
   if (settings === undefined) {
-    return <section className="dsh-phone-noema" style={styles.section}><p style={styles.intro}>{copy.unavailable}</p></section>
+    return <section className="dsh-phone-noema" style={styles.section}><AutomaticMemoryCard /><p style={styles.intro}>{copy.unavailable}</p></section>
   }
 
   return (
     <section className="dsh-phone-noema" style={styles.section}>
       <h2 style={styles.title}>{copy.title}</h2>
       <p style={styles.intro}>{copy.intro}</p>
+      <AutomaticMemoryCard />
+      <details><summary>{locale === 'zh' ? '高级记忆设置' : 'Advanced memory settings'}</summary>
       <ToggleRow copy={copy} labelKey="enabled" hintKey="enabledHint" checked={settings.enabled} disabled={!writable || busy} onChange={next => setField('enabled', next)} />
       <ToggleRow copy={copy} labelKey="guidance" hintKey="guidanceHint" checked={settings.guidance} disabled={!writable || busy} onChange={next => setField('guidance', next)} />
       <ToggleRow copy={copy} labelKey="autoStart" hintKey="autoStartHint" checked={settings.autoStart} disabled={!writable || busy} onChange={next => setField('autoStart', next)} />
@@ -895,6 +902,7 @@ export function NoemaMemorySettingsPanel({ ctx }: PanelProps): JSX.Element {
       <NumberRow copy={copy} labelKey="callTimeout" hintKey="callTimeoutHint" value={settings.callTimeoutMs} disabled={!writable || busy} onCommit={next => next === undefined ? undefined : setField('callTimeoutMs', next)} />
       <NumberRow copy={copy} labelKey="restartDelay" hintKey="restartDelayHint" value={settings.restartDelayMs} disabled={!writable || busy} onCommit={next => next === undefined ? undefined : setField('restartDelayMs', next)} />
       <p style={styles.note}>{copy.restartNote}</p>
+      </details>
       <h3 style={styles.title}>{copy.importTitle}</h3>
       <p style={styles.intro}>{copy.importHint}</p>
       <ToggleRow copy={copy} labelKey="importEnabled" hintKey="importEnabledHint" checked={settings.importEnabled} disabled={!writable || busy} onChange={next => setField('importEnabled', next)} />
@@ -950,8 +958,8 @@ export function apply(ctx: ClientContext): void {
     {
       name: 'settings.section',
       id: 'noema-memory',
-      order: 60,
-      label: () => ctx.locale.getLocale().active === 'zh' ? 'Noema 记忆' : 'Noema Memory',
+      order: 29,
+      label: () => ctx.locale.getLocale().active === 'zh' ? '记忆' : 'Memory',
     },
     Panel,
   ))

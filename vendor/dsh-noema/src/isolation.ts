@@ -1,6 +1,6 @@
 import type { NoemaMemorySettings } from './settings.js'
 
-export type MemoryCallSource = 'agent' | 'interface' | 'import'
+export type MemoryCallSource = 'agent' | 'interface' | 'import' | 'automatic-recall'
 
 /** Application entry-point protection; this is not an OS sandbox. */
 export function isolatedMemoryArgs(
@@ -11,6 +11,8 @@ export function isolatedMemoryArgs(
   provenance?: { window: string; project: string },
 ): Record<string, unknown> {
   if (!config.enabled) throw new Error('Noema memory is disabled in settings')
+  if (source === 'automatic-recall' && name !== 'noema_recall')
+    throw new Error('Automatic recall can only read accepted memories')
   if (source === 'agent' && !['noema_remember','noema_status'].includes(name))
     throw new Error('Shared Noema memory is managed in settings. Automatic learning and recall use the current project/window journal only')
   if (name !== 'noema_remember') return { ...args }

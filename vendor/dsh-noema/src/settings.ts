@@ -71,7 +71,7 @@ export const NOEMA_MEMORY_SETTINGS_DEFAULTS: NoemaMemorySettings = {
   importOnStartup: false,
   importWorkspaceFiles: false,
   importMaxBytes: 65_536,
-  importSources: ['codex', 'claude-code', 'opencode', 'cursor', 'grok', 'workbuddy', 'antigravity', 'trae', 'qoder'],
+  importSources: ['codex', 'claude-code', 'opencode', 'zcode', 'cursor', 'grok', 'workbuddy', 'antigravity', 'trae', 'qoder'],
 }
 
 /** Branded settings namespace. */

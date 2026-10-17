@@ -28,6 +28,7 @@ import { MemoryImportService } from './import-service.js'
 import { createNoemaTools } from './tools.js'
 import { noemaGuidanceText, NOEMA_GUIDANCE_SECTION } from './guidance.js'
 import { registerNoemaStatusRoute } from './status-route.js'
+import { recallAcceptedMemory } from './shared-recall.js'
 
 export { PLUGIN_NAME, NOEMA_TOOL_NAMES, NOEMA_MEMORY_SETTINGS_NAMESPACE, NOEMA_STATUS_ROUTE } from './names.js'
 export { NOEMA_MEMORY_SETTINGS_NS, NOEMA_MEMORY_SETTINGS_SCHEMA, NOEMA_MEMORY_SETTINGS_DEFAULTS, type NoemaMemorySettings } from './settings.js'
@@ -87,6 +88,8 @@ export async function apply(ctx: Context, config?: Partial<NoemaMemorySettings>)
 
   const manager = new NoemaServerManager(() => settingsSource(), ctx.logger)
   const importService = new MemoryImportService(manager, () => settingsSource(), ctx.logger)
+  // Used only by the user's opt-in conversation recall controller.
+  ctx.provide('dshNoemaRecall', { recall: (request: Parameters<typeof recallAcceptedMemory>[1]) => recallAcceptedMemory(manager, request, settingsSource()) })
   const disposers: Array<() => void | Promise<void>> = []
 
   for (const tool of createNoemaTools(manager, () => settingsSource(), importService)) {

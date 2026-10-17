@@ -235,8 +235,15 @@ const CURSOR: Importer = {
   ],
 }
 
+/** ZCode's actual local curated memory store (confirmed on this device). */
+const ZCODE: Importer = {
+  id: 'zcode', label: 'ZCode',
+  globalCandidates: () => [{ path: join(homedir(), '.zcode', 'cli', 'memories'), label: 'ZCode memories', kind: 'markdown-dir' }],
+  workspaceCandidates: () => [],
+}
+
 /** All importers in stable display order. */
-export const IMPORTERS: readonly Importer[] = [CODEX, CLAUDE_CODE, OPENCODE, CURSOR, GROK, WORKBUDDY, ANTIGRAVITY, TRAE, QODER]
+export const IMPORTERS: readonly Importer[] = [CODEX, CLAUDE_CODE, OPENCODE, ZCODE, CURSOR, GROK, WORKBUDDY, ANTIGRAVITY, TRAE, QODER]
 
 /** Importer id union. */
 export type ImporterId = (typeof IMPORTERS)[number]['id']
@@ -250,7 +257,7 @@ export function importerById(id: string): Importer | undefined {
 
 /** Resolve the enabled importers for one run, in stable order. */
 export function resolveImporters(sources: readonly string[] | undefined): Importer[] {
-  if (sources === undefined || sources.length === 0 || sources.includes('all')) return [...IMPORTERS]
+  if (sources === undefined || sources.includes('all')) return [...IMPORTERS]
   const selected: Importer[] = []
   for (const importer of IMPORTERS) {
     if (sources.includes(importer.id)) selected.push(importer)
