@@ -1336,6 +1336,23 @@ window.__ModuleLoader__.load({
 			return parts.length === 4 && parts[0] === "127" && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
 		}
 		//#endregion
+		//#region lib/types/client/socket.js
+		/** Physical socket selection for browser, desktop, and authenticated Node connections. */
+		/**
+		* Resolve a logical channel against the explicit Host or the page's document base.
+		* @param path - absolute logical channel path.
+		* @param factory - authenticated socket factory; omission uses the browser API.
+		* @param baseUrl - Host base URL, required outside a document.
+		* @returns a socket owned by the calling channel.
+		*/
+		function openConnectionWebSocket(path, factory = (url) => new WebSocket(url), baseUrl) {
+			const base = baseUrl ?? (typeof document === "undefined" ? void 0 : document.baseURI);
+			if (base === void 0) throw new Error("connection: WebSocket carrier requires streamBaseUrl outside a document");
+			const url = new URL(path.slice(1), base);
+			url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+			return factory(url.href);
+		}
+		//#endregion
 		//#region lib/types/client/index.js
 		/** Required services (none — this is the wire root). */
 		const inject = [];
@@ -1374,12 +1391,13 @@ window.__ModuleLoader__.load({
 		/**
 		* Install one Context-owned Connection service from explicit composition inputs.
 		* @param ctx - client Cordis context.
-		* @param options - physical carrier, reconnect timing, and page location.
+		* @param options - interaction participation, physical carrier, reconnect timing, and page location.
 		*/
 		function installConnection(ctx, options = {}) {
 			const pageLocation = options.location;
 			const transport = options.transport;
 			const recovery = options.recovery ?? {};
+			const interactions = options.interactions ?? (pageLocation === void 0 ? "none" : "answer");
 			const rpc = transport?.rpc ?? createWebConnectionRpc(transport?.fetch, transport?.openStream);
 			let generationSource;
 			let owner;
@@ -1415,6 +1433,8 @@ window.__ModuleLoader__.load({
 				publishState(void 0);
 			};
 			const handle = {
+				interactions,
+				openWebSocket: (path) => openConnectionWebSocket(path, transport?.createWebSocket, transport?.streamBaseUrl),
 				isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),
 				generation: {
 					getSnapshot: () => generation,
@@ -1514,4 +1534,4 @@ window.__ModuleLoader__.load({
 	}
 });
 
-//# sourceMappingURL=client.js.map
+//# sourceMappingURL=client.browser.js.map

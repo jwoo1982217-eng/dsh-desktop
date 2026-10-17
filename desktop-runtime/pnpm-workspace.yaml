@@ -11,6 +11,6 @@ allowBuilds:
   '@google/genai': true
 overrides:
   http-cache-semantics: 4.2.0
-  '@deepseek-ai/dsh-llm': 0.2.1-alpha.1
-  '@deepseek-ai/dsh-credentials': 0.2.1-alpha.1
-  '@deepseek-ai/dsh-commands': 0.2.1-alpha.1
+  '@deepseek-ai/dsh-llm': 0.2.1-alpha.4
+  '@deepseek-ai/dsh-credentials': 0.2.1-alpha.4
+  '@deepseek-ai/dsh-commands': 0.2.1-alpha.4
