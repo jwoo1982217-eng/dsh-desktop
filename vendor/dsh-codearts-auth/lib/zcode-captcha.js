@@ -1940,4 +1940,3 @@ export class ZcodeCaptchaBrowser {
  * 目前仅用于文档目的 —— 实际路径解析在 `zcode.ts` 的候选表里。
  */
 export const ZCODE_HOME = homedir();
-//# sourceMappingURL=zcode-captcha.js.map

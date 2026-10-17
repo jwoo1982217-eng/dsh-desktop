@@ -351,4 +351,3 @@ export async function runZcodeLogin(options = {}) {
     throw new ZcodeLoginError(`登录超时（${Math.round((Date.now() - (deadline - timeoutMs)) / 1000)} 秒内未完成授权）。` +
         `请重新发起并用浏览器打开授权页。`, 'timeout');
 }
-//# sourceMappingURL=zcode-login.js.map

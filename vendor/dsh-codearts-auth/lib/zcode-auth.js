@@ -1963,4 +1963,3 @@ export function emptyCheckinStatus(active, actionRequired = false) {
         ...actionRequired ? { actionRequired: true } : {},
     };
 }
-//# sourceMappingURL=zcode-auth.js.map

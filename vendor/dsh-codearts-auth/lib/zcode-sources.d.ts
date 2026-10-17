@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { AccountPool } from './account-pool.js';
 import type { ProviderAccountEntry } from './types.js';
 import type { ZcodeCredential } from './zcode.js';
+import { type ResetType } from './zcode-plan-reset.js';
 export interface ZcodeSourceProjection {
     id: string;
     kind: 'start-plan' | 'individual' | 'organization-flow' | 'team';
@@ -44,6 +45,16 @@ export declare class ZcodeSources {
         }[];
     }>;
     select(accountId: string, sourceId: string): Promise<void>;
+    reset(accountId: string, sourceId: string, action: 'status' | 'opportunity' | 'use', options?: {
+        idempotencyKey?: string;
+        resetType?: ResetType;
+        confirmed?: boolean;
+    }): Promise<import("./zcode-plan-reset.js").ResetStatus | {
+        granted: boolean;
+        nextTryAt: number | null;
+    } | {
+        used: true;
+    }>;
     resolve(entry: ProviderAccountEntry, c: ZcodeCredential): Promise<ZcodeCredential>;
 }
 //# sourceMappingURL=zcode-sources.d.ts.map

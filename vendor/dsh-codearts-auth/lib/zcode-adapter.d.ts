@@ -270,6 +270,7 @@ export declare class ZcodeAdapter extends LlmAdapter {
     private inputModalitiesFor;
     /** 就绪判据：默认看磁盘上有没有可用凭据。 */
     private ready;
+    private modelsForSources;
     listModels(_provider: string): Promise<readonly LlmModelInfo[]>;
     resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
     /**
