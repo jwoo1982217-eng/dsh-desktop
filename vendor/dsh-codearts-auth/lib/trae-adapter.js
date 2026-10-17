@@ -1805,4 +1805,3 @@ export function registerTraeLlm(ctx, options) {
     // 故必须由调用方持有引用。
     return adapter;
 }
-//# sourceMappingURL=trae-adapter.js.map

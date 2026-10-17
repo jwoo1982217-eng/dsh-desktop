@@ -276,4 +276,3 @@ export function registerAutoclaw(ctx, pool, readImage) {
     registerAdapterIdempotent(ctx.llm, [AUTOCLAW.id], integration.adapter, message => ctx.logger.warn(message));
     return integration;
 }
-//# sourceMappingURL=autoclaw.js.map

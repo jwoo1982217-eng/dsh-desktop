@@ -187,4 +187,3 @@ export function resetCaptchaSupply() {
     stats.interactive = 0;
     waiters.length = 0;
 }
-//# sourceMappingURL=captcha-supply.js.map

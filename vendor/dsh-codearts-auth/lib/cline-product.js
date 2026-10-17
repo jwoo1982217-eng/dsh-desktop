@@ -186,4 +186,3 @@ export const CLINE_MODELS_PATH = '/api/v1/models';
 export const CLINE_RECOMMENDED_MODELS_PATH = '/api/v1/ai/cline/recommended-models';
 /** 账号信息（挂 `apiBase`）。 */
 export const CLINE_ME_PATH = '/api/v1/users/me';
-//# sourceMappingURL=cline-product.js.map

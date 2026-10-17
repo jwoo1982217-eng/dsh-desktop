@@ -407,4 +407,3 @@ export async function fetchMinimaxCreditBalance(credential, fetcher = fetch, pro
     }
     return { total: roundCredits(total), packages: [], expiredTotal: 0 };
 }
-//# sourceMappingURL=minimax-credits.js.map

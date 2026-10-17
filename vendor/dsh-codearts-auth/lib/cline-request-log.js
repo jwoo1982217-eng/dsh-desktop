@@ -112,4 +112,3 @@ export function clineUpstreamOf(model) {
 export function resetClineRequestHistory() {
     history = [];
 }
-//# sourceMappingURL=cline-request-log.js.map

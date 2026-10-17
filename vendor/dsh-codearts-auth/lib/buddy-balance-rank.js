@@ -213,4 +213,3 @@ export function describeBuddyCreditSplit(split, windowDays = BUDDY_EXPIRING_WIND
 function roundCreditsInline(value) {
     return Math.round(value * 100) / 100;
 }
-//# sourceMappingURL=buddy-balance-rank.js.map

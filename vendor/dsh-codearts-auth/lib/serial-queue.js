@@ -114,4 +114,3 @@ export class SerialQueue {
         });
     }
 }
-//# sourceMappingURL=serial-queue.js.map

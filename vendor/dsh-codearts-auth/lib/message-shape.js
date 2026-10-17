@@ -83,4 +83,3 @@ export function normalizeHarnessMessages(messages) {
     }
     return normalized;
 }
-//# sourceMappingURL=message-shape.js.map

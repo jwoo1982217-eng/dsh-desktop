@@ -176,4 +176,3 @@ export const TRAE = {
     userAgent: 'Trae/0.1.52',
     fallbackModels: TRAE_FALLBACK_MODELS,
 };
-//# sourceMappingURL=trae-product.js.map

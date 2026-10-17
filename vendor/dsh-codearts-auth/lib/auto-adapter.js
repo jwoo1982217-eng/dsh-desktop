@@ -536,4 +536,3 @@ export async function pickCurrentAutoProvider(ctx, options) {
     const picked = await probe.selectProvider(undefined, p => probe.firstModelOf(p));
     return picked?.provider;
 }
-//# sourceMappingURL=auto-adapter.js.map

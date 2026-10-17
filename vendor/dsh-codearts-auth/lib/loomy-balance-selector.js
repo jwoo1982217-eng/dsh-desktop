@@ -156,4 +156,3 @@ export class LoomyBalanceSelector {
         return errors.length > 0 ? { kind: 'unknown', errors } : { kind: 'exhausted' };
     }
 }
-//# sourceMappingURL=loomy-balance-selector.js.map

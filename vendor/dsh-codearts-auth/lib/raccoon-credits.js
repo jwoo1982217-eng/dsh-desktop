@@ -205,4 +205,3 @@ export const raccoonCreditsForDefaultProduct = {
     claimLoginReward: (credential, fetcher) => claimRaccoonLoginReward(RACCOON, credential, fetcher),
     fetchOnboardingStatus: (credential, fetcher) => fetchRaccoonOnboardingStatus(RACCOON, credential, fetcher),
 };
-//# sourceMappingURL=raccoon-credits.js.map

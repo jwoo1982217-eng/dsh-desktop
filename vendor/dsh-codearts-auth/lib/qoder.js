@@ -308,4 +308,3 @@ export function withQoderNickname(credential, nickname) {
         return credential;
     return { ...credential, nickname };
 }
-//# sourceMappingURL=qoder.js.map

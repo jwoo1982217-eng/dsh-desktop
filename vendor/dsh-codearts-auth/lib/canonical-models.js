@@ -288,4 +288,3 @@ export function canonicalDisplayName(key) {
     // === 'function'`。
     return Object.hasOwn(CANONICAL_NAMES, key) ? CANONICAL_NAMES[key] : key;
 }
-//# sourceMappingURL=canonical-models.js.map

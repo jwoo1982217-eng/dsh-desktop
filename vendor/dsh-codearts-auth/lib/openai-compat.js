@@ -1058,4 +1058,3 @@ export async function* consumeOpenAiSse(response, options, config) {
     // 故天然不冲突。
     yield { type: 'finish', reason: resolveEmptyResponseReason(reason, blockCount) };
 }
-//# sourceMappingURL=openai-compat.js.map

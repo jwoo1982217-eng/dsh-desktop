@@ -131,4 +131,3 @@ export function keyPairFromStoredJwk(jwk) {
         publicKeyJwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y },
     };
 }
-//# sourceMappingURL=oauth.js.map

@@ -587,4 +587,3 @@ function consumeSseLine(rawLine) {
         return undefined;
     return line.slice(5).trim();
 }
-//# sourceMappingURL=gemini-messages.js.map

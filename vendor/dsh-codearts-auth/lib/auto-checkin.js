@@ -526,4 +526,3 @@ function defaultSchedule(fn, ms) {
     timer.unref?.();
     return { cancel: () => clearTimeout(timer) };
 }
-//# sourceMappingURL=auto-checkin.js.map

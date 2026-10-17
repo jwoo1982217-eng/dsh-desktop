@@ -248,4 +248,3 @@ export function fallbackToEntry(model) {
 export function minimaxFallbackEntries(product = MINIMAX) {
     return product.fallbackModels.map(fallbackToEntry);
 }
-//# sourceMappingURL=minimax.js.map

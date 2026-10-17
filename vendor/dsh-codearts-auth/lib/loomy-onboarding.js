@@ -172,4 +172,3 @@ export async function claimAllLoomyOnboardingTasks(credential, product, fetcher 
         total: state.total,
     };
 }
-//# sourceMappingURL=loomy-onboarding.js.map

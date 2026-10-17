@@ -658,4 +658,3 @@ export function registerLoomyLlm(ctx, options) {
     registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     return adapter;
 }
-//# sourceMappingURL=loomy-adapter.js.map

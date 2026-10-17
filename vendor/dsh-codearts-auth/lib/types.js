@@ -7,4 +7,3 @@
 export const BACKUP_FORMAT = 'dsh-codearts-auth/backup';
 /** 备份格式版本：格式演进时递增并保留迁移逻辑。 */
 export const BACKUP_VERSION = 1;
-//# sourceMappingURL=types.js.map

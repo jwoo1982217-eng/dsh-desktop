@@ -589,4 +589,3 @@ function accumulateBucket(target, source) {
 }
 /** 历史视图的最大回看天数（防一次下发过大；落盘本身已有 90 天淘汰）。 */
 export const TOKEN_LEDGER_HISTORY_MAX_DAYS = 90;
-//# sourceMappingURL=token-ledger.js.map

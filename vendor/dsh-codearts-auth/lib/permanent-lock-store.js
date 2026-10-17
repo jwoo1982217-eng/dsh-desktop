@@ -113,4 +113,3 @@ export function createPermanentLockStore(ctx) {
     }
     return new FileLockStore(join(home, 'jet-hub', PERMANENT_LOCKS_FILE), ctx.logger);
 }
-//# sourceMappingURL=permanent-lock-store.js.map

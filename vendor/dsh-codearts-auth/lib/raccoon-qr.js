@@ -518,4 +518,3 @@ export function renderQrSvg(text, options = {}) {
         + `<path d="${segments.join('')}" fill="${dark}"/>`
         + '</svg>';
 }
-//# sourceMappingURL=raccoon-qr.js.map

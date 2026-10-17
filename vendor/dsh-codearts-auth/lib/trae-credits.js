@@ -335,4 +335,3 @@ export function makeTraeClaimHandler(_product) {
 export function makeTraeBalanceHandler(_product) {
     return async (credential) => fetchTraeCreditBalance(credential, {});
 }
-//# sourceMappingURL=trae-credits.js.map

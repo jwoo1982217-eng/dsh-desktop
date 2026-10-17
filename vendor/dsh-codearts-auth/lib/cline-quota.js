@@ -206,4 +206,3 @@ export async function fetchClineUsageLimits(credential, product, fetcher = fetch
     }
     return { ok: true, windows: result.windows, ...result.error === undefined ? {} : { error: result.error } };
 }
-//# sourceMappingURL=cline-quota.js.map

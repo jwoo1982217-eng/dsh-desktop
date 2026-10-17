@@ -616,4 +616,3 @@ export function registerGeminiLlm(ctx, options) {
 export function geminiEffortId(id) {
     return ReasoningEffortId(id);
 }
-//# sourceMappingURL=gemini-adapter.js.map

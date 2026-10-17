@@ -152,4 +152,3 @@ function unitOf(packages) {
     const raw = packages.find((pkg) => typeof pkg.unit === 'string' && pkg.unit.length > 0)?.unit ?? '';
     return normalizeCreditUnit(raw);
 }
-//# sourceMappingURL=badge-subscription.js.map

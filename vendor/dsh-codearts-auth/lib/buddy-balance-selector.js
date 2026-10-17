@@ -267,4 +267,3 @@ export async function pickBuddyAccount(selector, candidates, options) {
     // 未锁定时的失败只可能是凭据问题，交给调用方继续走池的兜底。
     return { kind: allowPermanent ? 'exhausted' : 'locked', tried, ...reason ? { reason } : {} };
 }
-//# sourceMappingURL=buddy-balance-selector.js.map

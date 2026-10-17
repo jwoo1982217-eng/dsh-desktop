@@ -152,4 +152,3 @@ export async function projectRequestImage(attachment, options) {
 function isPositiveFinite(value) {
     return typeof value === 'number' && Number.isFinite(value) && value > 0;
 }
-//# sourceMappingURL=image-budget.js.map

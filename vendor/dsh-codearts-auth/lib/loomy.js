@@ -184,4 +184,3 @@ export function loomyChatHeaders(token) {
         token,
     };
 }
-//# sourceMappingURL=loomy.js.map

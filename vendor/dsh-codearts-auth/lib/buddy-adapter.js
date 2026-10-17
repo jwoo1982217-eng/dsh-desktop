@@ -2393,4 +2393,3 @@ export function registerBuddyLlm(ctx, options) {
     // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
     return adapter;
 }
-//# sourceMappingURL=buddy-adapter.js.map

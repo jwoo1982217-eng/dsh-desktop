@@ -163,4 +163,3 @@ export function canonicalReasoningEffortFor(effort) {
     }
     return best?.canonical;
 }
-//# sourceMappingURL=reasoning-ladder.js.map

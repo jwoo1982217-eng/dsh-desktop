@@ -306,4 +306,3 @@ export async function loadClineModels(product, options = {}) {
 export function hasClineRemoteModels(remote) {
     return remote.freeIds.length + remote.remoteIds.length + remote.entries.length > 0;
 }
-//# sourceMappingURL=cline-models.js.map

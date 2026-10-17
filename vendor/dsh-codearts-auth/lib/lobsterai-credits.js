@@ -344,4 +344,3 @@ export async function fetchLobsteraiCreditBalance(credential, product, fetcher =
 function roundCredits(value) {
     return Math.round(value * 100) / 100;
 }
-//# sourceMappingURL=lobsterai-credits.js.map

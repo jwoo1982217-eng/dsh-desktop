@@ -2274,4 +2274,3 @@ export async function runGrowthTaskCompletions(credential, product, fetcher = fe
                     : { ...(uidHint.length > 0 ? { message: uidHint.replace(/^；/, '') } : {}) }),
     };
 }
-//# sourceMappingURL=buddy-growth.js.map

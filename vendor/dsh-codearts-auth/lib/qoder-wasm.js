@@ -462,4 +462,3 @@ export const __testing = {
     },
     wasmPath: WASM_PATH,
 };
-//# sourceMappingURL=qoder-wasm.js.map

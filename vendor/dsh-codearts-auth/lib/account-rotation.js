@@ -72,4 +72,3 @@ export function afterAccount(accounts, last) {
         return [...accounts];
     return [...accounts.slice(index + 1), ...accounts.slice(0, index + 1)];
 }
-//# sourceMappingURL=account-rotation.js.map

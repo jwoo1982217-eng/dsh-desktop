@@ -423,4 +423,3 @@ export function createPoolRefresh(pool, productId, auth) {
         }
     };
 }
-//# sourceMappingURL=buddy-auth.js.map

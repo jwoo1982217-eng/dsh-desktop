@@ -367,4 +367,3 @@ export function createTokenLedgerStore(ctx) {
     }
     return new FileLedgerStore(join(home, 'jet-hub', TOKEN_LEDGER_FILE), ctx.logger);
 }
-//# sourceMappingURL=token-ledger-store.js.map

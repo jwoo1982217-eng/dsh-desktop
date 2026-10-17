@@ -237,4 +237,3 @@ export async function bindLoomySkip(rcode, product, fetcher = fetch) {
         throw new Error('微信登录响应缺少 userid');
     return { session, userid };
 }
-//# sourceMappingURL=loomy-oauth.js.map

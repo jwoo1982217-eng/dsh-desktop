@@ -217,4 +217,3 @@ export class CarrierPageServer {
         response.end(html);
     }
 }
-//# sourceMappingURL=captcha-carrier-server.js.map

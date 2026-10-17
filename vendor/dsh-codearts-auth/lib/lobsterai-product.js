@@ -157,4 +157,3 @@ export const ALL_LOBSTERAI_PRODUCTS = [LOBSTERAI];
 export function lobsteraiProductById(id) {
     return ALL_LOBSTERAI_PRODUCTS.find((product) => product.id === id);
 }
-//# sourceMappingURL=lobsterai-product.js.map

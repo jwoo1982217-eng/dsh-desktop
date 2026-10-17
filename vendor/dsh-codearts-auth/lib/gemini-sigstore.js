@@ -238,4 +238,3 @@ export function createGeminiSigStore(ctx) {
     }
     return new GeminiSigStore(join(home, 'jet-hub', GEMINI_SIG_FILE), ctx.logger);
 }
-//# sourceMappingURL=gemini-sigstore.js.map

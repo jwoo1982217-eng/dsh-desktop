@@ -129,4 +129,3 @@ export const MINIMAX_OAUTH_TIMEOUT_MS = 20_000;
  * 我们**不照抄**这么久的缓存（DSH 按需拉取目录），故实现缓存时也应重新评估。
  */
 export const MINIMAX_MODEL_TTL_MS = 300_000;
-//# sourceMappingURL=minimax-product.js.map

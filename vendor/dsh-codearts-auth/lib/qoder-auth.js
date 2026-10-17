@@ -447,4 +447,3 @@ export class QoderAuth extends Service {
         return parseCredential(resolved.value);
     }
 }
-//# sourceMappingURL=qoder-auth.js.map

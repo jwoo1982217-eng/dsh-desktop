@@ -126,4 +126,3 @@ export function loomyAuthHeaders(options) {
         headers['Content-MD5'] = md5;
     return headers;
 }
-//# sourceMappingURL=loomy-sign.js.map

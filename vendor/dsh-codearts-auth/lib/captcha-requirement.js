@@ -91,4 +91,3 @@ export function resetCaptchaRequirementMemory() {
     probeFirstCount = 0;
     knownRequiredCount = 0;
 }
-//# sourceMappingURL=captcha-requirement.js.map

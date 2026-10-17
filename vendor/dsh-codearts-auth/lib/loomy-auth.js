@@ -422,4 +422,3 @@ export class LoomyAuth extends Service {
         return claimAllLoomyOnboardingTasks(credential, this.product, this.fetchImpl);
     }
 }
-//# sourceMappingURL=loomy-auth.js.map

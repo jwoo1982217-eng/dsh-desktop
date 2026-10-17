@@ -528,4 +528,3 @@ export async function claimCodeArtsDailyCheckin(credential, fetcher = fetch) {
 function roundCredits(value) {
     return Math.round(value * 100) / 100;
 }
-//# sourceMappingURL=codearts-credits.js.map

@@ -363,4 +363,3 @@ export const ALL_QODER_PRODUCTS = [QODER, QODER_CN];
 export function qoderProductById(id) {
     return ALL_QODER_PRODUCTS.find((product) => product.id === id);
 }
-//# sourceMappingURL=qoder-product.js.map

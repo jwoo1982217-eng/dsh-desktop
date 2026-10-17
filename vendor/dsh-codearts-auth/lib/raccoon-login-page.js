@@ -494,4 +494,3 @@ export function renderRaccoonLoginPage(product, qrCode) {
 </body>
 </html>`;
 }
-//# sourceMappingURL=raccoon-login-page.js.map

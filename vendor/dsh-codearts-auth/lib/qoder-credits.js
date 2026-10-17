@@ -642,4 +642,3 @@ export async function claimQoderDailyCheckin(credential, product, fetcher = fetc
         return { kind: 'failed', code: -1, message: firstError };
     return { kind: 'already-claimed', message: '今天已领取', ...stale };
 }
-//# sourceMappingURL=qoder-credits.js.map

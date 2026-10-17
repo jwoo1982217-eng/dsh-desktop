@@ -215,4 +215,3 @@ export function createUsageBadge(deps) {
 function isAllFailed(snapshot) {
     return snapshot.accounts.length > 0 && snapshot.accounts.every((row) => row.error !== undefined);
 }
-//# sourceMappingURL=usage-badge.js.map

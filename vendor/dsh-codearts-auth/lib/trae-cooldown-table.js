@@ -33,4 +33,3 @@ export const TRAE_COOLDOWN_MS = {
 export function traeCooldownFor(kind) {
     return TRAE_COOLDOWN_MS[kind] ?? 3_600_000;
 }
-//# sourceMappingURL=trae-cooldown-table.js.map

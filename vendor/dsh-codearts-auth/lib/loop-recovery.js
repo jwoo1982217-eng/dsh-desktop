@@ -203,4 +203,3 @@ export function installLoopResume(ctx) {
         scope.on('agent/disposed', ({ agent }) => { controller.forget(agent); });
     });
 }
-//# sourceMappingURL=loop-recovery.js.map

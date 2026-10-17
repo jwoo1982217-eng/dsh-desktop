@@ -182,4 +182,3 @@ export async function claimLoomyDailyQuota(credential, product, fetcher = fetch)
         : (dailyQuota ?? 0);
     return { kind: 'claimed', credit: granted, streakDays: 0, isStreakDay: false };
 }
-//# sourceMappingURL=loomy-credits.js.map

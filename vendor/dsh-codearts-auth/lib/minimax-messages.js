@@ -613,4 +613,3 @@ export async function* consumeMinimaxSse(options) {
     yield { type: 'usage', usage };
     yield { type: 'finish', reason: mapMinimaxStopReason(stopReason) };
 }
-//# sourceMappingURL=minimax-messages.js.map

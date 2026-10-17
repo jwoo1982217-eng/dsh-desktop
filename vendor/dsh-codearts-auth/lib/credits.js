@@ -469,4 +469,3 @@ export function formatClaimGains(totals) {
     }
     return parts.length === 0 ? null : parts.join(', ');
 }
-//# sourceMappingURL=credits.js.map

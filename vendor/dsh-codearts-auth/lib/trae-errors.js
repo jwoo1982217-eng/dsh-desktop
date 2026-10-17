@@ -124,4 +124,3 @@ export function recordsTraeRateLimit(kind) {
 export function isTraeTerminalError(kind) {
     return kind === 'session-dead';
 }
-//# sourceMappingURL=trae-errors.js.map

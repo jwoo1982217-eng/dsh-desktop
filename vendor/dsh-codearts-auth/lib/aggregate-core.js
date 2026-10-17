@@ -113,4 +113,3 @@ export function rankCandidates(candidates) {
         .slice()
         .sort((a, b) => (a.expiry !== b.expiry ? a.expiry - b.expiry : a.price - b.price));
 }
-//# sourceMappingURL=aggregate-core.js.map

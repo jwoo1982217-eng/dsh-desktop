@@ -415,4 +415,3 @@ export function parseMinimaxModelsPayload(payload) {
     }
     return out;
 }
-//# sourceMappingURL=minimax-auth.js.map

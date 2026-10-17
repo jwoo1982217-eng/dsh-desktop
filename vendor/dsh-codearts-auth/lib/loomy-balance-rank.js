@@ -92,4 +92,3 @@ export function rankLoomyAccountsByBalance(accounts, options = {}) {
         .sort((a, b) => (a.tier - b.tier) || (a.index - b.index))
         .map((entry) => entry.account);
 }
-//# sourceMappingURL=loomy-balance-rank.js.map

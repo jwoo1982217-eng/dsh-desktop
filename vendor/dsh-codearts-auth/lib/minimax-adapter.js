@@ -362,4 +362,3 @@ export function registerMinimaxLlm(ctx, options) {
     registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     return adapter;
 }
-//# sourceMappingURL=minimax-adapter.js.map

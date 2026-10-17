@@ -379,4 +379,3 @@ export function registerAdapterIdempotent(llm, providers, adapter, warn, pruning
         return undefined;
     }
 }
-//# sourceMappingURL=llm-register-compat.js.map

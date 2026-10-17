@@ -385,4 +385,3 @@ function quotaRejectionHint(text) {
     }
     return text === '' ? '' : `：${text.slice(0, 160)}`;
 }
-//# sourceMappingURL=gemini-credits.js.map

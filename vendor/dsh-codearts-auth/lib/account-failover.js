@@ -24,4 +24,3 @@ export function hasStreamOutput(chunk) {
         return true;
     return ['text-delta', 'reasoning-delta', 'tool-call', 'tool-call-start', 'tool-call-delta', 'tool-input-delta', 'tool-input-start'].includes(c?.type);
 }
-//# sourceMappingURL=account-failover.js.map

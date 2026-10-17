@@ -1096,4 +1096,3 @@ export function isProseTruncatedByStopString(text) {
     // ② 必须以未闭合的开引号收尾（或半个标签，服务端可能已吐出一部分）
     return /`$/.test(tail) || /<$/.test(tail) || /<\/think$/.test(tail);
 }
-//# sourceMappingURL=sse.js.map

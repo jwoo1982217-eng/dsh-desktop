@@ -267,4 +267,3 @@ export async function fetchRaccoonUserInfo(product, credential, fetcher = fetch)
         return {};
     }
 }
-//# sourceMappingURL=raccoon-oauth.js.map

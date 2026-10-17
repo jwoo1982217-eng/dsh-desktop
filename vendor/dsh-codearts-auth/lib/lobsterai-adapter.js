@@ -1524,4 +1524,3 @@ export function buildLobsteraiModelsUrl(product, credential, clientVersion) {
 }
 /** 模型列表请求超时（与其它控制面请求一致）。 */
 export const LOBSTERAI_MODELS_TIMEOUT_MS = LOBSTERAI_REQUEST_TIMEOUT_MS;
-//# sourceMappingURL=lobsterai-adapter.js.map

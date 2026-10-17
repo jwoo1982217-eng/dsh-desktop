@@ -552,4 +552,3 @@ export async function zcodeExpiry(credential) {
         return nextUtc8DayStartMs();
     return NEVER;
 }
-//# sourceMappingURL=aggregate-expiry.js.map

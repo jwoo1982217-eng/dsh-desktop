@@ -431,4 +431,3 @@ function renderQrPage(qrDataUrl) {
 </body>
 </html>`;
 }
-//# sourceMappingURL=loomy-wechat-login.js.map
