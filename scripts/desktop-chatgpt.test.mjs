@@ -10,7 +10,7 @@ test('desktop installation and reinstall preserve existing bundles and account-i
   const root = await mkdtemp(path.join(tmpdir(), 'dsh-desktop-chatgpt-')); t.after(() => rm(root, { recursive: true, force: true }));
   const profile = path.join(root, 'profile'), modules = path.join(root, 'node_modules'); await mkdir(profile);
   for (const name of ['dsh', 'schemastery', 'dsh-credentials', 'dsh-llm']) {
-    const dir = path.join(modules, '@deepseek-ai', name); await mkdir(dir, { recursive: true }); await writeFile(path.join(dir, 'package.json'), JSON.stringify({ version: '0.2.1-alpha.1' }));
+    const dir = path.join(modules, '@deepseek-ai', name); await mkdir(dir, { recursive: true }); await writeFile(path.join(dir, 'package.json'), JSON.stringify({ version: '0.2.1-alpha.4' }));
   }
   const manifest = { dependencies: { existing: 'file:./existing' }, dsh: { profile: { bundles: ['existing', 'dsh-peer'] } } };
   await writeFile(path.join(profile, 'package.json'), JSON.stringify(manifest)); await writeFile(path.join(profile, 'credentials-marker'), 'preserve this');
@@ -22,7 +22,7 @@ test('desktop installation and reinstall preserve existing bundles and account-i
   for (const name of ['chatgpt-account.js', 'chatgpt-adapter.js', 'chatgpt.js']) assert.equal(await readFile(path.join(profile, 'node_modules/dsh-desktop-chatgpt', name), 'utf8'), await readFile(new URL('../phone-account/' + name, import.meta.url), 'utf8'));
   const before = await readFile(path.join(profile, 'package.json'), 'utf8');
   await writeFile(path.join(modules, '@deepseek-ai/dsh/package.json'), JSON.stringify({ version: '0.9.0' }));
-  await assert.rejects(installDesktopChatGpt(profile, modules), /0.2.1-alpha.1/);
+  await assert.rejects(installDesktopChatGpt(profile, modules), /0.2.1-alpha.4/);
   assert.equal(await readFile(path.join(profile, 'package.json'), 'utf8'), before);
 });
 

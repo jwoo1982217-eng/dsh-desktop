@@ -9,7 +9,7 @@ export async function installDesktopBrowser(profile, modules) {
   const manifestFile = path.join(profile, 'package.json'), original = await readFile(manifestFile, 'utf8'), manifest = JSON.parse(original);
   if (!Array.isArray(manifest.dsh?.profile?.bundles)) throw Error('请选择已有 DSH Web profile');
   const engine = JSON.parse(await readFile(path.join(modules, '@deepseek-ai/dsh/package.json'), 'utf8'));
-  if (engine.version !== '0.2.1-alpha.1') throw Error('浏览器面板适配 DSH 0.2.1-alpha.1，请先验证其他核心版本');
+  if (engine.version !== '0.2.1-alpha.4') throw Error('浏览器面板适配 DSH 0.2.1-alpha.4，请先验证其他核心版本');
   const target = path.join(profile, 'node_modules/dsh-desktop-browser'), staging = target + '.new-' + randomUUID(), backup = target + '.old-' + randomUUID(), temporary = manifestFile + '.browser-' + randomUUID();
   let old = false, installed = false;
   try {

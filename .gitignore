@@ -22,3 +22,7 @@ my-qq*.json
 __pycache__/
 *.pyc
 phone-qq/private-*.zip
+
+# 固定哈希生成的 OpenCode 运行组件
+/native/opencode/
+/native/.opencode-cache/

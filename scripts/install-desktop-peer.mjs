@@ -11,7 +11,7 @@ export async function installDesktopPeer(profile, modules) {
   const original = await readFile(manifestPath, 'utf8'), manifest = JSON.parse(original);
   if (!Array.isArray(manifest.dsh?.profile?.bundles)) throw Error('请选择已有 DSH profile，目录内须有 dsh.profile.bundles');
   const engine = JSON.parse(await readFile(path.join(modules, '@deepseek-ai/dsh/package.json'), 'utf8'));
-  if (engine.version !== '0.2.1-alpha.1') throw Error('当前远程插件适配 DSH 0.2.1-alpha.1；请使用匹配的桌面运行时');
+  if (engine.version !== '0.2.1-alpha.4') throw Error('当前远程插件适配 DSH 0.2.1-alpha.4；请使用匹配的桌面运行时');
   // pnpm desktops normally expose only the CLI at the project root. Locate
   // its transitive bundle dependencies in their real pnpm package trees.
   const locations = [modules];
@@ -40,10 +40,15 @@ export async function installDesktopPeer(profile, modules) {
     for (const name of files) await cp(path.join(root, 'peer', name), path.join(staging, name));
     await cp(path.join(root, 'peer/vendor'), path.join(staging, 'vendor'), { recursive: true });
     await cp(path.join(root, 'peer/agent-cards'), path.join(staging, 'agent-cards'), { recursive: true });
+    await cp(path.join(root, 'peer/knowledge-link'), path.join(staging, 'knowledge-link'), { recursive: true });
     await cp(path.join(root, 'peer/chat-history'), path.join(staging, 'chat-history'), { recursive: true });
     await cp(path.join(root, 'peer/chat-files'), path.join(staging, 'chat-files'), { recursive: true });
     await cp(path.join(root, 'peer/memory-isolation'), path.join(staging, 'memory-isolation'), { recursive: true });
+    await cp(path.join(root, 'peer/task-supervisor'), path.join(staging, 'task-supervisor'), { recursive: true });
     await cp(path.join(root, 'peer/mcp-manager'), path.join(staging, 'mcp-manager'), { recursive: true });
+    await cp(path.join(root, 'peer/on-demand-tools'), path.join(staging, 'on-demand-tools'), { recursive: true });
+    await cp(path.join(root, 'peer/subagent-scheduler'), path.join(staging, 'subagent-scheduler'), { recursive: true });
+    await cp(path.join(root, 'peer/legacy-subagent-policy'), path.join(staging, 'legacy-subagent-policy'), { recursive: true });
     await cp(path.join(root, 'peer/controlled-market'), path.join(staging, 'controlled-market'), { recursive: true });
     await cp(path.join(root, 'peer/workflow-hub'), path.join(staging, 'workflow-hub'), { recursive: true });
     for (const [source, dest] of [['peer/presentation.css', 'presentation.css'], ['peer/presentation.js', 'presentation.js'], ['peer/browser-compat.js', 'browser-compat.js'], ['phone-qq/skill-import.js', 'skill-import.js']]) await cp(path.join(root, source), path.join(staging, dest));

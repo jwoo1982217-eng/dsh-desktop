@@ -8,7 +8,7 @@ export async function installDesktopChatGpt(profile, modules) {
   const manifestFile = path.join(profile, 'package.json'), original = await readFile(manifestFile, 'utf8'), manifest = JSON.parse(original);
   if (!Array.isArray(manifest.dsh?.profile?.bundles)) throw Error('请选择已有 DSH profile');
   const engine = JSON.parse(await readFile(path.join(modules, '@deepseek-ai/dsh/package.json'), 'utf8'));
-  if (engine.version !== '0.2.1-alpha.1') throw Error('此插件适配 DSH 0.2.1-alpha.1，请先验证其他核心版本');
+  if (engine.version !== '0.2.1-alpha.4') throw Error('此插件适配 DSH 0.2.1-alpha.4，请先验证其他核心版本');
   const locations = [modules];
   async function locate(name, required = true) {
     for (const location of [...locations]) {

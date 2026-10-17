@@ -1,6 +1,8 @@
 # 源码来源
 
-电脑版适配基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，核心固定为 npm 发布的 `0.2.1-alpha.1`。依赖由 `desktop-runtime/pnpm-lock.yaml` 固定，安装时校验锁文件。
+- `team/vendor/ds-bot`：正式 npm `ds-bot@0.1.5`，来源 [Fei2411/DeepSeek-Bot](https://github.com/Fei2411/DeepSeek-Bot)，沿用 Apache-2.0 许可证；原始文件和发行完整性在 `team/upstream.json` 登记。`team` 的本地适配负责模式切换、角色卡复制和已有工具、技能衔接。
+
+电脑版适配基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)，核心固定为 npm 发布的 `0.2.1-alpha.4`。依赖由 `desktop-runtime/pnpm-lock.yaml` 固定，安装时校验锁文件。
 
 本次独立整理的源文件来自 [DSH 手机与共享适配仓库](https://cnb.cool/applecabal/dsh-phone) 的提交 `904ea96477626bbdb96989f7394f9f3ae6719337`，保留电脑版安装器、共享账号与远程协议、插件源码及兼容层。初始公开提交重新建立历史，不带私人开发目录或运行数据。
 

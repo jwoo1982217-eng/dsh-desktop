@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { installDesktopUpstream } from './install-desktop-upstream.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-export const desktopVersion = '0.2.1-alpha.1';
+export const desktopVersion = '0.2.1-alpha.4';
 
 export function assertDesktopNode(version = process.versions.node) {
   const [major, minor] = version.split('.').map(Number);

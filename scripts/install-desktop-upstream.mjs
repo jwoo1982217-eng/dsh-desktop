@@ -1,3 +1,5 @@
+import {installDesktopWorkbench} from './install-desktop-workbench.mjs';
+import {prepareProfileMigration, commitProfileMigration, migrationReceipt, restoreProfileMigration} from '../desktop/macos/app/profile-migration.mjs';
 import { readFile, writeFile, mkdir, cp, rename, symlink, rm, lstat, stat } from 'node:fs/promises';
 import { randomUUID, createHash } from 'node:crypto';
 import path from 'node:path';
@@ -7,6 +9,9 @@ import { installDesktopPeer } from './install-desktop-peer.mjs';
 import { installDesktopChatGpt } from './install-desktop-chatgpt.mjs';
 import { installDesktopBrowser } from './install-desktop-browser.mjs';
 import { installDesktopPocket } from './install-desktop-pocket.mjs';
+import { installDesktopTeam } from './install-desktop-team.mjs';
+import { buildTeamClient } from '../team/build-client.mjs';
+import { buildModelPicker } from './build-model-picker.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -33,7 +38,7 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
   desktop = desktop ? path.resolve(desktop) : null; profile = path.resolve(profile);
   const modules = path.join(root, 'desktop-runtime/node_modules');
   const version = JSON.parse(await readFile(path.join(modules, '@deepseek-ai/dsh/package.json'), 'utf8')).version;
-  if (version !== '0.2.1-alpha.1') throw Error('请先安装锁定的桌面运行时');
+  if (version !== '0.2.1-alpha.4') throw Error('请先安装锁定的桌面运行时');
   const manifestPath = path.join(profile, 'package.json');
   const original = await readFile(manifestPath, 'utf8'), manifest = JSON.parse(original);
   if (!Array.isArray(manifest.dsh?.profile?.bundles)) throw Error('请选择包含 dsh.profile.bundles 的 Web profile');
@@ -43,16 +48,33 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
   let hasJetHub = false;
   try { await lstat(currentJetHub); hasJetHub = true; }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
-  if (hasJetHub) for (const entry of expected.files) {
-    const digest = hash(await readFile(path.join(currentJetHub, entry.path)));
-    if (![entry.old, entry.new, entry.rotation, entry.upstreamRc3].includes(digest)) throw Error(`Jet Hub 的 ${entry.path} 有其他修改，请先合并兼容改动`);
+  if (hasJetHub) {
+    const verified = new Set(), missingSources = [];
+    for (const entry of expected.files) {
+      let bytes;
+      try { bytes = await readFile(path.join(currentJetHub, entry.path)); }
+      catch (error) {
+        if (error.code === 'ENOENT' && entry.path.startsWith('src/') && entry.path.endsWith('.ts')) {
+          missingSources.push(entry.path); continue;
+        }
+        throw error;
+      }
+      if (![entry.old, entry.new, entry.rotation, entry.upstreamRc3, entry.auditedDesktop].includes(hash(bytes))) throw Error(`Jet Hub 的 ${entry.path} 有其他修改，请先合并兼容改动`);
+      verified.add(entry.path);
+    }
+    // 正式分发包可以只有编译产物；对应 JS 必须在上述白名单中完整通过。
+    for (const name of missingSources) {
+      const compiled = 'lib/' + name.slice(4, -3) + '.js';
+      if (!verified.has(compiled)) throw Error(`Jet Hub 缺少已核对的运行文件 ${compiled}`);
+    }
   }
+  const profileMigration = await prepareProfileMigration(profile, modules);
   const backup = path.join(profile, '.upstream-rollback-' + randomUUID());
   await mkdir(backup, { mode: 0o700 });
   await writeFile(path.join(backup, 'package.json'), original, { mode: 0o600 });
   const swapped = [], copied = [];
   // 子安装器会替换本地自带插件，先保留完整副本，失败时连同清单一起恢复。
-  for (const name of ['dsh-peer', 'dsh-desktop-chatgpt', 'dsh-desktop-browser', 'dsh-pocket']) {
+  for (const name of ['dsh-peer', 'dsh-desktop-chatgpt', 'dsh-desktop-browser', 'dsh-pocket', 'dsh-team']) {
     const target = path.join(profile, 'node_modules', name), saved = path.join(backup, name);
     let existed = false;
     try { await lstat(target); await cp(target, saved, { recursive: true }); existed = true; }
@@ -61,7 +83,7 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
   }
   const launcher = desktop ? path.join(desktop, 'node_modules/.bin/dsh') : null;
   if (launcher) await cp(launcher, path.join(backup, 'dsh-launcher'));
-  const record = { profile, swapped, copied, launcher };
+  const record = { profile, swapped, copied, launcher, profilePatch:migrationReceipt(profileMigration, backup) };
   const saveRecord = () => writeFile(path.join(backup, 'restore.json'), JSON.stringify(record, null, 2), { mode: 0o600 });
   await saveRecord();
   const swap = async (target, source) => {
@@ -74,10 +96,11 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
     await saveRecord();
     await symlink(source, target);
   };
+  let migrationCommitted = false;
   try {
     // 核心会优先从自身安装目录解析组合包，部署时同步已审核的本地程序。
     for (const [name, source] of [['dsh-codearts-auth', 'vendor/dsh-codearts-auth'], ['@zseven-w/dsh-noema', 'vendor/dsh-noema'], ['dsh-peer', 'peer']]) {
-      for (const entry of ['package.json', 'cordis.patch.yml', 'lib', 'src', 'locale', 'vendor', 'agent-cards', 'chat-history', 'chat-files', 'memory-isolation', 'mcp-manager', 'controlled-market', 'workflow-hub', 'index.mjs', 'protocol.mjs', 'relay.mjs', 'tunnel.mjs', 'proxy.mjs', 'ui-reuse.mjs', 'browser-session.mjs', 'config-sync.mjs', 'page.html', 'presentation.css', 'presentation.js', 'browser-compat.js', 'skill-import.js']) {
+      for (const entry of ['package.json', 'cordis.patch.yml', 'lib', 'src', 'locale', 'vendor', 'agent-cards', 'chat-history', 'chat-files', 'memory-isolation', 'mcp-manager', 'subagent-scheduler', 'legacy-subagent-policy', 'controlled-market', 'workflow-hub', 'index.mjs', 'protocol.mjs', 'relay.mjs', 'tunnel.mjs', 'proxy.mjs', 'ui-reuse.mjs', 'browser-session.mjs', 'config-sync.mjs', 'page.html', 'presentation.css', 'presentation.js', 'browser-compat.js', 'skill-import.js']) {
         const file = path.join(root, source, entry);
         try { await lstat(file); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
         const deployed = path.join(modules, name, entry);
@@ -98,6 +121,7 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
     }
     // 新核心的移动适配均以本版源码为基线；桌面仍走原生分支。
     const { readdir } = await import('node:fs/promises');
+    await buildModelPicker();
     for (const name of await readdir(path.join(root, 'runtime/overlays/@deepseek-ai'))) {
       await cp(path.join(root, 'runtime/overlays/@deepseek-ai', name), path.join(modules, '@deepseek-ai', name), { recursive: true });
     }
@@ -109,6 +133,9 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
     if (await readFile(manifestPath, 'utf8') !== original) throw Error('安装期间 Profile 有其他修改');
     await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
     await installDesktopPeer(profile, modules);
+    await buildTeamClient();
+    await installDesktopTeam(profile, modules);
+    installDesktopWorkbench(profile);
     await installDesktopChatGpt(profile, modules);
     await installDesktopBrowser(profile, modules);
     await installDesktopPocket(profile, modules);
@@ -119,17 +146,20 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
       if (path.resolve(target) !== path.resolve(source)) await swap(target, source);
       await writeFile(launcher, '#!/bin/sh\nexec node "$(dirname "$0")/../@deepseek-ai/dsh/lib/bin.js" "$@"\n', { mode: 0o755 });
     }
+    await commitProfileMigration(profileMigration, backup);
+    migrationCommitted = profileMigration.changed;
     await saveRecord();
     return { version, profile, backup };
   } catch (error) {
-    await restoreDesktopUpstream(backup);
+    await restoreDesktopUpstream(backup, {skipProfilePatch:!migrationCommitted});
     throw error;
   }
 }
 
 /** 仅恢复安装入口与程序；用户会话的格式回退须使用升级前数据备份。 */
-export async function restoreDesktopUpstream(backup) {
+export async function restoreDesktopUpstream(backup, {skipProfilePatch = false} = {}) {
   const record = JSON.parse(await readFile(path.join(backup, 'restore.json'), 'utf8'));
+  if (!skipProfilePatch) await restoreProfileMigration(record.profilePatch);
   for (const { target, saved, existed } of [...record.swapped].reverse()) {
     await rm(target, { recursive: true, force: true });
     if (existed) await rename(saved, target);

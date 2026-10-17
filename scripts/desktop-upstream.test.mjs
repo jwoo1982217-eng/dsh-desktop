@@ -31,11 +31,49 @@ async function restored(f) {
 }
 test('desktop upgrade restores core, plugins and launcher after successful installation', async t => {
   const f = await fixture(t), result = await installDesktopUpstream(f.desktop, f.profile);
-  assert.equal(result.version, '0.2.1-alpha.1');
+  assert.equal(result.version, '0.2.1-alpha.4');
   assert.ok((await lstat(path.join(f.desktop, 'node_modules/@deepseek-ai/dsh'))).isSymbolicLink());
   await restoreDesktopUpstream(result.backup); await restored(f);
   assert.equal(await readFile(path.join(f.desktop, 'node_modules/@deepseek-ai/dsh/marker'), 'utf8'), 'old core');
 });
 test('failed core swap also restores both account and paired-peer bundles', async t => {
   const f = await fixture(t, true); await assert.rejects(installDesktopUpstream(f.desktop, f.profile)); await restored(f);
+});
+
+
+test('compiled-only installed Jet Hub is accepted while every corresponding JS remains verified', async t => {
+  const f = await fixture(t);
+  await rm(path.join(f.profile, 'node_modules/dsh-codearts-auth/src'), {recursive:true});
+  const result = await installDesktopUpstream(f.desktop, f.profile);
+  await restoreDesktopUpstream(result.backup);
+  await restored(f);
+});
+
+test('a missing compiled Jet Hub file refuses before writing the profile, then recovers', async t => {
+  const f = await fixture(t);
+  const file = 'lib/llm-adapter.js';
+  await rm(path.join(f.profile, 'node_modules/dsh-codearts-auth/src'), {recursive:true});
+  await rm(path.join(f.profile, 'node_modules/dsh-codearts-auth', file));
+  await assert.rejects(installDesktopUpstream(f.desktop, f.profile));
+  await restored(f);
+  await cp(path.join(source,file),path.join(f.profile,'node_modules/dsh-codearts-auth',file));
+  const result=await installDesktopUpstream(f.desktop,f.profile);
+  await restoreDesktopUpstream(result.backup);
+  await restored(f);
+});
+
+
+test('unknown edits of an audited desktop Jet Hub file are refused before writes; restoring exact bytes permits retry', async t => {
+  const f = await fixture(t);
+  const file = path.join(f.profile, 'node_modules/dsh-codearts-auth/lib/minimax-messages.js');
+  const original = await readFile(file);
+  const changed = Buffer.concat([original, Buffer.from('\n// unrecognized fixture edit\n')]);
+  await writeFile(file, changed);
+  await assert.rejects(installDesktopUpstream(f.desktop, f.profile), /lib\/minimax-messages\.js/);
+  await restored(f);
+  assert.deepEqual(await readFile(file), changed);
+  await writeFile(file, original);
+  const result = await installDesktopUpstream(f.desktop, f.profile);
+  await restoreDesktopUpstream(result.backup);
+  await restored(f);
 });

@@ -5,50 +5,58 @@
       "path": "lib/minimax-messages.js",
       "old": "0aab65589ec2d6c50bf45c028ca1599764623372009725c2aa02a7c5de440f8f",
       "new": "c0b5ffb1937e7757c2f0f11213d7efad15176761812a24d84f894fdffb61c678",
-      "upstreamRc3": "c0b5ffb1937e7757c2f0f11213d7efad15176761812a24d84f894fdffb61c678"
+      "upstreamRc3": "c0b5ffb1937e7757c2f0f11213d7efad15176761812a24d84f894fdffb61c678",
+      "auditedDesktop": "d41a1f02c8b0a9315f6e98206a25b310c19cd0f02132a03b8eaf65875159ca76"
     },
     {
       "path": "lib/lobsterai-adapter.js",
       "old": "eceb280c4510fda9b66a5fea53700a3c4a41fbaa1c3c26b52b6124e3ca6b78e3",
       "new": "538bc3fffe8fde0baab4f4145b1fc3f2cbb89d7e9a97d51e274ccc38a969c6dd",
-      "upstreamRc3": "9adef2d6529f8df80f39f8a560a865bdd78743272ccd415c408745f11e27f1ff"
+      "upstreamRc3": "9adef2d6529f8df80f39f8a560a865bdd78743272ccd415c408745f11e27f1ff",
+      "auditedDesktop": "d3692e213387cfcaa06da77b88b5a879f43161321f87d6e727bb8b3bd2074882"
     },
     {
       "path": "lib/buddy-adapter.js",
       "old": "54edf9c76ac07f29cc8c4e58bddcb2141f82dfa07ab2c57f7fb29c4d457b0f35",
       "new": "ba4afc595536e1a85ffa2e61bdc07898efcc550076068f27db7a5376f46cc346",
-      "upstreamRc3": "6cfffbc8974efb2bc420a8f373bd2fe8c0bed9cbb60dad1c6ce968bc30e5cc05"
+      "upstreamRc3": "6cfffbc8974efb2bc420a8f373bd2fe8c0bed9cbb60dad1c6ce968bc30e5cc05",
+      "auditedDesktop": "f450047df4f177024dd0924e4a76929f50a4ef42e9f714651ef9549171a36dda"
     },
     {
       "path": "lib/trae-adapter.js",
       "old": "b09c0df6a4283d82ed632ef35bf1a33f567d022b89ea0ed070cff989253b6bd5",
       "new": "b31441aadf6c69b728a6b252979252351138d66a701533a26c9dd75011ba9749",
-      "upstreamRc3": "476848a672b7a92596a31a50bf450388ff111398dbdb43345968a260d8eade60"
+      "upstreamRc3": "476848a672b7a92596a31a50bf450388ff111398dbdb43345968a260d8eade60",
+      "auditedDesktop": "7672f51cfa6cd75886e30134ea0c25e571147a89fb38bdb75e12d56f4b313657"
     },
     {
       "path": "lib/llm-adapter.js",
       "old": "bc2b5a76d88a51cc8b41d44bbf8b7c470b7e6d83b958eef3af00d32ca48a6eb7",
       "new": "bd746e043e0b539aecf72dfc50534a3a7a127340b3d78475efb2a991c49539d7",
-      "upstreamRc3": "3684c5e4f48a0f2d4089ba86d80a73469258d638affbc3835219c06fb7bfe749"
+      "upstreamRc3": "3684c5e4f48a0f2d4089ba86d80a73469258d638affbc3835219c06fb7bfe749",
+      "auditedDesktop": "d597f5f3eceea80387a30d5ee9decbf02efb06c8c405159fea5cfcd68658a8be"
     },
     {
       "path": "lib/llm-register-compat.js",
       "old": "8a2b827cfe89e592c1bf4879bec293d47cc3b30a64174125f4070728b7558c7a",
       "new": "18b6a66192c18316cb2bb606acdc78d797107464db1557e0641aa35119d2bb59",
       "rotation": "03437e0e56dec545137c594ba33d187047d670fba53dc60e28c877e7672164d0",
-      "upstreamRc3": "0083467b88d2c07363cc403f672f7955c651ae7424bd10237b958e4ac507f77e"
+      "upstreamRc3": "0083467b88d2c07363cc403f672f7955c651ae7424bd10237b958e4ac507f77e",
+      "auditedDesktop": "921d2a166ef1b4cc945d93354a78b5d74b4731c95d3b510400619cb82f7a3f14"
     },
     {
       "path": "lib/zcode-anthropic.js",
       "old": "a6db46cd8aaf29123bfd65cd912670f831c46087052ea112f8f0eacdbe8213e6",
       "new": "95500701671a67ee48e5045d77e2b90fddf4efdb4c47296155c3161e6f2e70cf",
-      "upstreamRc3": "36372ac1fb062cd187b17cc4dabfdada2a2c64b9d9a208b7197c1e622f349d60"
+      "upstreamRc3": "36372ac1fb062cd187b17cc4dabfdada2a2c64b9d9a208b7197c1e622f349d60",
+      "auditedDesktop": "b624d4bfb269609672d007bc9a5f4af2847faf49c78e03e969fee8fddadc1ff9"
     },
     {
       "path": "lib/openai-compat.js",
       "old": "232137431212a7b0754809de24f3be9c85957cf3bb65941fb15c41f99316a729",
       "new": "dde7a3f2dee3ca56dd7342cbaa3a394020d15324331ea52fea2b643249f10af4",
-      "upstreamRc3": "dde7a3f2dee3ca56dd7342cbaa3a394020d15324331ea52fea2b643249f10af4"
+      "upstreamRc3": "dde7a3f2dee3ca56dd7342cbaa3a394020d15324331ea52fea2b643249f10af4",
+      "auditedDesktop": "e395a6e2fb8776b2319b8c9009f9a1346d488c38ad80405a7d7e7f82544a23ec"
     },
     {
       "path": "src/llm-adapter.ts",
@@ -103,7 +111,8 @@
       "path": "lib/openai-gateway/messages.js",
       "old": "87465ab74ffb49d2ce1c587e897c5eef005d67c977f457b5f5a715378b17c7bd",
       "new": "aad0ac353a51beeec1e94ff8e092f3423fa595041675c5764a5a9d7d43a1d8fc",
-      "upstreamRc3": "f6c43522165a56c8dd8bc7a9c319d9d9338e5d1dd24c810f38eb25efd4417572"
+      "upstreamRc3": "f6c43522165a56c8dd8bc7a9c319d9d9338e5d1dd24c810f38eb25efd4417572",
+      "auditedDesktop": "7c6f04b71d7b9fc4d25ca73c1fddce2f57b292a824f4e8d557a463a42a0c699f"
     },
     {
       "path": "src/openai-gateway/messages.ts",
@@ -121,7 +130,8 @@
       "path": "lib/openai-gateway/stream.js",
       "old": "7d137eff5699b3f02652c0f34a49561e61421c1d501b1689c6247786c8ec99eb",
       "new": "257f15c84112f963dbfb524fcdff56b97d4b96a051b8b179e6956a18bbb35331",
-      "upstreamRc3": "b6b2579d4d6e8f0e7c03158d350adac7a093d4fb37aff2f8f9e76fb9987dce9f"
+      "upstreamRc3": "b6b2579d4d6e8f0e7c03158d350adac7a093d4fb37aff2f8f9e76fb9987dce9f",
+      "auditedDesktop": "32e77e744377b6cfcb4bf0c6e90dab3c4e4dbf70143910c07ea9ad6d7f0836cf"
     }
   ],
   "jetHubUpstream": "8bf1c6f82ea977267c4b95575d706b835d20ef64"

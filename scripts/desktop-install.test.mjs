@@ -57,7 +57,7 @@ test('reopening a live desktop does not spawn another engine or trust a stale lo
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => server.close(resolve)));
   const port = server.address().port, file = desktopStatePath(home, port);
-  const state = { home, version: '0.2.1-alpha.1', pid: process.pid, url: `http://127.0.0.1:${port}/?token=local-test` };
+  const state = { home, version: '0.2.1-alpha.4', pid: process.pid, url: `http://127.0.0.1:${port}/?token=local-test` };
   await writeFile(file, JSON.stringify(state), { mode: 0o600 });
   assert.deepEqual(await runningDesktop(home, port), state);
   assert.equal(await startDesktop({ home, port, noOpen: true }), 0);

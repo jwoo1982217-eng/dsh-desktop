@@ -1,13 +1,15 @@
 # 电脑版安装、启动与手机配对
 
-本仓库是独立的电脑版适配源码，手机 APK 源码位于 [手机仓库](https://cnb.cool/applecabal/dsh-phone)。电脑版是运行在电脑本机的 DSH Web 界面，使用系统浏览器；不是 Android APK，也不是官方 Electron 安装包。两端固定使用官方 `0.2.1-alpha.1` 预览版核心，包含 Jet Hub、ChatGPT 会员、Noema、技能和加密远程连接。
+本仓库是独立的电脑版适配源码，手机 APK 源码位于 [手机仓库](https://github.com/jwoo1982217-eng/dsh-phone)。电脑版固定使用官方 `0.2.1-alpha.4` 预览版核心，包含 Jet Hub、ChatGPT 会员、Noema、技能和加密远程连接。
+
+Mac 用户可以使用本项目新增的 [桌面安装包](macos/README.md)：双击 `.pkg` 安装，在“应用程序”里点击 DSH 图标即可打开独立窗口。应用内置 Electron 与 Node.js，账号、聊天和技能继续使用本机 `~/.dsh`。下文保留源码安装及浏览器启动方式。
 
 ## 安装电脑版
 
 需要 Git、Node.js 24.11+（包含 npm）；安装命令固定使用 pnpm 10.34.6，不替换电脑的全局 pnpm。Windows 若原生终端依赖需要编译，需安装 C++ 构建工具；本次实际验证平台为 macOS arm64。
 
 ```sh
-git clone https://cnb.cool/applecabal/dsh-desktop.git
+git clone https://github.com/jwoo1982217-eng/dsh-desktop.git
 cd dsh-desktop
 npx --yes pnpm@10.34.6 --dir desktop-runtime install --frozen-lockfile
 node scripts/install-desktop.mjs
