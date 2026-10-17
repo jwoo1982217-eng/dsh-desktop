@@ -17,10 +17,11 @@ const source = await readFile(path.join(root, 'runtime/overlays/@deepseek-ai/dsh
 assert.equal(source.split('return module.exports;').length, 2);
 const tested = source.replace('return module.exports;', 'module.exports.test = { InputBar, DraftEditorRuntime, registerComposerKeymap, enterCommand: cn$1 }; return module.exports;');
 const bundled = await build({ stdin: { resolveDir: path.join(root, 'vendor/dsh-codearts-auth'), loader: 'js', contents: `
-import React from 'react'; import * as jsx from 'react/jsx-runtime';
+import React from 'react'; import * as jsx from 'react/jsx-runtime'; import * as zod from 'zod';
 import * as ReactDOM from 'react-dom'; import { createRoot } from 'react-dom/client';
 window.__ModuleLoader__ = { load({factory}) {
   window.conversation = factory(id => {
+    if (id === 'zod') return zod;
     if (id === 'react') return React;
     if (id === 'react/jsx-runtime') return jsx;
     if (id === 'react-dom') return ReactDOM;
