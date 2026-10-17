@@ -17,10 +17,11 @@ const source = await readFile(path.join(root, 'runtime/overlays/@deepseek-ai/dsh
 assert.equal(source.split('return module.exports;').length, 2);
 const tested = source.replace('return module.exports;', 'module.exports.test = { InputBar, DraftEditorRuntime, registerComposerKeymap, enterCommand: cn$1 }; return module.exports;');
 const bundled = await build({ stdin: { resolveDir: path.join(root, 'vendor/dsh-codearts-auth'), loader: 'js', contents: `
-import React from 'react'; import * as jsx from 'react/jsx-runtime';
+import React from 'react'; import * as jsx from 'react/jsx-runtime'; import * as zod from 'zod';
 import * as ReactDOM from 'react-dom'; import { createRoot } from 'react-dom/client';
 window.__ModuleLoader__ = { load({factory}) {
   window.conversation = factory(id => {
+    if (id === 'zod') return zod;
     if (id === 'react') return React;
     if (id === 'react/jsx-runtime') return jsx;
     if (id === 'react-dom') return ReactDOM;
@@ -68,7 +69,7 @@ try {
   for (const mobile of [false, true]) {
     const context = await browser.newContext({ viewport: mobile ? {width:393,height:852} : {width:1280,height:850}, hasTouch:mobile, isMobile:mobile });
     const page = await context.newPage();
-    page.on('pageerror', error => errors.push(error.message));
+    page.on('pageerror', error => {errors.push(error.message); console.error('Composer fixture error:',error.message);});
     await context.route('http://127.0.0.1:32181/**', route => route.fulfill({ contentType:'text/html', body:'<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:20px;font:14px system-ui;--dsh-composer-side-clearance:8px;--dsh-composer-card-max-width:760px;--dsh-composer-text-max-height:160px;--dsw-alias-button-info-fill:#2563eb;--dsw-specific-input-major:#f2f5fa;--dsw-alias-label-primary:#18243b;--dsw-radius-panel:16px;--dsw-font-family:system-ui}'+(mobile?phoneCSS:'')+'</style><div id="app"></div><script>'+bundled.outputFiles[0].text+'</script>' }));
     await page.goto('http://127.0.0.1:32181/');
     const input = page.locator('[data-composer-input]'), send = page.locator('[data-composer-send]');
