@@ -76,9 +76,9 @@ export class PhoneSkills {
     await this.store.set(SKILLS_REF, JSON.stringify({ items, revision }));
     this.items = items; this.revision = revision; this.invalidate();
   }
-  provider(control, workspace, home) {
+  provider(control, workspace, home, additionalVisible = () => false) {
     this.invalidate = control.invalidate;
-    const visible = cwd => cwd === workspace || cwd?.startsWith(workspace + '/') || !!home && (cwd === home || cwd?.startsWith(home + '/workspaces/'));
+    const visible = cwd => cwd === workspace || cwd?.startsWith(workspace + '/') || !!home && (cwd === home || cwd?.startsWith(home + '/workspaces/')) || additionalVisible(cwd);
     return { name: 'phone-robot',
       list: async options => { await this.queue; return visible(options.cwd) ? this.items.filter(item => item.enabled).map(item => ({
         name: item.name, description: item.title ? `${item.title}：${item.description}`.slice(0, 660) : item.description, source: 'phone', provider: 'phone-robot',

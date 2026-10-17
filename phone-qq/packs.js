@@ -54,7 +54,7 @@ export function inspectPack(bytes) {
   return { hash, id: hash.slice(0, 24), title: 'DSH 技能包', skills, prompts, assets, warnings, bytes: [...assets.values()].reduce((sum, value) => sum + value.length, 0) };
 }
 export class PhonePacks {
-  constructor(store, root, home) { this.store = store; this.root = path.resolve(root); this.home = path.resolve(home); this.records = []; this.revision = 0; this.promptCache = ''; this.queue = Promise.resolve(); this.invalidate = () => {}; }
+  constructor(store, root, home, additionalVisible = () => false) { this.store = store; this.root = path.resolve(root); this.home = path.resolve(home); this.additionalVisible = additionalVisible; this.records = []; this.revision = 0; this.promptCache = ''; this.queue = Promise.resolve(); this.invalidate = () => {}; }
   mutate(fn) { const result = this.queue.then(fn); this.queue = result.catch(() => {}); return result; }
   async ensureRoot() { await mkdir(this.root, { recursive: true }); if ((await lstat(this.root)).isSymbolicLink()) throw new ConfigError('技能库目录不能是符号链接'); this.root = await realpath(this.root); }
   init(bundled) { return this.mutate(async () => {
@@ -70,7 +70,7 @@ export class PhonePacks {
       if (bytes) { const pack = inspectPack(bytes); if (!this.records.some(r => r.id === pack.id)) await this.install(pack); }
     }
   }); }
-  visible(cwd) { return cwd === this.home || cwd === path.dirname(this.root) || cwd?.startsWith(this.home + '/workspaces/'); }
+  visible(cwd) { return cwd === this.home || cwd === path.dirname(this.root) || cwd?.startsWith(this.home + '/workspaces/') || this.additionalVisible(cwd); }
   async status() { await this.queue; return { records: structuredClone(this.records), revision: this.revision }; }
   preview(bytes) { const { assets, ...info } = inspectPack(bytes); return info; }
   import(bytes, revision) { return this.mutate(async () => { this.check(revision); await this.install(inspectPack(bytes)); return { records: structuredClone(this.records), revision: this.revision }; }); }

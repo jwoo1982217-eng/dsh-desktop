@@ -37,10 +37,11 @@ export async function apply(ctx) {
   const home = canonicalPhoneHome();
   const workspace = path.join(home, 'workspaces/qq');
   const files = new PhoneWorkspace(workspace);
-  ctx.skills.registerProvider(control => skills.provider(control, workspace, home));
+  const teamDirectory = cwd => ctx.get('dshTeam')?.ownsWorkingDirectory(cwd) === true;
+  ctx.skills.registerProvider(control => skills.provider(control, workspace, home, teamDirectory));
   const packs = new PhonePacks({ get: async ref => (await ctx.credentials.resolve(credentialRef(ref)))?.value,
     set: (ref, value) => ctx.credentials.set(credentialRef(ref), value),
-  }, path.join(workspace, '.dsh-skill-packs'), home);
+  }, path.join(workspace, '.dsh-skill-packs'), home, teamDirectory);
   const packsReady = packs.init(new URL('./private-skill-pack.zip', import.meta.url));
   packsReady.catch(() => ctx.logger.warn('Phone skill pack could not be loaded'));
   ctx.skills.registerProvider(control => packs.provider(control));
