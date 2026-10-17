@@ -13,6 +13,9 @@ test('fresh peer install resolves MCP dependencies and keeps isolation modules o
     const result=await installDesktopPeer(profile,modules);
     const peer=await import(pathToFileURL(path.join(result.plugin,'index.mjs'))+'?install='+i);
     assert.ok(peer.inject.includes('tools'));
+    const loading = await import(pathToFileURL(path.join(result.plugin,'on-demand-tools/index.mjs')));
+    assert.deepEqual(loading.inject,['tools','systemPrompt']);
+    assert.match(await readFile(path.join(result.plugin,'cordis.patch.yml'),'utf8'),/name: dsh-peer\/on-demand-tools/);
     assert.match(await readFile(path.join(result.plugin,'mcp-manager/router.mjs'),'utf8'),/name: 'reuse'/);
     assert.match(await readFile(path.join(result.plugin,'memory-isolation/index.mjs'),'utf8'),/applyMemoryIsolation/);
     assert.equal(await readFile(path.join(profile,'user-settings-marker'),'utf8'),'unchanged');
