@@ -191,7 +191,17 @@ export declare const CODEBUDDY: BuddyProduct;
  * 这里可以删掉（`claimBaseOf` / `webBaseOf` 已能正确处理空值并给出可读错误）。
  */
 export declare const WORKBUDDY: BuddyProduct;
-/** 全部产品配置，供按 id 查询与遍历注册使用。 */
+/**
+ * 全部 **CodeBuddy 系**产品配置，供按 id 查询与遍历注册使用。
+ *
+ * ⚠️ 只放同源产品（共用 cli-external-link 认证 + ProductProvider 机制）。
+ * **腾讯 OrcaTerm 不在此列**：它的登录是网页 cookie（微信扫码）而非
+ * `/v2/plugin/auth/state` 两步流程，塞进本表会让 `account.create` 把
+ * `product.endpoint`/`product.platform` 当有效值用，拼出
+ * `undefined/v2/plugin/auth/state?platform=undefined` 而失败
+ *（真机事故 2026-10-14）。OrcaTerm 的登录在 `jet-hub-rpc.ts` 的
+ * `account.create` 里走独立分支（见 `orcaterm-login.ts`）。
+ */
 export declare const ALL_PRODUCTS: readonly BuddyProduct[];
 /** 按 provider id 取产品配置；未知 id 返回 undefined。 */
 export declare function productById(id: string): BuddyProduct | undefined;
