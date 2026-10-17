@@ -78,7 +78,7 @@ import {
   textFromContent,
   tokenValue,
 } from './messages.js'
-import { normalizeUpstreamFailure } from './model-errors.js'
+import { normalizeUpstreamFailure, upstreamStatusOrFallback } from './model-errors.js'
 import { failureToOpenAiError, withSuggestion, type SuggestionHook } from './stream.js'
 import { rewriteTencentContentFingerprints } from './tencent-fingerprint.js'
 import { toOpenAiUsage } from './usage.js'
@@ -652,7 +652,7 @@ interface ResponsesItemState {
 interface Accumulated {
   usage?: TokenUsage
   finishReason?: string
-  failure?: { code: string; message: string }
+  failure?: { code: string; message: string; status?: number }
 }
 
 function hexId(): string {
@@ -735,6 +735,7 @@ function applyStateChunk(state: Accumulated, chunk: StreamChunk): void {
   if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
     state.failure = {
       code: chunk.reason.failure.code,
+      status: chunk.reason.failure.status,
       message: chunk.reason.failure.message || `DSH model request ${chunk.reason.kind}`,
     }
     return
@@ -993,7 +994,7 @@ export async function collectResponsesResult(
   if (state.failure !== undefined) {
     // 上游在流里报错：与 Chat 路径同样翻成可识别的错误（含 404 翻译与纠错建议）。
     throw await toUpstreamError(
-      new OpenAiGatewayError(state.failure.message, 502, 'server_error', state.failure.code || 'upstream_error'),
+      new OpenAiGatewayError(state.failure.message, upstreamStatusOrFallback(state.failure.status), 'server_error', state.failure.code || 'upstream_error'),
       suggest,
     )
   }
@@ -1255,7 +1256,7 @@ export async function* toResponsesSse(
 
   if (state.failure !== undefined) {
     const converted = await toUpstreamError(
-      new OpenAiGatewayError(state.failure.message, 502, 'server_error', state.failure.code || 'upstream_error'),
+      new OpenAiGatewayError(state.failure.message, upstreamStatusOrFallback(state.failure.status), 'server_error', state.failure.code || 'upstream_error'),
       suggest,
     )
     for (const event of closeAll()) yield event

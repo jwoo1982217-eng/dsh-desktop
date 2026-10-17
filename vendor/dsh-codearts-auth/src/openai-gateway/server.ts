@@ -9,7 +9,7 @@ import { resolveGatewayConfig, type OpenAiGatewayConfig } from './config.js'
 import { markGatewayChannel } from './channel.js'
 import { toGenerateOptions, OpenAiGatewayError, parseModelRoute, normalizeReasoningEffort, normalizeMaxTokens, type OpenAiChatRequest, type ReasoningEffortNotice } from './messages.js'
 import type { AttachmentBridge, ImageLimits } from './images.js'
-import { collectGatewayEffortViews, collectGatewayModelIds, collectGatewayModels, toGatewayModelIds, toOpenAiModels } from './models.js'
+import { resolveGatewayModelMetadata, collectGatewayModelIds, collectGatewayModels, toGatewayModelIds, toOpenAiModels } from './models.js'
 import { effortResolutions } from './effort-view.js'
 import { CANONICAL_REASONING_EFFORTS } from '../reasoning-ladder.js'
 import { findCaseInsensitiveSuggestion, looksLikeMissingModel } from './model-errors.js'
@@ -142,12 +142,12 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
   const handleModels = async (response: ServerResponse): Promise<void> => {
     // 逐个 catch 的容错在 collectGatewayModels 里（设置页的 RPC 复用同一份，
     // 两处各写一遍必然漂移）。
-    const groups = await collectGatewayModels(options.llm, (provider, error) => {
+    const listed = await collectGatewayModels(options.llm, (provider, error) => {
       logger.warn(`[openai-gateway] ${provider} 模型目录读取失败，已从 /v1/models 跳过：${describe(error)}`)
     })
     // 档位视图是**附加信息**：某个模型解析不出来就只是它没有该字段，
     // 绝不能让整份目录跟着失败（同理，见 collectGatewayEffortViews 的注释）。
-    const effortViews = await collectGatewayEffortViews(options.llm, groups, (provider, error) => {
+    const { groups, effortViews } = await resolveGatewayModelMetadata(options.llm, listed, (provider, error) => {
       logger.warn(`[openai-gateway] ${provider}：${describe(error)}`)
     })
     jsonResponse(response, 200, { object: 'list', data: toOpenAiModels(groups, effortViews) })
@@ -169,10 +169,10 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): OpenAiGatewa
    * 这里给人和脚本查，那里给会自动扫目录的工具查；各算一遍必然漂移。
    */
   const handleReasoningEfforts = async (response: ServerResponse): Promise<void> => {
-    const groups = await collectGatewayModels(options.llm, (provider, error) => {
+    const listed = await collectGatewayModels(options.llm, (provider, error) => {
       logger.warn(`[openai-gateway] ${provider} 模型目录读取失败，已从 /v1/reasoning-efforts 跳过：${describe(error)}`)
     })
-    const effortViews = await collectGatewayEffortViews(options.llm, groups, (provider, error) => {
+    const { groups, effortViews } = await resolveGatewayModelMetadata(options.llm, listed, (provider, error) => {
       logger.warn(`[openai-gateway] ${provider}：${describe(error)}`)
     })
     jsonResponse(response, 200, {

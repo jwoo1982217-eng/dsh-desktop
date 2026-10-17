@@ -25,10 +25,15 @@ interface GatewaySwitchSource {
  * ⚠️ `saveImage` 的形状 `{ data, mediaType }` 来自临时探针的实测（`attachmentId`
  * 是 `sha256:` 内容寻址，媒体类型会被服务端按字节校验）。见 `images.ts` 文件头。
  */
-function makeGatewayAttachmentBridge(ctx: Context): AttachmentBridge | undefined {
-  const attachments = ctx.get('attachments') as { saveImage?: AttachmentBridge['saveImage'] } | undefined
-  if (attachments?.saveImage === undefined) return undefined
-  return { saveImage: (input) => attachments.saveImage!(input) }
+function makeGatewayAttachmentBridge(ctx: Context): AttachmentBridge {
+  // 附件服务可能晚于网关初始化，或在插件重载时更换；每次收图时再取当前实例。
+  return { saveImage: async (input) => {
+    const attachments = ctx.get?.('attachments') as { saveImage?: AttachmentBridge['saveImage'] } | undefined
+    if (typeof attachments?.saveImage !== 'function') {
+      throw new Error('当前 profile 未装载附件服务（@deepseek-ai/dsh-attachment-local），无法接收图片。')
+    }
+    return attachments.saveImage(input)
+  } }
 }
 
 /**

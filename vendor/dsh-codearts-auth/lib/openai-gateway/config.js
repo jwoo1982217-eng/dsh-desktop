@@ -25,4 +25,3 @@ export function resolveGatewayConfig(env = process.env) {
     }
     return { host: DEFAULT_GATEWAY_HOST, port };
 }
-//# sourceMappingURL=config.js.map

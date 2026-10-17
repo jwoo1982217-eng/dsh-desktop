@@ -13,10 +13,14 @@ import { createOpenAiGateway } from './server.js';
  * 是 `sha256:` 内容寻址，媒体类型会被服务端按字节校验）。见 `images.ts` 文件头。
  */
 function makeGatewayAttachmentBridge(ctx) {
-    const attachments = ctx.get('attachments');
-    if (attachments?.saveImage === undefined)
-        return undefined;
-    return { saveImage: (input) => attachments.saveImage(input) };
+    // 附件服务可能晚于网关初始化，或在插件重载时更换；每次收图时再取当前实例。
+    return { saveImage: async (input) => {
+            const attachments = ctx.get?.('attachments');
+            if (typeof attachments?.saveImage !== 'function') {
+                throw new Error('当前 profile 未装载附件服务（@deepseek-ai/dsh-attachment-local），无法接收图片。');
+            }
+            return attachments.saveImage(input);
+        } };
 }
 /**
  * 启动对外兼容网关，并把关闭动作绑定到插件生命周期。
@@ -79,4 +83,3 @@ export function mountOpenAiGateway(ctx, pool) {
         void disposeGatewayRuntime();
     }, 'openai-gateway');
 }
-//# sourceMappingURL=index.js.map

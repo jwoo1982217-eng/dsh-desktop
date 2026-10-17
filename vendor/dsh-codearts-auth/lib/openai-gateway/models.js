@@ -58,8 +58,9 @@ export async function collectGatewayModels(llm, onError) {
  * 注定被上游拒绝的图。
  */
 export async function collectGatewayModelIds(llm, onError, effortViews) {
-    const groups = await collectGatewayModels(llm, onError);
-    return toGatewayModelIds(groups, effortViews);
+    const listed = await collectGatewayModels(llm, onError);
+    const resolved = await resolveGatewayModelMetadata(llm, listed, onError);
+    return toGatewayModelIds(resolved.groups, effortViews ?? resolved.effortViews);
 }
 /**
  * 分组目录 → 扁平行（设置页/面板用）。
@@ -104,25 +105,46 @@ export function toGatewayModelIds(groups, effortViews) {
  * 逐模型 catch：单个模型解析失败只是**它**没有档位字段，不影响整个目录。
  */
 export async function collectGatewayEffortViews(llm, groups, onError) {
-    const views = new Map();
+    return (await resolveGatewayModelMetadata(llm, groups, onError)).effortViews;
+}
+/**
+ * 图片能力与档位共用一次精确解析。列表的简略行可能省略图片声明，不能因此把
+ * 已支持图片的模型导出成仅文本；解析失败则保留该行原有声明，不猜型号或删模型。
+ */
+export async function resolveGatewayModelMetadata(llm, groups, onError) {
+    const effortViews = new Map();
     const resolve = llm?.resolveModelInfo;
-    // 宿主不提供该能力时**静默返回空表**：档位是附加信息，拿不到就不发字段，
-    // 不能让整份目录跟着失败。
     if (typeof resolve !== 'function')
-        return views;
-    await Promise.all(groups.flatMap(({ provider, models }) => models.map(async (model) => {
-        try {
-            const info = await resolve.call(llm, provider, model.id);
-            const view = effortView(info?.reasoning?.efforts, info?.reasoning?.defaultEffort);
-            if (view !== undefined)
-                views.set(toOpenAiModelId(provider, model.id), view);
-        }
-        catch (error) {
-            onError?.(provider, new Error(`${model.id} 的档位解析失败（该模型不带档位字段，目录本身照常返回）：`
-                + `${error instanceof Error ? error.message : String(error)}`));
-        }
+        return { groups, effortViews };
+    const resolvedGroups = await Promise.all(groups.map(async ({ provider, models }) => ({
+        provider,
+        models: await Promise.all(models.map(async (model) => {
+            try {
+                const info = await resolve.call(llm, provider, model.id);
+                const view = effortView(info?.reasoning?.efforts, info?.reasoning?.defaultEffort);
+                if (view !== undefined)
+                    effortViews.set(toOpenAiModelId(provider, model.id), view);
+                const input = info?.inputModalities;
+                const contextWindow = info?.context?.contextWindow ?? info?.contextWindow;
+                const maxTokens = info?.defaultMaxTokens ?? info?.maxTokens;
+                return {
+                    ...model,
+                    ...Array.isArray(input) && input.length > 0 && input.every(value => typeof value === 'string')
+                        ? { inputModalities: [...input] } : {},
+                    ...model.contextWindow === undefined && typeof contextWindow === 'number' && Number.isSafeInteger(contextWindow) && contextWindow > 0
+                        ? { contextWindow } : {},
+                    ...model.maxTokens === undefined && typeof maxTokens === 'number' && Number.isSafeInteger(maxTokens) && maxTokens > 0
+                        ? { maxTokens } : {},
+                };
+            }
+            catch (error) {
+                onError?.(provider, new Error(`${model.id} 的元信息解析失败（保留列表声明）：`
+                    + `${error instanceof Error ? error.message : String(error)}`));
+                return model;
+            }
+        })),
     })));
-    return views;
+    return { groups: resolvedGroups, effortViews };
 }
 /** 将 DSH 的 provider 分组目录转换为 OpenAI models 响应中的 data 项。 */
 export function toOpenAiModels(groups, effortViews) {
@@ -142,4 +164,3 @@ export function toOpenAiModels(groups, effortViews) {
         };
     }));
 }
-//# sourceMappingURL=models.js.map

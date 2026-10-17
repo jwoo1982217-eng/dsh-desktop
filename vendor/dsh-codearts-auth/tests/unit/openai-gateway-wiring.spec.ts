@@ -1,3 +1,4 @@
+import { createServer, request } from 'node:http'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -139,5 +140,57 @@ describe('网关的插件接线', () => {
 
     const { isGatewayRunning } = await import('../../src/openai-gateway/runtime.js')
     expect(isGatewayRunning()).toBe(false)
+  })
+})
+
+
+describe('网关启动晚于或早于附件服务都可收图', () => {
+  it('先启动文本网关，附件服务晚到或替换后两种图片协议均使用当前服务', async () => {
+    const probe = createServer()
+    const port = await new Promise<number>((resolve) => probe.listen(0, '127.0.0.1', () => {
+      const address = probe.address() as { port: number }; probe.close(() => resolve(address.port))
+    }))
+    process.env.DSH_OPENAI_GATEWAY_PORT = String(port)
+    let store: { saveImage(input: unknown): Promise<unknown> } | undefined
+    let calls = 0, saves = 0
+    const { ctx } = makeContext()
+    const live = Object.assign(ctx, {
+      get: (name: string) => name === 'attachments' ? store : undefined,
+      llm: {
+        listProviders: () => [{ id: 'fixture' }],
+        listModels: async () => [{ provider: 'fixture', id: 'vision', name: '本地模型' }],
+        resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }),
+        async *stream(options: { messages: Array<{ content: Array<{ type: string }> }> }) {
+          calls += 1
+          yield { type: 'text-delta', index: 0, text: options.messages[0].content.map(b => b.type).join(',') }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      },
+    })
+    mountOpenAiGateway(live)
+    const { applyGatewayDesiredState } = await import('../../src/openai-gateway/runtime.js')
+    await applyGatewayDesiredState()
+    const send = (path: string, body: unknown) => new Promise<{ status: number; value: any }>((resolve, reject) => {
+      const req = request({ host: '127.0.0.1', port, path, method: 'POST', headers: { authorization: 'Bearer wiring-test-key', 'content-type': 'application/json' } }, response => {
+        let text = ''; response.on('data', bytes => { text += String(bytes) }); response.on('end', () => resolve({ status: response.statusCode!, value: JSON.parse(text) }))
+      }); req.on('error', reject); req.end(JSON.stringify(body))
+    })
+    const image = { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }
+    const chat = { model: 'fixture/vision', messages: [{ role: 'user', content: [image] }] }
+    expect((await send('/v1/chat/completions', chat)).status).toBe(400)
+    expect(calls).toBe(0)
+    expect((await send('/v1/chat/completions', { model: 'fixture/vision', messages: [{ role: 'user', content: '文字' }] })).status).toBe(200)
+    store = { async saveImage() { saves += 1; return { attachmentId: 'sha256:local-fixture', mediaType: 'image/png' } } }
+    const accepted = await send('/v1/chat/completions', chat)
+    expect(accepted.status).toBe(200)
+    expect(accepted.value.choices[0].message.content).toBe('image')
+    store = { async saveImage() { throw new Error('本地保存失败') } }
+    expect((await send('/v1/chat/completions', chat)).status).toBe(400)
+    store = { async saveImage() { saves += 1; return { attachmentId: 'sha256:replacement', mediaType: 'image/png' } } }
+    const response = await send('/v1/responses', { model: 'fixture/vision', input: [{ role: 'user', content: [{ type: 'input_image', image_url: image.image_url.url }] }] })
+    expect(response.status).toBe(200)
+    expect(response.value.output[0].content[0].text).toBe('image')
+    expect(saves).toBe(2)
+    expect(calls).toBe(3)
   })
 })

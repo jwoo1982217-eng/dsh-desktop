@@ -286,3 +286,47 @@ describe('collectGatewayEffortViews（思考档位视图）', () => {
     expect(view?.efforts).toEqual([{ id: 'high', name: 'High', canonical: 'high' }])
   })
 })
+
+
+describe('网关导出图片能力的精确元信息', () => {
+  it('简略列表省略图片能力时，设置页与导出接口都采用精确解析结果', async () => {
+    let calls = 0
+    const source = {
+      listProviders: () => [{ id: 'fixture' }],
+      listModels: async () => [{ id: 'vision/with-slash', name: '看图模型' }],
+      resolveModelInfo: async () => {
+        calls += 1
+        return { inputModalities: ['text', 'image'], context: { contextWindow: 65536 }, defaultMaxTokens: 4096 }
+      },
+    }
+    const rows = await collectGatewayModelIds(source)
+    expect(rows[0]).toMatchObject({ id: 'fixture/vision/with-slash', input: ['text', 'image'] })
+    expect(calls).toBe(1)
+  })
+
+  it('精确路线明确仅文本时不按简略列表或型号误报看图能力', async () => {
+    const source = {
+      listProviders: () => [{ id: 'fixture' }],
+      listModels: async () => [{ id: 'glm-5.3-flash', name: '指定路线', inputModalities: ['text', 'image'] }],
+      resolveModelInfo: async () => ({ inputModalities: ['text'] }),
+    }
+    expect((await collectGatewayModelIds(source))[0].input).toEqual(['text'])
+  })
+
+  it('某个模型解析失败或返回坏能力字段时保留原有声明，后续请求可恢复', async () => {
+    let failed = true
+    const source = {
+      listProviders: () => [{ id: 'fixture' }],
+      listModels: async () => [{ id: 'vision', name: '看图', inputModalities: ['text', 'image'] }],
+      resolveModelInfo: async () => {
+        if (failed) throw new Error('本地元信息读取失败')
+        return { inputModalities: ['text', 'image'] }
+      },
+    }
+    expect((await collectGatewayModelIds(source))[0].input).toEqual(['text', 'image'])
+    failed = false
+    expect((await collectGatewayModelIds(source))[0].input).toEqual(['text', 'image'])
+    source.resolveModelInfo = async () => ({ inputModalities: [] })
+    expect((await collectGatewayModelIds(source))[0].input).toEqual(['text', 'image'])
+  })
+})

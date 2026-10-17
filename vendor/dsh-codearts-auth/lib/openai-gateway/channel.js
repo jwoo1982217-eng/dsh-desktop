@@ -60,4 +60,3 @@ export function channelOfOptions(options) {
         ? 'gateway'
         : 'direct';
 }
-//# sourceMappingURL=channel.js.map

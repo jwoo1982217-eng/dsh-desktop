@@ -120,6 +120,14 @@ export declare function toGatewayModelIds(groups: readonly GatewayProviderModels
  * 逐模型 catch：单个模型解析失败只是**它**没有档位字段，不影响整个目录。
  */
 export declare function collectGatewayEffortViews(llm: GatewayModelSource, groups: readonly GatewayProviderModels[], onError?: (provider: string, error: unknown) => void): Promise<Map<string, GatewayEffortView>>;
+/**
+ * 图片能力与档位共用一次精确解析。列表的简略行可能省略图片声明，不能因此把
+ * 已支持图片的模型导出成仅文本；解析失败则保留该行原有声明，不猜型号或删模型。
+ */
+export declare function resolveGatewayModelMetadata(llm: GatewayModelSource, groups: readonly GatewayProviderModels[], onError?: (provider: string, error: unknown) => void): Promise<{
+    groups: readonly GatewayProviderModels[];
+    effortViews: Map<string, GatewayEffortView>;
+}>;
 /** 将 DSH 的 provider 分组目录转换为 OpenAI models 响应中的 data 项。 */
 export declare function toOpenAiModels(groups: readonly GatewayProviderModels[], effortViews?: ReadonlyMap<string, GatewayEffortView>): OpenAiModel[];
 //# sourceMappingURL=models.d.ts.map

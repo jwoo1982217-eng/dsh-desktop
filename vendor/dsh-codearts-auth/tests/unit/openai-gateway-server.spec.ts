@@ -651,3 +651,23 @@ describe('OpenAI gateway 思考档位（翻译层与对照表）', () => {
     }
   })
 })
+
+describe('JetHub 导出目录与图片入口', () => {
+  it('导出精确图片能力和容量，含多段模型名，且不产生模型推理', async () => {
+    const port = await freePort()
+    let inferenceCalls = 0
+    const gateway = createOpenAiGateway({ env: ENV(port), llm: {
+      listProviders: () => [{ id: 'fixture' }],
+      listModels: async () => [{ provider: 'fixture', id: 'vision/with-slash', name: '看图模型' }],
+      resolveModelInfo: async () => ({ inputModalities: ['text', 'image'], context: { contextWindow: 65536 }, defaultMaxTokens: 4096 }),
+      stream: (options) => { inferenceCalls += 1; return responseStream(options.signal) },
+    } })
+    await gateway.start()
+    try {
+      const result = await call(port, '/v1/models', { key: 'test-key' })
+      expect(result.status).toBe(200)
+      expect(JSON.parse(result.body).data[0]).toMatchObject({ id: 'fixture/vision/with-slash', input: ['text', 'image'], context_window: 65536, max_tokens: 4096 })
+      expect(inferenceCalls).toBe(0)
+    } finally { await gateway.close() }
+  })
+})

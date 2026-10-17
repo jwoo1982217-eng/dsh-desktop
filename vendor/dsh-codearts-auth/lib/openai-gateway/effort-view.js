@@ -83,4 +83,3 @@ export function effortResolutions(declared) {
         return { requested, outcome: 'unexpressible' };
     });
 }
-//# sourceMappingURL=effort-view.js.map

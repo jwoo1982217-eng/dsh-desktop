@@ -68,7 +68,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { DEFAULT_IMAGE_LIMITS } from './images.js';
 import { OpenAiGatewayError, convertTools, createGatewayMessage, parseModelRoute, partsFromContent, textFromContent, tokenValue, } from './messages.js';
-import { normalizeUpstreamFailure } from './model-errors.js';
+import { normalizeUpstreamFailure, upstreamStatusOrFallback } from './model-errors.js';
 import { failureToOpenAiError, withSuggestion } from './stream.js';
 import { rewriteTencentContentFingerprints } from './tencent-fingerprint.js';
 import { toOpenAiUsage } from './usage.js';
@@ -630,6 +630,7 @@ function applyStateChunk(state, chunk) {
     if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
         state.failure = {
             code: chunk.reason.failure.code,
+            status: chunk.reason.failure.status,
             message: chunk.reason.failure.message || `DSH model request ${chunk.reason.kind}`,
         };
         return;
@@ -857,7 +858,7 @@ export async function collectResponsesResult(chunks, responseId, model, request,
         items.push(item);
     if (state.failure !== undefined) {
         // 上游在流里报错：与 Chat 路径同样翻成可识别的错误（含 404 翻译与纠错建议）。
-        throw await toUpstreamError(new OpenAiGatewayError(state.failure.message, 502, 'server_error', state.failure.code || 'upstream_error'), suggest);
+        throw await toUpstreamError(new OpenAiGatewayError(state.failure.message, upstreamStatusOrFallback(state.failure.status), 'server_error', state.failure.code || 'upstream_error'), suggest);
     }
     if (state.finishReason === undefined) {
         throw new OpenAiGatewayError('upstream stream ended before finish', 502, 'server_error', 'incomplete_stream');
@@ -1108,7 +1109,7 @@ export async function* toResponsesSse(chunks, responseId, model, request, sugges
         return;
     }
     if (state.failure !== undefined) {
-        const converted = await toUpstreamError(new OpenAiGatewayError(state.failure.message, 502, 'server_error', state.failure.code || 'upstream_error'), suggest);
+        const converted = await toUpstreamError(new OpenAiGatewayError(state.failure.message, upstreamStatusOrFallback(state.failure.status), 'server_error', state.failure.code || 'upstream_error'), suggest);
         for (const event of closeAll())
             yield event;
         yield emitStatus('failed', null, responsesError(converted));
@@ -1127,4 +1128,3 @@ export async function* toResponsesSse(chunks, responseId, model, request, sugges
         yield event;
     yield emitStatus(statusOf(state), state.usage === undefined ? null : usageJson(state.usage));
 }
-//# sourceMappingURL=responses.js.map

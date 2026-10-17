@@ -94,13 +94,17 @@ export function upstreamStatusOrFallback(status) {
  * 其余失败保留原状态，不根据含糊的消息文字猜测账号状态。
  */
 export function normalizeUpstreamFailure(failure) {
-    if (failure.code === 'QUOTA_EXCEEDED') {
+    if (['QUOTA_EXCEEDED', 'QUOTA', 'ACCOUNT_QUOTA'].includes(failure.code)) {
         return { status: 429, type: 'insufficient_quota', code: failure.code };
     }
-    if (failure.code === 'MISSING_CREDENTIAL') {
-        return { status: 401, type: 'authentication_error', code: failure.code };
+    if (failure.code === 'UPSTREAM_RESTRICTED') {
+        return { status: 403, type: 'gateway_error', code: failure.code };
     }
-    if (failure.code === 'RATE_LIMITED') {
+    if (['MISSING_CREDENTIAL', 'INVALID_CREDENTIAL', 'AUTH'].includes(failure.code)) {
+        const status = failure.status === 403 ? 403 : 401;
+        return { status, type: 'authentication_error', code: failure.code };
+    }
+    if (['RATE_LIMITED', 'RATE_LIMIT'].includes(failure.code)) {
         return { status: 429, type: 'rate_limit_error', code: failure.code };
     }
     if (!looksLikeMissingModel(failure.message)) {
@@ -149,4 +153,3 @@ export function findCaseInsensitiveSuggestion(requested, catalog) {
     const candidates = catalog.filter((id) => id.toLowerCase().startsWith(lower));
     return candidates.length === 1 ? candidates[0] : undefined;
 }
-//# sourceMappingURL=model-errors.js.map

@@ -246,3 +246,33 @@ describe('findCaseInsensitiveSuggestion', () => {
     expect(findCaseInsensitiveSuggestion('CodeArts/deepseek-v4.1-flash', CATALOG)).toBeUndefined()
   })
 })
+
+
+describe('alpha.4 通用适配器错误码兼容', () => {
+  it.each(['QUOTA', 'ACCOUNT_QUOTA', 'QUOTA_EXCEEDED'])('额度错误 %s 不得包装成网关故障', (code) => {
+    expect(normalizeUpstreamFailure({ status: 502, type: 'server_error', code, message: '额度不足' }))
+      .toEqual({ status: 429, type: 'insufficient_quota', code })
+  })
+  it.each(['AUTH', 'INVALID_CREDENTIAL', 'MISSING_CREDENTIAL'])('鉴权错误 %s 保留 401/403 的区别', (code) => {
+    for (const status of [401, 403]) {
+      expect(normalizeUpstreamFailure({ status, type: 'server_error', code, message: '请求被拒绝' }))
+        .toEqual({ status, type: 'authentication_error', code })
+    }
+  })
+  it('暂时限流与未知服务错误保持原语义', () => {
+    expect(normalizeUpstreamFailure({ status: 502, type: 'server_error', code: 'RATE_LIMIT', message: '429' }))
+      .toEqual({ status: 429, type: 'rate_limit_error', code: 'RATE_LIMIT' })
+    expect(normalizeUpstreamFailure({ status: 503, type: 'server_error', code: 'SERVER', message: '不可用' }))
+      .toEqual({ status: 503, type: 'server_error', code: 'SERVER' })
+  })
+})
+
+
+describe('网关临时限制', () => {
+  it('保留 403 与网关错误类型，不包装成密钥无效或可重试限流', () => {
+    expect(normalizeUpstreamFailure({
+      status: 403, type: 'server_error', code: 'UPSTREAM_RESTRICTED',
+      message: '请求内容已多次触发上游风控，该客户端已被暂时限制调用（约 1 分钟后自动解除）',
+    })).toEqual({ status: 403, type: 'gateway_error', code: 'UPSTREAM_RESTRICTED' })
+  })
+})

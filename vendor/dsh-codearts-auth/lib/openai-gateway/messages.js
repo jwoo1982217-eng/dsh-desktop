@@ -399,4 +399,3 @@ export async function toGenerateOptions(body, signal, reasoningEffortOverride, m
         signal,
     };
 }
-//# sourceMappingURL=messages.js.map

@@ -151,4 +151,3 @@ export async function toImageBlock(url, bridge, limits, already) {
     }
     return { type: 'image', attachment: ref };
 }
-//# sourceMappingURL=images.js.map
