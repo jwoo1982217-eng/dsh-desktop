@@ -17,6 +17,7 @@ import {
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
 import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js';
+import { OpencodeLocalPanel } from './opencode-local-panel.js';
 import {
   formatExpirySplitLine,
   formatPoolSplitLine,
@@ -309,6 +310,8 @@ const ZCODE_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAA
  * 图形：深色圆角方块 + 白色终端提示符（`>` 加下划线），呼应 CLI 形象。
  */
 const OPENCODE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzEyMTYxZCIvPjxwYXRoIGQ9Ik02LjUgOC41IDEwLjUgMTJsLTQgMy41IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBkPSJNMTIuNSAxNmg1IiBzdHJva2U9IiNmZmYiIHN0cm9rZS13aWR0aD0iMS44IiBmaWxsPSJub25lIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz48L3N2Zz4=';
+/** 腾讯 OrcaTerm：终端提示符意象，取腾讯云蓝 #006EFF。 */
+const ORCATerm_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzAwNkVGRiIvPjxwYXRoIGQ9Ik03IDguNSAxMSAxMmwtNCAzLjUiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjgiIGZpbGw9Im5vbmUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGQ9Ik0xMyAxNS41aDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjgiIGZpbGw9Im5vbmUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPjwvc3ZnPg==';
 
 /**
  * Gemini Code Assist 面板图标（内联 SVG data URL，手绘）。
@@ -379,6 +382,18 @@ const PROVIDERS = Object.freeze([
    * 下面的「弹窗 + 轮询」路径 —— 也因此它**不**经过 zCode 的渠道选择弹窗。
    */
   { id: 'opencode', label: 'OpenCode', icon: OPENCODE_ICON, logoClass: 'opencode' },
+  /**
+   * 腾讯 OrcaTerm（遨驰终端）。
+   *
+   * ⚠️ label 必须与 `ORCATerm.displayName`（src/orcaterm-product.ts）**逐字一致**：
+   * 侧栏 rail 与 provider 面板两处按它取显示文案，不一致会出现同名不同字。
+   *
+   * ⚠️ 它是**唯一以网页登录态 cookie 为凭据**的 provider（其余都是 token）：
+   * 面板「登录」打开 `orcaterm.cloud.tencent.com`，用户微信扫码后
+   * `uin`/`skey` 落进内置浏览器 cookie jar，由 `orcaterm-credential.ts` 采集，
+   * **不需要用户手输任何凭据**。
+   */
+  { id: 'orcaterm', label: '腾讯 OrcaTerm (腾讯云)', icon: ORCATerm_ICON, logoClass: 'orcaterm' },
   /**
    * Gemini Code Assist（Google Cloud Code 免费线，第 14 个 provider）。
    *
@@ -873,7 +888,7 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
     provider === 'zcode' ? React.createElement(ZcodeSourcePanel, { account, rpcCall, onChanged: onSourceChanged }) : null,
     rateLimits.length > 0
       ? React.createElement('div', { className: 'dim-jh-rateLimits' },
-          React.createElement('span', { className: 'dim-jh-rateLimitsLabel' }, '限额重置'),
+          React.createElement('span', { className: 'dim-jh-rateLimitsLabel' }, provider === 'zcode' ? '本地限流标记' : '限额重置'),
           rateLimits.map(([modelId, resetAt]) =>
             React.createElement('span', {
               key: modelId,
@@ -953,7 +968,7 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
             title: RESET_HELP,
             disabled: busy || !hasAnyLimit,
             onClick: () => onReset(account.id),
-          }, '重置')
+          }, provider === 'zcode' ? '清除本地限流' : '重置')
         : null,
       React.createElement('button', {
         className: 'dim-jh-btn',
@@ -2692,6 +2707,7 @@ function ProviderPanel({ provider, rpcCall, isolatedLoginCall }) {
   // 「显示列表」：控制模型列表面板的展开状态。关闭时不挂载面板，避免
   // 每次进入面板都白白发一次 model.list 请求。
   const [showModels, setShowModels] = React.useState(false);
+  const [modelCatalogVersion, setModelCatalogVersion] = React.useState(0);
   // 「订阅额度」：控制额度/请求记录弹窗的展开状态。同样关闭即不挂载，
   // 避免每次进入面板都发 cline.quota / cline.requestLog（那两发在非 Cline
   // 渠道会直接 bad-request）。
@@ -3397,7 +3413,7 @@ function ProviderPanel({ provider, rpcCall, isolatedLoginCall }) {
               title: RESET_ALL_HELP,
               disabled: probeBusy !== null || accounts.length === 0,
               onClick: () => void runLimitAction('resetAll'),
-            }, '重置所有')
+            }, provider === 'zcode' ? '清除本地限流（全部）' : '重置所有')
           : null,
         // 锁定永久积分：只消耗会近期作废的积分，保住长期积分。
         // 文案按 provider 给（Loomy 是「每日赠送额度」，两个 buddy 是
@@ -3634,7 +3650,7 @@ function ProviderPanel({ provider, rpcCall, isolatedLoginCall }) {
                 // 卡片级「重测 / 重置」：只对会返回限流错误的 provider 渲染。
                 showRateLimitActions: supportsRateLimit(provider),
                 rpcCall,
-                onSourceChanged: async () => { await loadAccounts(); await loadCredits(); },
+                onSourceChanged: async () => { await loadAccounts(); await loadCredits(); setModelCatalogVersion(v => v + 1); },
                 onToggle: toggleAccount,
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),
@@ -3667,6 +3683,7 @@ function ProviderPanel({ provider, rpcCall, isolatedLoginCall }) {
     // 实际靠 fixed 定位浮在整个面板之上，不再挤占账号池的版面。
     showModels
       ? React.createElement(ModelListPanel, {
+          key: provider + ":" + modelCatalogVersion,
           provider,
           rpcCall,
           onClose: () => setShowModels(false),
@@ -5268,6 +5285,7 @@ export function JetHubPage({ close, rpcCall, chatGptCall, isolatedLoginCall }) {
    * 无谓的渲染；状态本身由页面级 `providerStatuses` 提供，不额外发请求。
    */
   const [showProviderSwitches, setShowProviderSwitches] = React.useState(false);
+  const [openCodeModels, setOpenCodeModels] = React.useState(false);
   /** 正在提交的供应商 id 集合：只禁用被点的那一个开关。 */
   const [providerBusy, setProviderBusy] = React.useState(() => new Set());
   /**
@@ -5891,8 +5909,11 @@ export function JetHubPage({ close, rpcCall, chatGptCall, isolatedLoginCall }) {
             ? React.createElement(AggregatePanel, { key: p.id + '-' + version, rpcCall })
             : p.externalAccount
               ? React.createElement(ChatGptPlanPanel, { key: p.id + '-' + version, chatGptCall })
-              : React.createElement(ProviderPanel, { key: p.id + '-' + version, provider: p.id, rpcCall, isolatedLoginCall }))
+              : p.id === 'opencode'
+                ? React.createElement(OpencodeLocalPanel, { key: p.id + '-' + version, rpcCall, showModelList: () => setOpenCodeModels(true) })
+                : React.createElement(ProviderPanel, { key: p.id + '-' + version, provider: p.id, rpcCall, isolatedLoginCall }))
         : null))),
+    openCodeModels ? React.createElement(ModelListPanel, { provider: 'opencode', rpcCall, onClose: () => setOpenCodeModels(false) }) : null,
     // 「供应商开关」以 modal 渲染：它是覆盖层，放在布局之后只是组件树的书写顺序
     // （与账号面板里的模型列表同款做法）。关闭即不挂载，避免常驻一份开关列表。
     showProviderSwitches

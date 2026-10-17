@@ -63,6 +63,5 @@ export declare function makeReadImageRequest(ctx: Context): (attachment: unknown
     data: Uint8Array;
     mediaType: string;
 } | undefined>;
-/** 注册 codeartsAuth 服务与 codearts LLM 路由（不注册斜杠命令）。 */
 export declare function apply(ctx: Context): void;
 //# sourceMappingURL=index.d.ts.map

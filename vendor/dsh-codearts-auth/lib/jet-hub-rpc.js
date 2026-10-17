@@ -16,7 +16,7 @@
  */
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { isGatewayEnabled } from './openai-gateway/config.js';
-import { collectGatewayEffortViews, collectGatewayModels, toGatewayModelIds } from './openai-gateway/models.js';
+import { resolveGatewayModelMetadata, collectGatewayModels, toGatewayModelIds } from './openai-gateway/models.js';
 import { applyGatewayDesiredState, gatewayAddress, gatewayApiKey, isGatewayRunning, setGatewayDesiredEnabled, } from './openai-gateway/runtime.js';
 import { LOOMY } from './loomy-product.js';
 import { buddyExpiringWindowDays } from './buddy-balance-rank.js';
@@ -49,6 +49,8 @@ import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oau
 import { credentialExpiresAtMs } from './buddy.js';
 import { claimDailyCheckin, claimUnitOf, fetchCheckinStatus, fetchCreditBalance, } from './credits.js';
 import { CODEBUDDY, WORKBUDDY, productById } from './product.js';
+import { createOrcaTermAccount, orcaTermNickname, serializeOrcaTermCredential } from './orcaterm-login.js';
+import { ORCATerm } from './orcaterm-product.js';
 import { runGrowthTaskCompletions } from './buddy-growth.js';
 /**
  * 有成长中心任务可做的 provider —— **只有 CodeBuddy 中国版**。
@@ -648,9 +650,9 @@ async function collectGatewayCatalog(llm, providers, onError) {
     if (typeof resolve === 'function') {
         source.resolveModelInfo = (provider, model) => resolve.call(llm, provider, model);
     }
-    const groups = await collectGatewayModels(source, onError);
-    const views = await collectGatewayEffortViews(source, groups, onError);
-    return toGatewayModelIds(groups, views);
+    const listed = await collectGatewayModels(source, onError);
+    const { groups, effortViews } = await resolveGatewayModelMetadata(source, listed, onError);
+    return toGatewayModelIds(groups, effortViews);
 }
 /**
  * 列出可用于枚举目录的 provider。
@@ -1148,6 +1150,12 @@ function registerJetHubEndpoints(ctx, pool, codearts, buddy, workbuddy, lobstera
      * 反过来（switch 先匹配）又会被别的 provider 的 case 误吞。
      */
     async function handleMethod(method, payload, _signal) {
+        if (method.startsWith('opencode.local.')) {
+            const handled = await modelAdapters?.opencode?.handleRpc?.(method, payload);
+            if (handled !== undefined)
+                return handled;
+            throw new Error('OpenCode 本地服务尚未加载，请更新并重启 DSH');
+        }
         if (method.startsWith('opencode.')) {
             const handled = await handleOpencodeRpc(ctx, pool, method, payload);
             if (handled !== undefined)
@@ -1157,6 +1165,18 @@ function registerJetHubEndpoints(ctx, pool, codearts, buddy, workbuddy, lobstera
         if (autoclawResult !== undefined)
             return autoclawResult;
         switch (method) {
+            case 'zcode.resetStatus':
+            case 'zcode.resetOpportunity':
+            case 'zcode.resetUse': {
+                const req = payload;
+                if (typeof req.accountId !== 'string' || typeof req.sourceId !== 'string')
+                    throw new Error('额度重置账号或套餐无效');
+                const action = method === 'zcode.resetStatus' ? 'status' : method === 'zcode.resetOpportunity' ? 'opportunity' : 'use';
+                const value = await zcodeSources(ctx, pool).reset(req.accountId, req.sourceId, action, req);
+                if (action === 'use')
+                    usageBadge.clear();
+                return { ok: true, value };
+            }
             case 'zcode.sources': {
                 const req = payload;
                 return { ok: true, value: await zcodeSources(ctx, pool).list(req.accountId, req.refresh === true) };
@@ -1167,6 +1187,7 @@ function registerJetHubEndpoints(ctx, pool, codearts, buddy, workbuddy, lobstera
                     throw new Error('额度来源参数无效');
                 await zcodeSources(ctx, pool).select(req.accountId, req.sourceId);
                 usageBadge.clear();
+                ctx.emit('llm/adapters-updated');
                 return { ok: true, value: { selected: req.sourceId } };
             }
             case 'account.list': {
@@ -1180,6 +1201,42 @@ function registerJetHubEndpoints(ctx, pool, codearts, buddy, workbuddy, lobstera
                 const id = `${provider}-${shortId()}`;
                 const suffix = shortId().toUpperCase();
                 const refName = `${provider.toUpperCase()}_ACCOUNT_${suffix}`;
+                // ── 腾讯 OrcaTerm ────────────────────────────────────────────────────
+                // 独立分支，**必须排在 `productById()` 之前**：OrcaTerm 的登录是网页
+                // cookie（微信扫码）而非 `/v2/plugin/auth/state` 两步流程。它一旦落进
+                // CodeBuddy 分支，`product.endpoint`/`product.platform` 就是 undefined，
+                // 会拼出 `undefined/v2/plugin/auth/state?platform=undefined` 而失败
+                //（真机事故 2026-10-14）。
+                if (provider === ORCATerm.id) {
+                    const outcome = createOrcaTermAccount();
+                    // ⚠️ 无论凭据是否已就绪，**都先建占位条目**（与其余 provider 同契约）：
+                    // 客户端的 `account.create` 之后会 `setInterval` 轮询
+                    // `login.poll({accountId})`，账号不存在时它永远拿不到 `done`，
+                    // 登录窗口不会自动关闭、用户以为卡死。占位条目让轮询有对象可查。
+                    const ref = credentialRef(refName);
+                    if (outcome.status === 'ready') {
+                        await ctx.credentials.set(ref, serializeOrcaTermCredential(outcome.credential));
+                    }
+                    await pool.addAccount({
+                        id,
+                        provider: ORCATerm.id,
+                        nickname: outcome.status === 'ready' ? orcaTermNickname(outcome.credential) : id,
+                        enabled: true,
+                        credentialRef: refName,
+                        // 登录态是随腾讯云会话过期的 cookie，没有 refresh 端点。
+                        refreshable: false,
+                        createdAt: Date.now(),
+                    });
+                    usageBadge.clear();
+                    return {
+                        ok: true,
+                        value: {
+                            accountId: id,
+                            // 凭据已就绪时不给 loginUrl：客户端会跳过登录窗口直接刷新列表。
+                            loginUrl: outcome.status === 'ready' ? '' : outcome.loginUrl,
+                        },
+                    };
+                }
                 // CodeBuddy 系（buddy / workbuddy）共用两步登录流程：
                 // 只获取 loginUrl 和 state 立即返回，后台用同一个 state 异步执行
                 // 完整登录流程。两者的差异只在产品配置（platform、登录 URL 附加
@@ -1955,6 +2012,21 @@ function registerJetHubEndpoints(ctx, pool, codearts, buddy, workbuddy, lobstera
                     }
                     if (!isUsableZcodeCredential(parsed))
                         return { ok: true, value: { done: false } };
+                }
+                // OrcaTerm：凭据来自**内置浏览器的 cookie jar**，不在轮询开始时就有。
+                // 每次 poll 重新采一次：用户扫码完成后 cookie 落到 jar 里，这一轮就
+                // 采得到并把凭据写入该账号 —— 登录窗口随即被客户端关掉。
+                //
+                // ⚠️ 不能只判 `resolved` 非空就 done：占位条目在凭据未就绪时
+                // `resolve` 可能返回空串/undefined（取决于存储后端），这里显式采一次。
+                if (entry.provider === ORCATerm.id) {
+                    const outcome = createOrcaTermAccount();
+                    if (outcome.status !== 'ready')
+                        return { ok: true, value: { done: false } };
+                    await ctx.credentials.set(ref, serializeOrcaTermCredential(outcome.credential));
+                    await pool.updateAccount(entry.id, { nickname: orcaTermNickname(outcome.credential) });
+                    usageBadge.clear();
+                    return { ok: true, value: { done: true, success: true } };
                 }
                 return { ok: true, value: { done: true, success: true } };
             }
@@ -4149,4 +4221,3 @@ function normalizeRpcResult(result) {
 function reply(rpcId, result) {
     return Response.json({ type: 'server-response', rpcId, result: normalizeRpcResult(result) });
 }
-//# sourceMappingURL=jet-hub-rpc.js.map

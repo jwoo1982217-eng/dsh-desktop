@@ -56,7 +56,12 @@ import { GeminiAuth } from './gemini-auth.js';
 import { registerGeminiLlm } from './gemini-adapter.js';
 import { GEMINI } from './gemini.js';
 import { createGeminiSigStore } from './gemini-sigstore.js';
-import { registerOpencodeLlm } from './opencode-adapter.js';
+import { OpencodeLocalService } from './opencode-local-native.js';
+import { OpencodeLocalAdapter } from './opencode-local-adapter.js';
+import { OpencodeHybridAdapter, createOpencodeInferenceAdapter } from './opencode-hybrid-adapter.js';
+import { registerAdapterIdempotent } from './llm-register-compat.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { registerAutoLlm } from './auto-adapter.js';
 import { AGGREGATE_PROVIDER, registerAggregateLlm } from './aggregate-adapter.js';
 // ⚠️ `createExpiryProbe` 从**底座**导入，不是从 `aggregate-adapter.js`
@@ -65,50 +70,11 @@ import { createExpiryProbe } from './aggregate-expiry.js';
 // ⚠️ opencode 的 RPC 由 `jet-hub-rpc.ts` 的 handleMethod 统一分派
 // （它调 handleOpencodeRpc），本文件**不再**单独注册端点 —— 详见
 // `opencode-rpc.ts` 模块头「为什么是被主 switch 调用」。
-import { ensureDefaultAnonymousSlot, listIdentitySlots, } from './opencode-auth.js';
 import { OPENCODE } from './opencode-product.js';
-import { deriveProjectId } from './opencode.js';
-import { primeOpencodeCapabilities, refreshOpencodeCapabilities } from './opencode-capability.js';
+import { registerOrcaTermLlm } from './orcaterm-adapter.js';
+import { ORCATerm } from './orcaterm-product.js';
+import { resolveOrcaTermCredential } from './orcaterm-credential.js';
 import { closeAllProxyDispatchers } from './opencode-proxy.js';
-import { execFile } from 'node:child_process';
-/**
- * 懒加载的 OpenCode UA：首个请求要发时才探测本机 opencode 版本，探测一次即缓存。
- *
- * ⚠️ 拿不到**不阻塞、不抛错**，回退 `OPENCODE.defaultUserAgent`：UA 只是一个伪装
- * 维度，服务端并未校验其真实性（opencode2dsh 实测），不值得为此延迟启动。
- * 探测最多等 2 秒；本机没装 opencode 是**正常情况**（匿名通道照样能用）。
- * ⚠️ 用 `execFile` 而非 `exec`：**不经过 shell**，参数不会被解释；带
- * `windowsHide` 免得在 Windows 上闪一个黑框。
- * ⚠️ 缓存 Promise 而非结果：并发首请求只会 spawn 一次探测进程。
- */
-function lazyOpencodeUserAgent() {
-    let pending;
-    return () => {
-        pending ??= new Promise((resolve) => {
-            execFile('opencode', ['--version'], { timeout: 2000, windowsHide: true }, (_err, stdout) => {
-                resolve(typeof stdout === 'string' ? stdout : '');
-            });
-        })
-            .then((out) => {
-            const version = out.match(/(\d+\.\d+\.\d+)/)?.[1];
-            return version === undefined ? OPENCODE.defaultUserAgent : `opencode/${version}`;
-        })
-            .catch(() => OPENCODE.defaultUserAgent);
-        // 同步取值：缓存命中时立刻有值；未命中时用产品默认（不阻塞首个请求）。
-        let cached = OPENCODE.defaultUserAgent;
-        void pending.then((ua) => { cached = ua; });
-        return cached;
-    };
-}
-/**
- * 拉取 Zen 模型目录的超时（毫秒）。
- *
- * ⚠️ 桌面版实测：到 `opencode.ai` 的 fetch 可能**永不 settle**（宿主网络
- * 异常），而 `loadOpencodeCatalog` 的兜底分支只有在内层 Promise **结束**
- * 后才可能执行。挂死时模型列表与用量徽标会同时空白（用户报障 2026-10-02）。
- * 8 秒足够覆盖正常路径（实测首字节 720ms 量级），又不会让 UI 干等太久。
- */
-const OPENCODE_CATALOG_TIMEOUT_MS = 8_000;
 export const name = 'codearts-auth';
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
 // 提供，headless/CLI profile 里并不存在。静态 inject 会让本插件在那些 profile
@@ -246,6 +212,45 @@ export function makeReadImageRequest(ctx) {
     };
 }
 /** 注册 codeartsAuth 服务与 codearts LLM 路由（不注册斜杠命令）。 */
+/**
+ * 解析账号池里存的 OrcaTerm 凭据 JSON。
+ *
+ * 形态由登录流程写入：网页登录存 `{"uin","skey","userId"}`，
+ * 桌面 token 存 `{"ot_session":"…"}`。损坏的 JSON 返回 null，让上层回退到
+ * cookie 采集 —— 而不是把坏凭据交给 upstream 换一个费解的 4xx。
+ */
+function parseOrcaTermSecret(value) {
+    const raw = String(value ?? '').trim();
+    if (!raw)
+        return null;
+    if (raw.startsWith('{')) {
+        try {
+            const parsed = JSON.parse(raw);
+            const uin = String(parsed.uin ?? '').trim();
+            const skey = String(parsed.skey ?? '').trim();
+            if (uin && skey)
+                return { kind: 'web', uin, skey, userId: String(parsed.userId ?? '').trim() };
+            const ot = String(parsed.ot_session ?? '').trim();
+            if (ot)
+                return { kind: 'desktop', otSession: ot };
+            return null;
+        }
+        catch {
+            return null;
+        }
+    }
+    return null;
+}
+/** OrcaTerm 用量记账：写进与其余 provider 同一份账本，面板才能显示消耗。 */
+function recordOrcaTermUsage(ctx, record) {
+    try {
+        const store = ctx.get?.('tokenLedger');
+        store?.record?.({ ...record, provider: ORCATerm.id });
+    }
+    catch (error) {
+        ctx.logger?.debug?.(`[orcaterm] 用量记账跳过：${String(error)}`);
+    }
+}
 export function apply(ctx) {
     // 本插件自带 Jet Hub 设置页，关闭 0.1.7 起由 Config schema 反渲染的自动表单
     // （老契约没有 configure()，静默跳过）。
@@ -1914,127 +1919,63 @@ export function apply(ctx) {
         // 同上：captcha 浏览器必须随插件一起回收。
         zcodeAdapter.stop();
     }, 'codearts-auth.scheduler (legacy)');
-    // ===== OpenCode Zen（账号槽 + 匿名槽平权混合池）=====
-    //
-    // 形态与前面所有 provider 相同：进程内 LlmAdapter 直发远端，无子进程、无端口。
-    // 两处独有语义：
-    // 1. **身份 = 槽**：账号槽（手动粘贴的 `sk-` key，可各配代理）+ 匿名槽
-    //    （凭证就是字面量 `public`，永远本机出口）。免费模型下全槽**平权**轮换，
-    //    收费模型只走账号槽（匿名凭证只被服务端认作免费通道）。
-    // 2. **每账号可配代理**：NAT 后的多台 PC 共享一个出口 IP，而 Zen 的匿名通道
-    //    按出口 IP 限流 ⇒ 要真正分开只能给各账号各配一条出口（`opencode-proxy.ts`）。
-    //
-    // ⚠️ 指纹派生的**唯一作用是防关联**（opencode 协议层没有机器指纹），
-    // 不参与配额计算 —— 换配额桶只能靠换 key 或换代理。
-    // ⚠️ 版本探测**不能**在 apply 里 await（apply 是同步函数）：那会让插件启动
-    // 阻塞最多 2 秒。改为**懒加载**：首个请求要发时才探测并缓存，探测失败直接
-    // 用 `OPENCODE.defaultUserAgent`（UA 只是伪装维度，服务端未校验真实性）。
-    const opencodeUA = lazyOpencodeUserAgent();
-    const opencodeAdapter = registerOpencodeLlm(ctx, {
-        identitySlots: async () => listIdentitySlots(await Promise.all(pool.listAccountsByProvider(OPENCODE.id).map(async (entry) => {
-            const resolved = await ctx.credentials
-                .resolve(credentialRef(entry.credentialRef))
-                .catch(() => undefined);
-            let parsed = {};
-            if (resolved !== undefined) {
-                try {
-                    parsed = JSON.parse(resolved.value);
-                }
-                catch {
-                    // 凭据损坏：回退到匿名凭证，让用户看到「凭据未配置」而不是整条崩掉
-                }
-            }
-            const apiKey = parsed.api_key ?? OPENCODE.anonymousKey;
-            // ⚠️⚠️ **指纹代次必须以账号池为权威重算**（本任务最容易漏的一步）：
-            // 「指纹」按钮只把 generation 写进账号条目
-            // （`updateOpencodeFingerprintGeneration`），凭据里的 `fingerprint`
-            // 仍是添加账号时的旧值。若直接透传凭据里的 fingerprint，代次涨了而
-            // project id **纹丝不动** —— 用户点了「指纹」却什么都没换，且**不报错**，
-            // 是最难排查的一类静默失效。
-            const generation = Math.max(pool.opencodeFingerprintGenerationFor(entry.id), 0);
-            // ⚠️ **identity 选择**：匿名槽的 api_key 全是 `public`，用它派生会让
-            // N 条匿名通道拿到**同一个指纹**（彼此无法区分）。故匿名槽改用
-            // **条目 id** 作 identity —— 这正是「多个匿名账号各有独立指纹」的实现点。
-            const identity = apiKey === OPENCODE.anonymousKey ? entry.id : apiKey;
-            const snapshot = {
-                id: entry.id,
-                enabled: entry.enabled,
-                apiKey,
-                proxy: pool.opencodeProxyFor(entry.id),
-                fingerprint: { projectId: deriveProjectId(identity, generation), generation },
-            };
-            return snapshot;
-        })), 
-        // 取值一次即可：`listIdentitySlots` 要的是字符串，不是惰性函数。
-        // 首次调用时可能还是产品默认值（探测在后台跑），后续请求才用真机版本 ——
-        // 宁可前几次 UA 用兜底值，也不让插件启动阻塞在 2 秒的子进程上。
-        opencodeUA()),
-        // ⚠️⚠️ **必须有超时**（真机事故 2026-10-02）：桌面版到 opencode.ai 的
-        // fetch 可能**永不 settle**（与同源的 remote.session 故障都是宿主网络问题）。
-        // 没有超时 → `loadOpencodeCatalog` 的 try/catch 永远走不到 →
-        // `listModels` 永不返回 → **模型列表与徽标同时空白**（用户报障）。
-        // 有超时则超时后回退兜底表，UI 立刻可用（只是暂时看不到付费模型）。
-        fetchRemoteCatalog: (slot, signal) => fetch(`${OPENCODE.baseUrl}${OPENCODE.modelsPath}`, {
-            headers: { authorization: `Bearer ${slot.apiKey}` },
-            // 组合两个信号：调用方给的（取消）+ 自己的超时（防挂死）。
-            signal: signal === undefined
-                ? AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)
-                : AbortSignal.any([signal, AbortSignal.timeout(OPENCODE_CATALOG_TIMEOUT_MS)]),
-        }),
-        disabledModels: () => pool.disabledModelsFor(OPENCODE.id),
-        isLimited: (slotId, modelId) => {
-            const entry = pool.listAccountsByProvider(OPENCODE.id).find(a => a.id === slotId);
-            const resetAt = entry?.modelRateLimits?.[modelId];
-            return !entry?.enabled || (resetAt !== undefined && resetAt > Date.now());
+    // ===== OpenCode 本机原生 serve =====
+    // JetHub 保留同一个 provider id 与原账号记录；实际请求交给本机 OpenCode。
+    const opencodeLocalRef = credentialRef('OPENCODE_LOCAL_SERVER');
+    const opencodeLocal = new OpencodeLocalService({
+        home: process.env.DSH_HOME || join(homedir(), '.dsh'),
+        readAuth: async () => {
+            const resolved = await ctx.credentials.resolve(opencodeLocalRef);
+            if (!resolved)
+                return undefined;
+            const value = JSON.parse(resolved.value);
+            if (typeof value.username !== 'string' || typeof value.password !== 'string')
+                throw Error('OpenCode 本地服务访问密码存储格式损坏');
+            return { username: value.username, password: value.password };
         },
-        markLimited: async (slotId, modelId, resetAtMs) => {
-            // 匿名条目同样落盘：它是池里的一条普通条目，限额标记在面板可见、
-            // 可用「重测/清除」恢复（早期把匿名槽当进程内状态，重启即丢）。
-            await pool.updateModelRateLimit(slotId, modelId, resetAtMs);
-        },
-        warn: (message) => ctx.logger.warn(`[codearts-auth] ${message}`),
-        // ⚠️ 图片字节桥接：Zen 有多个免费模型实测支持图片输入（big-pickle /
-        // space-bunny-free / mimo-v2.6 / mimo-v2.5，2026-10-02 真机验证），
-        // 模态由 `opencode-capability.ts` 按远端 models.dev 播报。
-        // ⚠️ 不接 `readImageRequest`（缩放桥接）：Zen 免费通道对图片体积的
-        // 限制**未实测**，不凭猜测加一层压缩（Qoder/Raccoon 是实测撞到体积
-        // 限制才接的）。先发原图，撞到限制再按实测加。
-        readImage: makeReadImage(ctx),
-    });
-    // 保证至少有一条匿名通道（零账号也能用免费模型）。
-    //
-    // ⚠️ **不 await**：`apply()` 是同步的（不能 await），而这里是异步 IO。
-    // 走 fire-and-forget —— 它只是「补一条默认条目」，失败最坏结果是用户
-    // 手动点「+ 添加匿名通道」，而 `listIdentitySlots` 每次请求都实时读池，
-    // 补完立即生效，不需要等它。
-    void ensureDefaultAnonymousSlot((entry) => pool.addAccount(entry), (refName, value) => ctx.credentials.set(credentialRef(refName), value), () => pool.listAccountsByProvider(OPENCODE.id), 
-    // ⚠️ 判据是「池里有没有匿名条目」而不是「有没有账号」：用户若主动
-    // 删光了匿名通道，那是明确选择，不该每次启动又塞回来（删除会像失灵）。
-    () => pool.listAccountsByProvider(OPENCODE.id).some((e) => e.id.startsWith(`${OPENCODE.id}-anon-`))).then((id) => {
-        if (id !== '')
-            ctx.logger.info(`[codearts-auth] 已为 OpenCode 创建默认匿名通道：${id}`);
-    }).catch((error) => {
-        ctx.logger.warn(`[codearts-auth] 创建默认 OpenCode 匿名通道失败：${String(error)}`);
-    });
-    // 预热模型能力表（models.dev）。
-    //
-    // ⚠️⚠️ **两条硬约定**（真机事故 2026-10-02）：
-    // 1. 渲染路径上**只读同步缓存**，永不 await 网络 —— 我最初在 `listModels`
-    //    里 await 这个拉取，而它 5 MB / 慢则 1.4s、宿主网络异常时**永不返回**，
-    //    于是模型选择器一直空白（用户报障「一直卡着」）。
-    // 2. 拉取完成要**广播目录变更**：能力表是能力判定的来源，DSH 已经用
-    //    「纯文本」渲染过一帧，不广播它不会重算（免费模型会一直显示不支持图片）。
-    //
-    // 首次运行磁盘没缓存时，本次刷新可能晚于首帧几十秒；那段时间能力按纯文本
-    // 保守处理（见 opencode-capability.ts 的模块头）。
-    primeOpencodeCapabilities();
-    refreshOpencodeCapabilities(() => {
-        try {
+        saveAuth: auth => ctx.credentials.set(opencodeLocalRef, JSON.stringify(auth)),
+        onCatalogChanged: () => { try {
             ctx.emit('llm/adapters-updated');
         }
-        catch (error) {
-            ctx.logger.warn(`[codearts-auth] 广播 OpenCode 能力更新失败：${String(error)}`);
-        }
+        catch { } },
+        warn: message => ctx.logger.warn(message),
+    });
+    const opencodeLocalAdapter = new OpencodeLocalAdapter(opencodeLocal, {
+        readImage: makeReadImage(ctx),
+        disabledModels: () => pool.disabledModelsFor(OPENCODE.id),
+    });
+    // /inference 匿名快通道：与本地服务共用同一个 provider id，由 Hybrid 按模型 id
+    // 分流（免费实测表 → 直连 opencode.ai/inference；其余 → 本地服务）。
+    // 2026-10-17：本地 CLI 通道在免费档体感慢，快通道免 key 且单轮直连。
+    const opencodeInferenceAdapter = createOpencodeInferenceAdapter();
+    const opencodeAdapter = new OpencodeHybridAdapter(opencodeLocalAdapter, opencodeInferenceAdapter, {
+        disabledModels: () => pool.disabledModelsFor(OPENCODE.id),
+    });
+    registerAdapterIdempotent(ctx.llm, [OPENCODE.id], opencodeAdapter);
+    ctx.effect(() => () => opencodeLocal.dispose());
+    // ── 腾讯 OrcaTerm ────────────────────────────────────────────────────────
+    // 凭据来源三层，由 `resolveOrcaTermCredential` 统一裁决（账号池 → 内置浏览器
+    // cookie 采集 → orcaterm_token.txt）。面板「登录」打开内置浏览器完成微信扫码，
+    // cookie 落在同一个 jar 里，因此**不需要用户手输任何凭据**。
+    const orcaTermAdapter = registerOrcaTermLlm(ctx, {
+        resolveCredential: async () => {
+            // 账号池里的 OrcaTerm 条目优先：它支持多账号与过期展示。
+            const entries = pool.listAccountsByProvider(ORCATerm.id).filter(candidate => candidate.enabled);
+            for (const entry of entries) {
+                const resolved = await ctx.credentials.resolve(credentialRef(entry.credentialRef)).catch(() => undefined);
+                if (resolved !== undefined) {
+                    const parsed = parseOrcaTermSecret(resolved.value);
+                    if (parsed !== null)
+                        return parsed;
+                }
+            }
+            // 回退：内置浏览器 cookie 采集 → token 文件。
+            return resolveOrcaTermCredential() ?? undefined;
+        },
+        recordUsage: (record) => {
+            recordOrcaTermUsage(ctx, record);
+        },
+        warn: (message) => ctx.logger.warn(`[orcaterm] ${message}`),
     });
     // ⚠️ 这里**不再**调 `registerOpencodeRpc`：opencode 的端点已并入
     // `registerJetHubRpc` 内部的 handleMethod（见 `opencode-rpc.ts` 模块头）。
@@ -2170,6 +2111,7 @@ export function apply(ctx) {
         gemini: pruned(GEMINI.id, geminiAdapter),
         zcode: pruned(ZCODE.id, zcodeAdapter),
         opencode: pruned(OPENCODE.id, opencodeAdapter),
+        [ORCATerm.id]: pruned(ORCATerm.id, orcaTermAdapter),
         // ⚠️ 聚合 provider 也必须进这张表（设计文档 §5.2 的必改点）：`jet-hub-rpc.ts` 的
         // `fullCatalogIds` **优先**用本表的 `listAllModels()`（不套黑名单的全量目录），
         // 缺失时才退化到 `llm.listModels(provider)` —— 后者已被适配器按黑名单过滤。
@@ -2219,4 +2161,3 @@ export function apply(ctx) {
     });
     ctx.provide('accountPool', pool);
 }
-//# sourceMappingURL=index.js.map
