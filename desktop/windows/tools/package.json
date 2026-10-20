@@ -1,0 +1,1 @@
+{"name":"dsh-windows-build-tools","private":true,"type":"module","dependencies":{"7zip-bin":"5.2.0","electron-builder":"26.15.3","resedit":"3.0.2"}}

@@ -1,0 +1,88 @@
+{
+  "platform": "win32-x64",
+  "electron": "44.7.2",
+  "node": "24.14.0",
+  "archives": [
+    {
+      "url": "https://registry.npmjs.org/@vscode/ripgrep-win32-x64/-/ripgrep-win32-x64-1.18.0.tgz",
+      "bytes": 2111160,
+      "sha256": "725006b9662fa0f73cb0dc7d62b666524b80cfe125214ca75dab5293ef9e4203",
+      "name": "@vscode/ripgrep-win32-x64",
+      "version": "1.18.0",
+      "integrity": "sha512-KNPvtElldqILHdnAetujPaowkNbpqJy3ssIGGN6F6Kve9Qi+nNLI2DN01O83JjCEVQbCzl8Ov3QZ9Eov3BR8Dg=="
+    },
+    {
+      "url": "https://registry.npmjs.org/node-addon-require-builtin-win32-x64-msvc/-/node-addon-require-builtin-win32-x64-msvc-0.1.9.tgz",
+      "bytes": 172834,
+      "sha256": "b25a18758b16d01b0ca9dd8c198d8a626a1283018dc97c825c9938be06f3c5f3",
+      "name": "node-addon-require-builtin-win32-x64-msvc",
+      "version": "0.1.9",
+      "integrity": "sha512-+i6N4A7m7txjbw8pDYESdWXiKO9EEVq0SzTzwPS0WZuV4F1MzQnaDJwJJnO7T6zAc0BvqHXBOkpharCrUjFhbQ=="
+    },
+    {
+      "url": "https://registry.npmjs.org/@koromix/koffi-win32-x64/-/koffi-win32-x64-3.1.1.tgz",
+      "bytes": 399006,
+      "sha256": "b0be9b6a916b9f5de5b97fb5de844efe1121f7ed44cafb481a1479c7c90aec9b",
+      "name": "@koromix/koffi-win32-x64",
+      "version": "3.1.1",
+      "integrity": "sha512-KqHPmvj6QILhNyI/To8QSihHsijeVGIYYPBOUnXEpcnH2LuLbargY4Hd6dDeTN3Z90uUUxN+1FWz1UnhVzFOiA=="
+    },
+    {
+      "url": "https://registry.npmjs.org/@zseven-w/dsh-noema-win32-x64/-/dsh-noema-win32-x64-0.1.0-rc.1.tgz",
+      "bytes": 5037260,
+      "sha256": "1a135f09dae25bfa5cd902170f6dfee6da2dc2cb12881147e7b70ea830c90fd6",
+      "name": "@zseven-w/dsh-noema-win32-x64",
+      "version": "0.1.0-rc.1",
+      "integrity": "sha512-533aOUakkIRMTifs2/n2fkKuGb3xtxnkW2cuoHsYlyVxcb2AXGMC4ah48+wYWYfdxNuXaHyt5AfN2ihglB0JNg=="
+    },
+    {
+      "url": "https://registry.npmjs.org/opencode-windows-x64-baseline/-/opencode-windows-x64-baseline-1.19.2.tgz",
+      "bytes": 60267047,
+      "sha256": "62d0ffaa75791569d9a8725540f2cab3cfece5f33d22e3b6f33596a4879e4b57",
+      "name": "opencode-windows-x64-baseline",
+      "version": "1.19.2",
+      "integrity": "sha512-VyeypKM0m6oTCT8rOJNuIc85vzEQt3vlciFZlcfDrp0QECMHNwJ16Hlk591luh+FpVD7kPf3J5SBZ2baee8KVw=="
+    },
+    {
+      "url": "https://registry.npmjs.org/@img/sharp-win32-x64/-/sharp-win32-x64-0.35.5.tgz",
+      "bytes": 8575353,
+      "sha256": "16a804181ddd258ca6fe7079b2faa0c0356654c9db3d93ab0a80ec5e5161c3d4",
+      "name": "@img/sharp-win32-x64",
+      "version": "0.35.5",
+      "integrity": "sha512-x76eH0vEiHlcMQu8Y8IenntaACtddpT6W0wmXtWrnKcnKI7ME5DdgqhAD6SEWOEl1v2zDvkZDhFA9KnURwpfqg=="
+    },
+    {
+      "url": "https://registry.npmjs.org/sherpa-onnx-win-x64/-/sherpa-onnx-win-x64-1.13.8.tgz",
+      "bytes": 8894875,
+      "sha256": "fe522f02a5c113c2567a43982107ef41ae517f9a431931e90731e7e4d4341073",
+      "name": "sherpa-onnx-win-x64",
+      "version": "1.13.8",
+      "integrity": "sha512-oZF1c9VPOKtMwn83Bboc5XSWL+76BRoyB3eUuVnCknBKxwSULZU2Foia9VHWzU+n4I12rPsP6z6H9Rp1hD9o8g=="
+    },
+    {
+      "url": "https://registry.npmjs.org/@deepseek-ai/libreoffice-kit-win32-x64/-/libreoffice-kit-win32-x64-0.1.5.tgz",
+      "bytes": 71367942,
+      "sha256": "5cc9051e7d29a6dfe409bb3dbfcb931cbb1591709d83b84b404faf319a64d0ae",
+      "name": "@deepseek-ai/libreoffice-kit-win32-x64",
+      "version": "0.1.5",
+      "integrity": "sha512-uKuDGZdofxuW4iRmUh8b3+XWU28JeOCYMTAONzo7tEHIq00DV2cARcgUYiTP7gUH49tH4A/RyPMOVEBzK7qjjw=="
+    },
+    {
+      "url": "https://nodejs.org/dist/v24.14.0/node-v24.14.0-win-x64.zip",
+      "bytes": 36217529,
+      "sha256": "313fa40c0d7b18575821de8cb17483031fe07d95de5994f6f435f3b345f85c66"
+    },
+    {
+      "url": "https://github.com/electron/electron/releases/download/v44.7.2/electron-v44.7.2-win32-x64.zip",
+      "bytes": 157867015,
+      "sha256": "10a89447ef64ac5cb9f782af48ffd83734a40ae91681259d1048ca3c9e6c5da4"
+    },
+    {
+      "url": "https://download.visualstudio.microsoft.com/download/pr/ebdab8e5-1d7b-4d9f-a11b-cbb1720c3b12/843068991DAAA1F73AD9F6239BCE4D0F6A07A51F18C37EA2A867E9BECA71295C/VC_redist.x64.exe",
+      "bytes": 18731856,
+      "sha256": "843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c",
+      "kind": "vc-redist",
+      "version": "14.51.36247"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "dsh-macos-build-tools",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@electron/packager": "20.3.0"
+  }
+}
