@@ -4,7 +4,7 @@ import {Context} from '@deepseek-ai/cordis';
 import {BasicCompactionEngine} from '../runtime/overlays/@deepseek-ai/dsh-compaction-basic/lib/index.js';
 import {estimateMessage} from '@deepseek-ai/dsh-token-meter/estimate';
 
-const agent = () => ({options:{provider:'fixture',model:'local'},session:{id:'fixture-session',requestHeader:()=>({config:{provider:'fixture',model:'local'}}),toolHistory:()=>[]}});
+const agent = () => ({options:{provider:'fixture',model:'local'},session:{id:'fixture-session',requestHeader:()=>({config:{provider:'fixture',model:'local'}}),toolHistory:()=>({tools:[],updates:[]})}});
 function fixture(config={}) {
   const ctx=new Context(), hooks={};
   ctx.provide('tokenMeter',{estimateMessage});
