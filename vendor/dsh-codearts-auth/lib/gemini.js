@@ -605,3 +605,4 @@ export function normalizeBase64(data) {
         return undefined;
     return cleaned;
 }
+//# sourceMappingURL=gemini.js.map

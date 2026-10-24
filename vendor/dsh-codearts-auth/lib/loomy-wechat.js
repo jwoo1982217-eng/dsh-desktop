@@ -272,3 +272,4 @@ export async function pollLoomyWechatOnce(uuid, lastErrcode, fetcher = fetch) {
     // 408 与未知值一律归 waiting（保守：绝不误判成功）。
     return { status: LOOMY_WECHAT_POLL_STATUS.waiting, code: '', errcode };
 }
+//# sourceMappingURL=loomy-wechat.js.map

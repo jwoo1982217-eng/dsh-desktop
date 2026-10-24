@@ -87,3 +87,4 @@ export function captureNativeTool(request, message, sessionId, tools, shell) {
         return undefined;
     return { name: tool.name, arguments: result };
 }
+//# sourceMappingURL=opencode-local-handoff.js.map

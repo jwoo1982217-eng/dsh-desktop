@@ -3,8 +3,8 @@ import {
   OpencodeHybridAdapter, createOpencodeInferenceAdapter, opencodeInferenceSlot,
 } from '../../src/opencode-hybrid-adapter.js'
 import type { OpencodeLocalAdapter } from '../../src/opencode-local-adapter.js'
-import type { OpencodeAdapter } from '../../src/opencode-adapter.js'
-import { OPENCODE } from '../../src/opencode-product.js'
+import type { OpencodeAdapter } from '../../src/opencode-inference-adapter.js'
+import { OPENCODE } from '../../src/opencode-inference-product.js'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 
 function chunk(text: string): StreamChunk {

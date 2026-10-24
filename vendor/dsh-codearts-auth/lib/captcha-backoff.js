@@ -146,3 +146,4 @@ export function captchaQueueEnabledFromEnv(env = process.env) {
  *（官方 `f3()` 里是 `expiresAt: t + 6e4`）。
  */
 export const CAPTCHA_CONFIG_TTL_MS = 60_000;
+//# sourceMappingURL=captcha-backoff.js.map

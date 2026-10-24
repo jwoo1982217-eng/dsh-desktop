@@ -645,3 +645,4 @@ export async function startCallbackServer(port = TRAE_CALLBACK_PORT, _consoleHos
         clearTimeout(timer); });
     return result;
 }
+//# sourceMappingURL=trae-oauth.js.map

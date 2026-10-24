@@ -123,3 +123,4 @@ export function createBadgePreferenceStore(ctx) {
     }
     return new FilePreferenceStore(join(home, 'jet-hub', BADGE_PREFERENCES_FILE), ctx.logger);
 }
+//# sourceMappingURL=badge-preferences.js.map

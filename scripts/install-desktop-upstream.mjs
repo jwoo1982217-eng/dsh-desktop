@@ -1,3 +1,4 @@
+import {JETHUB_PACKAGE, JETHUB_LEGACY_PACKAGE, migrateJetHubManifest, isJetHubPackage} from './jethub-package.mjs';
 import {installDesktopWorkbench} from './install-desktop-workbench.mjs';
 import {prepareProfileMigration, commitProfileMigration, migrationReceipt, restoreProfileMigration} from '../desktop/macos/app/profile-migration.mjs';
 import { readFile, writeFile, mkdir, cp, rename, symlink, rm, lstat, stat } from 'node:fs/promises';
@@ -44,7 +45,8 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
   if (!Array.isArray(manifest.dsh?.profile?.bundles)) throw Error('请选择包含 dsh.profile.bundles 的 Web profile');
   manifest.dependencies ??= {};
   const expected = JSON.parse(await readFile(path.join(root, 'desktop-chatgpt/upstream-source-hashes.json'), 'utf8'));
-  const currentJetHub = path.join(profile, 'node_modules/dsh-codearts-auth');
+  let currentJetHub = path.join(profile, 'node_modules', JETHUB_PACKAGE);
+  try { await lstat(currentJetHub); } catch (error) { if (error.code !== 'ENOENT') throw error; currentJetHub = path.join(profile, 'node_modules', JETHUB_LEGACY_PACKAGE); }
   let hasJetHub = false;
   try { await lstat(currentJetHub); hasJetHub = true; }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -59,7 +61,7 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
         }
         throw error;
       }
-      if (![entry.old, entry.new, entry.rotation, entry.upstreamRc3, entry.auditedDesktop].includes(hash(bytes))) throw Error(`Jet Hub 的 ${entry.path} 有其他修改，请先合并兼容改动`);
+      if (![entry.old, entry.new, entry.rotation, entry.upstreamRc3, entry.auditedDesktop, entry.providersHubRc2].includes(hash(bytes))) throw Error(`Jet Hub 的 ${entry.path} 有其他修改，请先合并兼容改动`);
       verified.add(entry.path);
     }
     // 正式分发包可以只有编译产物；对应 JS 必须在上述白名单中完整通过。
@@ -99,12 +101,12 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
   let migrationCommitted = false;
   try {
     // 核心会优先从自身安装目录解析组合包，部署时同步已审核的本地程序。
-    for (const [name, source] of [['dsh-codearts-auth', 'vendor/dsh-codearts-auth'], ['@zseven-w/dsh-noema', 'vendor/dsh-noema'], ['dsh-peer', 'peer']]) {
+    for (const [name, source] of [[JETHUB_PACKAGE, 'vendor/dsh-codearts-auth'], ['@zseven-w/dsh-noema', 'vendor/dsh-noema'], ['dsh-peer', 'peer']]) {
       for (const entry of ['package.json', 'cordis.patch.yml', 'lib', 'src', 'locale', 'vendor', 'agent-cards', 'chat-history', 'chat-files', 'memory-isolation', 'mcp-manager', 'subagent-scheduler', 'legacy-subagent-policy', 'controlled-market', 'workflow-hub', 'index.mjs', 'protocol.mjs', 'relay.mjs', 'tunnel.mjs', 'proxy.mjs', 'ui-reuse.mjs', 'browser-session.mjs', 'config-sync.mjs', 'page.html', 'presentation.css', 'presentation.js', 'browser-compat.js', 'skill-import.js']) {
         const file = path.join(root, source, entry);
         try { await lstat(file); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
         const deployed = path.join(modules, name, entry);
-        if (name === 'dsh-codearts-auth') {
+        if (isJetHubPackage(name)) {
           const temporary = deployed + '.jethub-' + randomUUID();
           try {
             await cp(file, temporary, { recursive: true });
@@ -125,11 +127,15 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
     for (const name of await readdir(path.join(root, 'runtime/overlays/@deepseek-ai'))) {
       await cp(path.join(root, 'runtime/overlays/@deepseek-ai', name), path.join(modules, '@deepseek-ai', name), { recursive: true });
     }
-    for (const name of ['dsh-codearts-auth', '@zseven-w/dsh-noema']) {
+    for (const name of [JETHUB_PACKAGE, '@zseven-w/dsh-noema']) {
       await swap(path.join(profile, 'node_modules', name), path.join(modules, name));
       manifest.dependencies[name] = 'file:' + path.join(modules, name);
       if (!manifest.dsh.profile.bundles.includes(name)) manifest.dsh.profile.bundles.push(name);
     }
+    // 兼容旧引用，但两个名字必须指向同一物理包；bundle 只激活新版一次。
+    await swap(path.join(modules, JETHUB_LEGACY_PACKAGE), path.join(modules, JETHUB_PACKAGE));
+    await swap(path.join(profile, 'node_modules', JETHUB_LEGACY_PACKAGE), path.join(modules, JETHUB_PACKAGE));
+    Object.assign(manifest, migrateJetHubManifest(manifest, modules));
     if (await readFile(manifestPath, 'utf8') !== original) throw Error('安装期间 Profile 有其他修改');
     await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
     await installDesktopPeer(profile, modules);

@@ -138,3 +138,4 @@ export function prepareInferencePayload(payload) {
         tools,
     };
 }
+//# sourceMappingURL=opencode-inference.js.map

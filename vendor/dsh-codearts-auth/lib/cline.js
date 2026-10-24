@@ -224,3 +224,4 @@ export function clineAuthHeaders(accessToken, product, extra = {}) {
         ...extra,
     };
 }
+//# sourceMappingURL=cline.js.map

@@ -7,6 +7,8 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertDesktopNode, desktopVersion } from './install-desktop.mjs';
 
+import { JETHUB_NAMES } from './jethub-package.mjs';
+
 const root = fileURLToPath(new URL('../', import.meta.url));
 export function desktopStatePath(home, port) { return path.join(home, `.desktop-web-${port}.json`); }
 function validLocalUrl(url, port) {
@@ -38,9 +40,10 @@ export async function desktopLaunch({ home = process.env.DSH_HOME || path.join(h
   if (engine.version !== desktopVersion) throw Error('桌面核心版本不匹配，请重新安装 desktop-runtime');
   home = path.resolve(home);
   const manifest = JSON.parse(await readFile(path.join(home, 'profiles/web/package.json'), 'utf8'));
-  for (const name of ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-codearts-auth', 'dsh-peer', 'dsh-desktop-chatgpt']) {
+  for (const name of ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-peer', 'dsh-desktop-chatgpt']) {
     if (!manifest.dsh?.profile?.bundles?.includes(name)) throw Error('电脑版尚未安装完整，请先执行 node scripts/install-desktop.mjs');
   }
+  if (!JETHUB_NAMES.some(name => manifest.dsh.profile.bundles.includes(name))) throw Error('电脑版 Jet Hub 尚未安装');
   return {
     executable: process.execPath,
     args: ['--expose-internals', path.join(modules, '@deepseek-ai/dsh/lib/bin.js'), '--profile', 'web', '--host', '127.0.0.1', '--port', String(port), ...(noOpen ? ['--no-open'] : [])],

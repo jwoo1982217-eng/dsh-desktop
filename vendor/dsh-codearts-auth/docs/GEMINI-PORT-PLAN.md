@@ -57,9 +57,9 @@
 
 1. **目标项目改为当前工作区**。初版写 `F:\project\deepseek-harness-codearts_1`,实际就是
    `F:\project\dsh-codearts-plugin`。这四个文档是放在当前工作区 `docs/` 下当背景材料的。
-2. **分工方式改为 inline**。初版第五节写 `[子代理 hy4-preview]` 派发。AGENTS.md「工作方式」明确:
-   子任务优先用 inline 执行,不要新开 subagent(用户 2026-09-29 拍板)。理由是同工作区 subagent
-   做反向验证时互相踩坏未提交状态、且已有两次空转到超时。已把四步 `[子代理]` 改成 `[主模型 inline]`。
+2. **分工方式不再写死执行者**。初版第五节写 `[子代理 hy4-preview]` 派发 ⇒ 执行者标记已删除。
+   ⚠️ 2026-10-20 更新:本条原先引用 `AGENTS.md`「子任务优先用 inline 执行,不要新开 subagent」
+   这条约定来论证改法;**该约定已移除**,执行方式改由实施者自行选择。
 3. **`refreshAll` 范式改为照 codearts(`src/service.ts:406`),不照 minimax**。初版写「照 minimax 惯例」,
    但 minimax-auth.ts:281 是旧范式(`if (!entry.refreshable) continue`),正是 AGENTS.md
    「账号池的 `refreshable` 只是凭据材料的镜像」一节**已被推翻**的写法。codearts 才是最新范式:
@@ -449,15 +449,15 @@ gemini 必须显式加分支,并补 `tests/unit/account-probe-adapter.spec.ts` �
 8. `account-probe-adapter.spec.ts` 补一条 —— gemini 在 `probeWithAdapter` 分派表里有独立分支
    (防第四次同型缺陷:新增 provider 漏加分派,落到 else 被 CodeArtsAdapter 签名失败)。
 
-## 五、执行步骤与分工(待确认后执行,**全部 inline**)
+## 五、执行步骤与分工(待确认后执行)
 
-1. **[主模型 inline]** 定稿六个新文件的导出骨架与 DSH↔Gemini 映射表(接口先行)。
-2. **[主模型 inline]** `gemini.ts` 纯函数层 + 测试 1/2/3。
-3. **[主模型 inline]** `gemini-oauth.ts` + `gemini-sigstore.ts` + 测试 4。
-4. **[主模型 inline]** `gemini-auth.ts` + `gemini-adapter.ts` + `gemini-credits.ts`(与插件服务契约耦合最深、坑最密集,亲做)。
-5. **[主模型 inline]** index.ts / jet-hub-rpc.ts / plugin-src/client 接线 + 测试 5/6/7。
-6. **[主模型 inline]** 跑全量 `pnpm typecheck && pnpm test && pnpm build:all`,回报输出。
-7. **[主模型 inline]** 逐条验收:门控返空数组、两步式立即返回 URL、refreshAll 照 codearts 范式、
+1. 定稿六个新文件的导出骨架与 DSH↔Gemini 映射表(接口先行)。
+2. `gemini.ts` 纯函数层 + 测试 1/2/3。
+3. `gemini-oauth.ts` + `gemini-sigstore.ts` + 测试 4。
+4. `gemini-auth.ts` + `gemini-adapter.ts` + `gemini-credits.ts`(与插件服务契约耦合最深、坑最密集,亲做)。
+5. index.ts / jet-hub-rpc.ts / plugin-src/client 接线 + 测试 5/6/7。
+6. 跑全量 `pnpm typecheck && pnpm test && pnpm build:all`,回报输出。
+7. 逐条验收:门控返空数组、两步式立即返回 URL、refreshAll 照 codearts 范式、
    轮换立即回写、字母序金标准;通过后在目标项目本地提交(**不 push**,远端为他人仓库)。
 
 ## 六、真实 wire 样例(移植时的对齐基准)

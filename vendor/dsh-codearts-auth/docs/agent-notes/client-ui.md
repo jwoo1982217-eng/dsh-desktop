@@ -89,8 +89,9 @@ buddy: no usable credential; log in from the Jet Hub panel first
 
 **链路**（四个环节都正确，合起来却报出假原因）：
 
-1. 唯一的启用账号带该模型的未过期限流标记 → `pickBuddyCredential`
-   （`src/index.ts`）的候选筛成**空集**；
+1. 唯一的启用账号带该模型的未过期限流标记 → 候选筛（原
+   `src/index.ts` 里 buddy 系那段编排闭包，符号名已随 Task 6 删除
+   —— 见 git 历史 `d35d9e3`）筛成**空集**；
 2. `select()`（`src/buddy-balance-selector.ts`）对空候选只能回一个笼统的
    `{kind:'exhausted'}`，**未锁定时 `reason` 被丢弃**；
 3. 调用方退到**单凭据 ref** `BUDDY_ACCESS_TOKEN` —— 而 Jet Hub 登录只写
@@ -209,6 +210,307 @@ buddy: no usable credential; log in from the Jet Hub panel first
   「安全策略拦截（11140）：账号冷却 + 流内错误帧」段（7 条）。
   ⚠️ 已做**反向验证**：错误码退回 `AUTH` → **7 条**变红；禁用冷却标记 → **5 条**变红
   （含认证 / 限流 / 流内三条通道各自那条）；禁用流内识别 → **2 条**变红。
+### ⚠️⚠️ 承上：**额度用尽**也不能用 harness 常量 `QUOTA_EXCEEDED_CODE`（Issue IKJVCW）
+
+上一条讲的是「自定义文案要避开 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA`」。
+**但「避开 `QUOTA`」这件事有一个隐蔽的陷阱** —— 它让 codearts 成了十个
+provider 里**唯一**中招的一家。
+
+#### 陷阱：harness 常量的字面值就是被替换的那个码
+
+```ts
+// @deepseek-ai/dsh-llm
+export declare const QUOTA_EXCEEDED_CODE = "QUOTA"   // ← 就是 "QUOTA"
+```
+
+于是「用 harness 的规范化常量」这个看起来最正确的写法，
+**恰好产出会被客户端吞掉的码**（`failureMessage`，实测见下）：
+
+```js
+if (code === "QUOTA" || code === "ACCOUNT_QUOTA") return t("message.failure.quota");
+return code === "AUTH" ? t("message.failure.auth") : message;
+```
+
+`message.failure.quota` 的中文是「**当前请求的额度已用尽**」。
+
+#### 真实症状（用户报障）
+
+`codeartsQuotaExhaustedMessage()` 精心写的
+
+> `codearts: 模型 deepseek-v4.1-flash 的免费额度（benefit）已用尽，`
+> `预计 5.5 小时后重置（按 UTC+8 自然日结算，预计 …）。可改用其它模型，或…`
+
+**一个字都到不了用户眼前**，只剩「当前请求的额度已用尽」——
+既没有原因（benefit 额度）、也没有出路（换模型 / 切账号 / 何时恢复）。
+用户会去等额度恢复，而实际该做的是换模型。
+
+#### 判据：**字面量 `'QUOTA_EXCEEDED'`，不是 `QUOTA_EXCEEDED_CODE`**
+
+| 码 | 客户端替换文案？ | 在 `DEFAULT_RETRYABLE_CODES`？ | 语义 |
+|---|---|---|---|
+| `QUOTA`（= harness 常量） | **是** | 否 | 额度 |
+| `'QUOTA_EXCEEDED'`（字面量） | **否** | 否 | 额度 |
+| `PERMISSION_DENIED` | 否 | 否 | 权限（**额度用它属语义错位**） |
+
+⚠️ **不要为了「与 harness 词汇一致」改回常量**，也**不要**照 IKJVCW 建议把额度
+一律改 `PERMISSION_DENIED`：仓库里 buddy / cline / lobsterai / trae / zcode /
+minimax 等 **~20 处**额度错误一律用字面量 `'QUOTA_EXCEEDED'`，且**都不被替换** ——
+`codearts` 改用 harness 常量才是异类，**这正是缺陷只在本家复现的原因**。
+
+⚠️ 下游判据**已经双认**这个词汇差异，不必配套改：
+`account-probe.isRateLimitFailure` 与 `qoder-adapter.isQuotaExceededError`
+都同时接受 `'QUOTA_EXCEEDED'` 与 `'QUOTA'`；`dead-model-store` 的
+`IGNORED_CODES` **只收** `'QUOTA_EXCEEDED'`（原先靠 `/额度/` 文案兜底才没把模型
+误记成 30 天失效，改后是显式命中，**比原来更稳**）。
+
+#### ⚠️ 客户端按码判定的点**不止一处**（别只盯着 `failureMessage`）
+
+审计实测（2026-10-11，桌面端 `app.asar` 与 `dsh-client-ui-chat/lib/client.js` 双份一致）：
+
+| # | 判定点 | 判据 | 对 `'QUOTA_EXCEEDED'` 的影响 |
+|---|---|---|---|
+| 1 | `failureMessage` | 替换 **5** 个码：`ACCOUNT_SIGNED_OUT` / `ACCOUNT_SIGN_IN_REQUIRED` / `QUOTA` / `ACCOUNT_QUOTA` / `AUTH` | ✅ 不命中 ⇒ **message 完整透出**（本修复的目的） |
+| 2 | `quotaNotice` | `code !== "QUOTA" && code !== "ACCOUNT_QUOTA"` | ❌ 不命中 ⇒ **全局额度 Toast 不再触发**（见下） |
+| 3 | `displayFailure` | `if (code === "AUTH") return { code, message: "" }` | ✅ 不涉及（但这是 `AUTH` 的 message 被**置空串**之处） |
+
+⚠️ **第 1 处的「5 个码」不要写成「三个码」** —— `src/sse.ts` 的
+`REASONING_LOOP_CODE` 注释里**早就登记了同一份 5 码清单**，同一仓库两套同义
+数字必有一处是错的（本次修复初版就写错成三个，被审计抓出）。
+
+⚠️ **第 2 处是本修复的已知取舍**（审计实测，**不要**当缺陷再「修」回去）：
+`quotaNotice` 驱动一条**不随 Chat 面板消失**的全局额度 Toast，它只认
+`QUOTA` / `ACCOUNT_QUOTA`。改用 `'QUOTA_EXCEEDED'` 后该 Toast 不再出现。
+⇒ 取舍是「失败行有真实原因、但没有全局 Toast」vs「失败行被换成误导文案、
+但有全局 Toast」，**取前者**：真实原因就在失败行里，用户一定看得到；
+而后者的误导文案会把用户引向「等额度恢复」这个错误动作。
+若将来确实需要那条 Toast，做法是在 `plugin-src/client/` 自行注册
+`shell.quota-notice` 条目接管该码，**不是**把码改回 `QUOTA`。
+
+#### 三处产出点缺一不可
+
+`src/llm-adapter.ts` 有**三条**会产出该码的路径（少一条就会退回「被客户端顶掉文案」）：
+
+1. SSE 通道 `InferHub.4291.200`（HTTP 200 + 流内错误帧）；
+2. 4xx 通道的同一个码（服务端也可能以 4xx 下发）；
+3. **`httpErrorCode()` 里的额度归一化**（`400 + insufficient balance` 等措辞）
+   —— 这条最易漏，因为它**不在**那两块醒目的额度分支里。
+
+#### ⚠️⚠️ 401/403 下的额度分流**不得**为了「整齐」而调整（一次假阳性审计）
+
+4xx 分支的真实顺序是：
+
+```
+isAuthError（401/403 恒真 ⇒ 续期 + continue 重试）
+  → isSseQuotaExhaustedErrorCode（额度）→ isRateLimited → … → httpErrorCode
+```
+
+401/403 先被 `isAuthError` 接走续期一次，**第二轮**才轮到额度判据。
+逐格实测（重建 `lib/` 后走 `stream()`）：
+
+| 报文（4xx + 文案） | 400 | 401 | 403 |
+|---|---|---|---|
+| `insufficient balance` | 额度 | **AUTH** | **AUTH** |
+| `insufficient quota` | 额度 | **额度** | **额度** |
+| `out of credits` | 额度 | **AUTH** | **AUTH** |
+| `quota exceeded` | 额度 | **AUTH** | **AUTH** |
+| `InferHub.4291.200` + `insufficient quota` | 额度 | **额度** | **额度** |
+
+只有 `insufficient quota`（与 `4291` 码值腿）能穿透 ——
+因为 `isSseQuotaExhaustedErrorCode` 的**文案腿只认 `insufficient quota`**，
+不认 `balance` / `credits`。这是**既有行为**，不是本次改动引入。
+
+⚠️ **不要为了让这张表变整齐去调 `httpErrorCode` 的 401/403 优先级** ——
+独立审计曾报过一条「高」严重度缺陷：`httpErrorCode` 里
+`if (status === 401 || status === 403) return 'AUTH'` 排在
+`isQuotaExceededError(detail)` 之前，故「403 + `insufficient balance` 落 `AUTH`、
+同一文案用 400 却归额度」。**我照它改过，已撤回** —— 那是**孤立函数的假阳性**：
+审计只测了被建议修改的那个函数，没看它在真实控制流里**本就排在额度判据之后**。
+（教训：**审计结论必须回到生产路径复核**，不能只测被点名的那个函数。）
+
+而且该调整**违反本仓库的成文铁律**（`AGENTS.md`「同族判据必须逐格同构」）：
+
+> **401/403 先判**，恒归认证类 —— 状态码与额度文案并存时
+> （网关侧故障常在报文里捎带余额提示）**以状态码为准**
+
+codearts 的 401/403 来自**网关**（`APIG.0602` Invalid token / `APIG.0301` 验签失败），
+网关故障时捎带余额词是常态。让余额词改写分类 ⇒ 真凭据失效被说成「额度用尽」，
+用户被引向「等额度恢复」而非重新登录。该铁律是 2026-10-06 raccoon / loomy
+「一个请求内 6 个号各被封 24h」事故的产物。
+
+⚠️ 且「codearts 会用 401/403 下发额度文案」**无实测支撑**（141 个真实会话零命中；
+`InferHub.4291` 仅 1 次命中且是在讨论参考实现的 Rust 源码）。
+**将来真抓到该报文再按实测处理**，不要据构造报文改分类顺序 ——
+提建议者自己在「无法确认」里也承认「无线上真实报文，证据强度不足」。
+
+#### `errorDetail` 的两条腿：**只加不减**
+
+`errorDetail`（`src/llm-adapter.ts`）是上述分类的唯一输入。审计实测它
+**不认** `{"error":"<字符串>"}` 形态（只认 `typeof data.error === 'object'`），
+于是该形态退回**整段 JSON** —— 用户看到一坨不可读的裸 JSON。
+`src/openai-compat.ts` 的**同名函数**早已修过这个形态，本份没跟上
+（又一例「一文件两套同义判据」，两处改一处时**必须同时改另一处**）。
+
+⚠️ 修它时**只加腿、不减腿**：`error.code` / `error.type` / `error.message` /
+`error_code`+`error_msg` / 顶层 `message` 五条原有腿**必须全部保留** ——
+OpenAI 形态常把额度语义写在 `{"error":{"code":"insufficient_quota"}}` 里，
+少了 code 那条腿，该报文会从额度**掉回** `AUTH`/`INVALID_REQUEST`。
+（改的第一版真的把几条腿一起删了，是比原缺陷更糟的回退。）
+
+⚠️ **测 `errorDetail` 必须直接断言它的返回值**，**不要**绕道「分类结果」：
+`{"error":"insufficient balance"}` 这种报文，即使字符串腿失效、函数退回整段
+JSON，**整段 JSON 里也含该短语** ⇒ 额度判据照样命中 ⇒ 用例全绿。
+第一版就是这么写的，反向验证时才发现是**假守卫**（禁用该腿后 11 条全绿）。
+故 `errorDetail` 已**导出**（与 `isSseQueueErrorCode` 同款惯例）供单测直接锁定。
+
+测试：
+- `tests/unit/llm-adapter.spec.ts` 的两段（`IKJVCW`）：
+  「★ 额度错误的码不得被客户端替换」（8 条）+「★ errorDetail 的形态覆盖」（6 条）。
+
+⚠️ 已做**反向验证**（逐条实测变红，非推断）：
+- 额度码改回 `'QUOTA'` → **3 条**变红（三条产出路径各自独立锁死）；
+- `httpErrorCode` 恢复「401/403 短路在前」→ **1 条**变红（报出 `'AUTH'`）；
+- 额度判据放宽成裸 `insufficient` → **1 条**变红（反向守卫，报出 `QUOTA_EXCEEDED`）；
+- 禁用 `errorDetail` 的字符串腿 → **2 条**变红（报出裸 JSON 形态）；
+- 删掉 `errorDetail` 的 `error.code` 腿 → **1 条**变红。
+
+⚠️ **试过但失败的攻击角度**（记下以免后人重复）：
+「本仓库不再有地域封锁判据」是**结论而非疏漏** —— 详见下条。
+
+### ⚠️⚠️ **不要给 codearts 加「地域封锁」判据**（IKJVCW 的 B 部分，已被推翻）
+
+修复初版曾照 `cline-adapter` 的 `isClineRegionForbidden` 给 codearts 加了一套
+「非凭据拒绝」判据（`isNonCredentialDenial` + 4 个 marker），**已整体撤回**。
+撤回依据（四路独立取证，两轮审计交叉确认）：
+
+| 取证 | 结果 |
+|---|---|
+| 全量解压 `~/.dsh/sessions` 下 **141 个真实会话** | `not available in your region` / `country` / `region not supported` / `not subscribed to required model plan` / **`access forbidden`** 命中 **0 次** |
+| codearts **真实错误码词汇表**（同批会话抽取） | 全是 `APIG.0301`(验签失败) / `APIG.0602` / `APIG.0101` / `TM.00001041`(并发上限) / `InferHub.4005.200`(unsupported model) / `InferHub.002002009.404`(not registered) / `InferHub.4004.200` / `InferHub.4291.200` / `InferHub.ModelArts.81111.429` / `STS5.1806` —— **无一条地域/订阅类** |
+| 端点结构 | `CHAT_API_BASE` 与 `QUEUE_STATUS_BASE` 都硬编码 `snap-access.cn-north-4.myhuaweicloud.com`（中国区华为云），插件**没有任何 region 切换能力** ⇒ 「换出口 / 换区」这个出路在 codearts 上**不存在** |
+| 把真实词汇表逐条喂给新判据 | 命中 **0/12** —— 对生产流量零作用 |
+
+⚠️ **所有地域类 marker 的证据都来自 Cline**（`cline-adapter.ts` 的实测报文、
+`providers-cline.md` 坑 6、`implementation-notes.md`）。这是「移植既有实现」
+的典型误用：抄了别家的**判据表**而非本家的实测事实（`AGENTS.md` 的
+「先抄『类别→动作』表」那条纪律的同型错误）。
+
+⚠️ 照搬还有**直接坏处**（实测）：新表与 cline 表对同一报文**给出相反结论**
+—— `{"error":"access forbidden: x is not permitted"}` 在 cline 判「地域」、
+在新表判「不是非凭据」；反向也不一致（`not subscribed` 在新表判真、cline 判假），
+既非子集也非超集，是**第三套口径**。
+
+⚠️ 而且 `not subscribed to required model plan` 归「与凭据无关」是**错的**：
+本仓库自己的实测（`src/cline-rate-limit.ts` 注释、`providers-cline.md`）记它是
+`ENTITLEMENT_ERROR` ——「有余额（500000）但**没有订阅计划**」，是**账号级**属性
+⇒ 不同账号订阅状态可不同 ⇒ 正确处置是**换号**，而不是硬失败。
+（撤回前命中该 marker 时 `getAvailableAccount` 调用 **0 次**。）
+
+⚠️ 撤回还顺带消除两处**由它引入**的损害：非 JSON 403（CDN/网关 HTML 页）
+含 marker 时会把**整页 HTML（含 `<script>`）**原样送进失败行；以及
+「地域文案 + 额度文案」并存的报文被错分到权限分支而**失去换号机会**。
+
+**结论**：将来若真在 codearts 上抓到地域封锁报文，**按实测再加**；
+现在加是凭空的，且会长期维护一张无依据且与别家相反的表。
+
+### ⚠️⚠️ **错误码取 `AUTH` 会连 message 一起吞掉**（Issue IKLBSH，第二次复发）
+
+上面的 `failureMessage` 铁律在 opencode 上**又犯了一次**，且这次有**真实报文**：
+
+| | 取值 | 用户看到 |
+|---|---|---|
+| 修前 | `'AUTH'` | 「**API 密钥无效**」+ **报文与指路文案全丢** |
+| 修后 | `'PERMISSION_DENIED'` | 完整文案（「根因是 session id **形状**、换 key 或换出口都无效」）|
+
+**取证**（`scripts/scan-error-corpus.mjs` 扫 868 个真实会话的真实失败面）：
+两条 `turn/end` 失败事件的 `code` 就是 `AUTH`，message 逐字是
+```
+opencode: HTTP 403 — {"type":"error","error":{"type":"FreeTierError",
+            "message":"Error from provider (Console): OpenCode's free tier
+            can only be used from within OpenCode"}}
+```
+（会话 `session-d7c80d34`，2026-10-02）⇒ 该缺陷**在真实流量上发生过**。
+
+⚠️ **这不是孤例，是复发形态**：`buddy` 的 `11140`（2026-09-27）从 `AUTH`
+改成 `PERMISSION_DENIED` 时，`buddy-adapter.ts` 的注释里就已逐字记下同一条
+`failureMessage` 判据。**下次接新 provider 时，凡「文案本身就是出路」的错误
+（形状门禁 / 账号级拦截 / 需要用户做非登录动作的），码一律避开
+`AUTH` / `QUOTA` / `ACCOUNT_QUOTA` 三个。** 判据可复用
+`dead-model-store` 的 `IGNORED_CODES`（`AUTH` / `QUOTA_EXCEEDED` / `RATE_LIMIT` /
+`MISSING_CREDENTIAL` / `PERMISSION_DENIED`）—— 它是「与模型是否存在无关」
+的白名单，正好覆盖这类错误。
+
+⚠️ **`PERMISSION_DENIED` 不在 `DEFAULT_RETRYABLE_CODES` 里**（该集合是
+`EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`）⇒ 改成它
+**不会**引入「白退避 5 次」的回退 —— 这是选它而不选 `SERVER` 的理由。
+
+⚠️ **本条追认 A4（「非凭据 401/403 一律判 AUTH」）**：它与 `codearts` 的**地域
+marker 表**是两件事 ——
+
+| A4 的两半 | 取证结论 |
+|---|---|
+| 「非凭据 401/403 → `AUTH` → 客户端吞文案」的**机制** | ✅ **真实存在**，有真实报文（上表；opencode 已修）|
+| issue 建议的 `isNonCredentialDenial` + 地域 marker 表 | ❌ **无实测支撑**，见上一节，**维持撤回** |
+
+⚠️ **`buddy-adapter.ts` 的通用 403 出口仍会产出 `AUTH`**（`httpErrorCode` 的
+`401 || 403 → AUTH`）。该出口在**换号耗尽**且最后一次不是 11140 形态时可达
+⇒ 同样吞文案。**但我没有真实报文**（真实失败面里 `buddy`/`workbuddy` 的 403
+**全部**是 11140 形态）⇒ **只登记、不据推断改**（`AGENTS.md` 的既有纪律：
+没有实测报文就不改分类）。
+
+### ⚠️ **`errorDetail` 要认 `detail` 字段**（Issue IKLBSH A1）
+
+上游代理（如包装成 `acp-proxy failure` 的那类）把异常包成
+`{"error":"<摘要>","detail":"<真实原因>"}`：只读 `error` 会只剩**没有信息量的
+摘要**，真正的原因（连接超时 / 鉴权细节）全在 `detail` 里。
+
+⚠️ **本仓库有 6 份同义的 `errorDetail`**（`openai-compat` / `llm-adapter` /
+`buddy-adapter` / `lobsterai-adapter` / `trae-adapter` / `accio-adapter`）。
+6 份各写一条判据必然漂移，故该腿**只留一份实现**
+（`openai-compat.ts` 的 `detailFieldText`），其余 5 份 import 它。
+
+⚠️ **证据强度如实标注（两轮审计独立复核后修订）**：868 会话 / 190 条真实失败面
+里 `"detail"` **零命中**；全文命中逐条查证**全部**是 JSON Schema 的
+`description` 字段与源码讨论窗口。⇒ 定性是「**结构上可达、零实测**」，
+**不是**「真实存在」。我原本的旁证「harness 的 `providerErrorDetail` 也产出该
+字段」**被审计证伪** —— 它只在 `DeepSeekFilesError` 那条路上产出，与 HTTP 错误体
+不是同一数据面。**别把它写成「已实测」**。
+
+#### ⚠️⚠️ 展示出口与分类出口**必须分开**（真实净回归，两轮审计独立确证）
+
+「无条件加一条 detail 腿」会把**纯展示改进变成行为变更**：
+`httpErrorCode(status, body)` 拿 `errorDetail(body)` 的**产物**去跑
+`isQuotaExceededError` / `isContextWindowExceededError` 正则 ⇒
+
+| 报文 | 只算既有腿 | 加上 detail 腿 |
+|---|---|---|
+| `{"message":"bad request","detail":"out of credits"}` | `INVALID_REQUEST` | **`QUOTA_EXCEEDED`** |
+| `{"message":"bad request","detail":"prompt is too long for this model"}` | `INVALID_REQUEST` | **`CONTEXT_WINDOW_EXCEEDED`** |
+
+后者还会**触发 DSH 的上下文溢出压缩**、改变重试与换号行为。
+
+⇒ 修法：**两条出口** —— `errorDetail`（**展示**，含 detail）／
+`errorDetailForClassify`（**分类**，不含），两者**共用** `errorDetailImpl`
+（不各写一份，那是首条红线）。分类调用点**只有 `llm-adapter.ts` 的两处**：
+`httpErrorCode` 与 4xx 额度判据。
+
+⚠️ **该回归原本零守卫**：我加的 3 条 A1 用例只断言 `errorDetail` 的**返回值**，
+没有一条锁**分类结果** ⇒ 把分类输入换回含 detail 的产物时全量测试**一条都不红**
+（两轮审计各自实测确认）。⇒ 已补 2 条**行为级**分类守卫 + 1 条结构性扫描
+（`tests/unit/error-detail-wiring.spec.ts`）。
+
+⚠️ **第二处分类点比第一处更隐蔽**：`isSseQuotaExhaustedErrorCode(code, message)`
+的**第二参是原始 body**（既有行为），故文案腿「insufficient quota」**本就**
+看得到 detail ⇒ 用「额度措辞」的报文测它**测不出差别**。真正会被翻转的是
+**码值腿**（`4291`）：detail 里出现 `InferHub.4291.200` 时才翻转。
+（我第一版守卫在这里也漏了 —— 变异实测：换回展示出口后那条行为用例**仍绿**。）
+
+⚠️⚠️ **「接线了 6 处」≠「6 处都有守卫」**（对抗审计实测）：把 `detailFieldText`
+改成恒 `undefined` ⇒ 只红 3 条且**全在 `llm-adapter.spec.ts`**；`openai-compat`
+自己那份**零行为级守卫**（变异实测 0 条红）。⇒ 已补结构性扫描覆盖全部 6 处。
+
+⚠️ **为什么守卫用「计数 + 扫描」而非逐文件断言**：新增第 7 份 `errorDetail` 时
+新文件不在清单里 ⇒ **静默漏掉**。扫描 + 计数才能同时抓住「漏接一处」与
+「新增一份没接」。
 
 ## 模型黑名单（Jet Hub「显示列表」开关）
 
@@ -268,6 +570,242 @@ ctx.remote.$on('credentials/reference-updated', () => this.catalog.refresh())
 不广播、广播抛错仍算成功（替身必须真的实现 `ctx.emit`，否则生产代码的广播会以
 `ctx.emit is not a function` 被 try/catch 静默吞掉，用例形同虚设）。
 
+### ⚠️⚠️ 远端目录**落地时**也必须广播 —— 十个适配器原先 0 处广播（Issue IKJVTF）
+
+**真实缺陷**（用户报障，2026-10-07）：Jet Hub 模型设置页显示 **5 个**模型
+（含 2 个 `cline-pass/*`），**对话框模型选择器只剩 2 个**（两个 `cline-free/*`）
+—— 重启 DSH 后「模型消失」。
+
+**根因是两个独立缺陷**（master 上复核仍存在，见该 issue 的评论）：
+
+**① 远端目录落地后从不广播。** 两条链路读的**不是同一份数据**：
+
+| 入口 | 取数 |
+|---|---|
+| 设置页 | 插件 RPC `model.list` → 适配器 `listAllModels()`（**每次实时**） |
+| 对话框 | DSH `buildModelCatalog` → `ctx.llm.listModels()` → `remoteModels ?? fallbackCatalog()` |
+
+客户端在 `status === 'ready'` 时短路返回缓存，只在四个宿主事件上 `refresh()`。
+**首拉失败**（凭据解析不出 / 目录端点那次请求超时）→ 客户端把**兜底表**缓存成
+ready；此后远端目录真的落地也**没有任何事件**通知它重读 ⇒ 永久分叉。
+修复前十个适配器的 `ensureRemoteModels` 全是 **0 处广播**。
+
+⚠️ **窗口的准确边界**（对抗审计复核后订正）：四个事件里的
+`credentials/record-updated` / `credentials/reference-updated` **只由凭据
+「写入 / 重载」触发**（`dsh-credentials/lib/index.js` 的 `notifyRecordUpdated`
+仅被 `set` / `delete` / `reload` 三处调用）。**冷启动时凭据早已在磁盘上、
+没有写入动作** ⇒ 它们**不会**触发。所以「凭据未就绪」那半**也**在这个窗口内，
+不是只覆盖「凭据稍后就绪」。⇒ 本修复是必需的，不是锦上添花。
+
+⚠️ **但有一个它解决不了的边界**：客户端在 `ModelDirectory` **构造时**就
+`catalog.load()`，而广播是 `queueMicrotask` 派发的 ⇒ **冷启动首次打开对话框
+仍会先看到兜底表**，要等目录落地 + 广播之后（最长约 35s，即首个预热轮）
+才自愈。别向用户承诺「重启后立刻就对」。
+
+**② 残缺目录被永久缓存。** `hasClineRemoteModels` 只要**任一来源非空**就判
+「已拿到」。实测 `recommended-models` 成功、`/api/v1/models` 失败时
+（宿主日志 `[cline] 模型目录来源失败：models fetch failed`），这份残缺目录被
+`if (this.remoteModels !== undefined) return` **永久短路** ⇒ 只有 `/api/v1/models`
+才有的 466 条按量计费模型（含 `apodex/apodex-1.1-mini:free`）**再也拉不回来**，
+连预热重试都在短路处直接返回。
+
+⚠️⚠️ **这条有个极隐蔽的第二层**（对抗审计实测证伪，初版修复**完全没修好**）：
+`RemoteCatalogGate` 的冷却（`retryAt` / `cooling()`）在生产里**只有闸门自己
+那一处调用点**，而它排在适配器的短路**之后**。所以只把「`complete` 传对」
+是**没用的** —— 残缺目录**也**赋值了 `remoteModels`，短路照样命中，
+`cooling()` 永远读不到。**短路判据本身必须从「已定义」改成「已完整」**：
+
+```ts
+// ❌ 初版（= 没修）：残缺目录也赋值了 remoteModels ⇒ 永久短路
+if (this.remoteModels !== undefined) return
+// ✅ 现在：残缺时放行到闸门，由 30s 冷却控制重试节奏
+if (this.remoteComplete) return
+```
+
+⚠️ **反向验证**：把这一行改回 `remoteModels !== undefined` ⇒ **3 条**行为用例
+变红；把 `remoteComplete` 恒置 `true` ⇒ **3 条**变红。
+初版用例只断言 `gate.cooling() === true` 是**假绿**（守着生产读不到的字段）——
+现改为断言「清掉冷却后**真的重拉**并把 `apodex/*` 补回来」。
+
+⚠️ **`complete` 判据不能用 `warnings.length === 0` 反推**（第三条入口）：
+「**主动跳过**一个来源」与「**取到了**一个来源」在 warnings 上不可区分。两条实测：
+- **无凭据**时 `/api/v1/models` **不发请求**（`fetchClineRemoteModels` 直接
+  `return []`）⇒ 若不计 warning 就被判成完整。该路径**真实可达**：
+  `providerCatalogVisible` 只查「有没有已登录账号」、**不过滤 `enabled`**，
+  而 `getAvailableAccount` 过滤 ⇒「有账号但全部停用」时门控通过、凭据却 undefined。
+- **HTTP 200 + 形状异常**（网关降级返回 `{}` / HTML）：解析器静默返回空表、
+  零 warning ⇒ 判成完整并永久缓存。
+
+⇒ 现在由 `fetchClineRemoteModels` **显式**给出 `complete`（两个来源各自的
+「请求成功 + 形状可识别」），跳过与形状异常**都记 warning**。
+
+**修法（四条一起，缺任何一条都还会看到症状）**：
+
+1. **`src/catalog-broadcast.ts` 是「模型目录变更」这类广播的唯一实现**。
+   `jet-hub-rpc.ts` 原先自带的那份 `try { ctx.emit(...) } catch` 已改为同名导入
+   —— 两份实现必然漂移（本 issue 的缺陷① 就是「十处全漏」）。它同时做
+   **同 tick 按 ctx 合并**（`WeakSet` + `queueMicrotask`），因为一次目录落地
+   会牵动多个 provider。
+   ⚠️ 仍有**两处内联 `ctx.emit('llm/adapters-updated')` 未收口**（审计指出，
+   有意留待后续）：`index.ts` 的 opencode 能力预热、`jet-hub-rpc.ts` 的永久积分
+   锁定端点。后者用 `ctx.logger.warn`（**无两级可选链**，logger 缺席时会抛、
+   仅被 catch 吞），与 `catalog-broadcast.ts` 的 `ctx.logger?.warn?.` 不一致。
+   ⚠️ **合并标记必须在 `emit` 之后清**：`llm/adapters-updated` 的监听器会再次走
+   `buildModelCatalog` → `listModels` → 可能又触发目录落地；标记若提前清，
+   每次派发都翻一倍 ⇒ **广播风暴**。
+2. **通知放在 `RemoteCatalogGate`**（十个适配器的**单点收口**）的成功分支，
+   且必须在 `await task` **之后** —— 那时适配器才刚把目录赋给 `remoteModels`，
+   客户端重读才拿得到新数据（早于它广播等于白广播）。
+   适配器拿不到 `ctx`，故由各 `registerXxxLlm` 注入
+   `onCatalogLoaded: () => broadcastCatalogChanged(ctx)`。
+3. **`run` 返回值扩展为 `{ got, complete }`** —— 两个判据**不能合并**：
+
+   | 字段 | 语义 | 决定 |
+   |---|---|---|
+   | `got` | 拿到**非空**目录（**残缺也算**） | **显示** + **广播** |
+   | `complete` | **所有来源**都拿全了 | **永久缓存** + **清冷却** |
+
+   只看「非空」⇒ 残缺目录被永久缓存（缺陷②）；只看「完整」⇒ 残缺时整个目录
+   都不展示，用户的模型列表凭空消失。**向后兼容**：返回裸布尔时
+   `complete = got`，既有八个单来源适配器的返回值**一行都不用改**。
+   ⚠️ 别把这两处「为统一」改成同一个变量 —— 反向验证各自独立锁死。
+   ⚠️⚠️ **光传对 `complete` 是不够的** —— 短路判据必须同步改成
+   `if (this.remoteComplete) return`，否则冷却永远读不到（见缺陷② 的第二层）。
+4. **`complete` 由数据源显式给出，不由 `warnings` 反推**：`ClineRemoteModels.complete`
+   来自两个来源各自的「请求成功 + 形状可识别」；跳过（无凭据）与形状异常
+   （HTTP 200 + `{}` / HTML）**都记 warning**。
+
+**冷启动自愈**：`src/catalog-prewarm.ts` 做**有界**预热（立即起、此后每 35s 一轮，
+共三轮）。⚠️ **间隔必须大于闸门的 30s 失败冷却**，否则重试被**原样挡回**、
+什么也不做（症状是「静默无效」，没有报错，只是目录一直补不回来）。
+
+⚠️⚠️ **光有「间隔 > 冷却」还不够**（对抗审计实测证伪，初版按绝对时刻一次性排程）：
+闸门的 `retryAt` 是「**失败那一刻** + 30s」，而固定排程是「**启动那一刻** + 35s / 75s」——
+首拉耗时 `d ∈ (5s, 35s]` 时 35s 轮被挡回，`d ∈ (45s, 75s]` 时 75s 轮也被挡回
+（`d=60s` 实测 `retryAt=90s`，75s 轮时仍在冷却；cline 超时 20s、buddy/loomy/raccoon 60s
+都落在这两个区间）。⇒ 改为**链式**：`上一轮结束 + 间隔` 才排下一轮。
+⚠️ 反向验证：改回「一次性按绝对时刻排」⇒ **2 条**变红。
+
+该约束由 `tests/unit/catalog-prewarm.spec.ts` 的用例守着（`isPrewarmSpacingValid()`
+**目前只有单测调用**，接线层没断言 —— 别把它当成运行期闸门）。
+预热走 `ctx.llm.listModels`（对 `withDeadModelPruning` 包装透明；`aggregate`
+走它自己的 60s 目录 TTL 缓存，边际成本≈0），停止函数挂 `ctx.effect`；
+`setTimeout` 必须 `unref`（否则命令行 `dsh` 会被它挂住不退）。
+各 provider 的账号门控都在远端拉取**之前**，故未登录的 provider 是零请求。
+
+**测试**：`tests/unit/catalog-broadcast.spec.ts`（18 条：异步派发、同 tick 合并、
+**emit 期间的重入不形成风暴**、不同 ctx 独立、logger 缺席不抛错、`got`/`complete`
+逐格判据、残缺后冷却到期可重试、冷却中跳过不广播、`onLoaded` 抛错不反噬）+
+`tests/unit/catalog-prewarm.spec.ts`（23 条：立即轮不阻塞、逐 provider 预热、
+单点失败不影响其余、停止即停手、**链式排程**、间隔 > 冷却）+
+`tests/unit/cline-adapter.spec.ts` 的「残缺目录自愈」**真接线**用例
+（不注入 `loadModels`，走真实 `loadClineModels` + 真实 `fetchImpl`
+—— 注入式加载器可以省略 `remote`，从而掩盖完整性判据）。
+
+⚠️ **这些用例必须是行为断言，不能只断言 `cooling()`**：初版那条
+「残缺后仍会重试」断言的是 `gate.cooling() === true`，而该字段在生产路径上
+**读不到**（见缺陷② 第二层）⇒ **假绿**（把 `complete` 改成恒 `true`，它照样通过）。
+现在断言的是「清掉冷却后**真的重拉**、`apodex/*` 被补回来、之后转为完整不再重拉」。
+
+⚠️ **接线类的 `expect(source).toMatch(...)` 是源码文本断言，挡不住真实回退**
+（审计实测：把 buddy 的 `onCatalogLoaded` 注入整行注释掉 ⇒ 171 条全绿 0 红）。
+故另补了一条**真装配**行为用例（`registerBuddyLlm(ctx, …)` + `ctx.emit` 替身
++ 真实 `listModels`，断言目录落地后真的 emit 一次）—— 该变异现在会让**1 条变红**。
+
+⚠️ **已做反向验证**（每条独立，别当同义反复删掉）：
+
+| 变异 | 变红 |
+|---|---|
+| 短路改回 `remoteModels !== undefined` | **3 条** |
+| `remoteComplete` 恒置 `true` | **3 条** |
+| `fetchClineRemoteModels` 的 `complete` 恒 `true` | **3 条** |
+| 真正原形态（`warnings` 反推 + 删掉两条新 warning） | **2 条** |
+| 预热改回「一次性按绝对时刻排」 | **2 条** |
+| 闸门不广播 | **5 条** |
+| 冷却按 `got` 而非 `complete` | **3 条** |
+| 广播改同步 emit + 标记提前清 | **3 条** |
+
+**顺带清掉的死代码**：`cline-adapter.ts` 曾有两行重复的 `return true`
+（`git log -L` 显示由合并提交 `4ce4a6e` 引入，`0ca8256` 在其后加了
+`if (!gotRemote) return false` 使其成为不可达代码）。
+
+### ⚠️⚠️ buddy / codearts 的**多端点残缺**：同一形态的第三个入口（审计 I3）
+
+⚠️ 这一条是**同一缺陷在另两个 provider 上的复发**，且它们都是插件**主力**
+provider —— 只修 Cline 是不够的。两家的目录都来自**两个**独立端点，
+而「一个成功、另一个失败」是**常态**而非异常：
+
+| provider | 两个端点 | 只在一个端点里出现的东西 |
+|---|---|---|
+| **buddy / workbuddy** | `/console/enterprises/{scope}/models` + `/v3/config` | `hy4-preview-f`（**限时免费**变体，促销 `modelIds` 只写着它） |
+| **codearts** | `opengw gateway/config` + `snap-access /v1/model/builtin` | benefit 模型（`glm-5.3-flash` 等）与常规模型各占一半 |
+
+⚠️ 两处的失败路径都**静默**：`fetchSignedGet` 返回 `undefined`、
+`requestConfig` 返回空快照。于是单端点成功时 `models.length > 0`，
+而旧短路判据是 `remoteModels !== undefined` ⇒ **残缺目录永久固化**
+（冷却读不到，与 Cline 的缺陷② 逐格同构）。
+buddy 那格的用户可见症状正是 issue 里报过的原话
+**「hy4 preview 现在 ide 是免费我们还是 0.29」** —— 促销倍率只由
+`/v3/config` 下发，而它是失败的那一个。
+
+**修法（与 Cline 同一套语义，但数据源层要各自上报）**：
+
+- 数据源加**出参**（不改返回值形状，既有调用方与 10+ 条单测零改动）：
+  `fetchCodeArtsRemoteModels(cred, fetch, outcome?)` 上报
+  `{ gatewayOk, builtinOk }`；`buddy-oauth.fetchModels(cred, fetch, signal, product, outcome?)`
+  上报 `{ scopedOk, configOk }`。
+  ⚠️ **成功判据是「请求成功 + 形状可识别」，不是「解析出非空列表」**：
+  上游把某个来源的模型**全部下架**时，`result.models: []` 是**合法**状态，
+  把它当失败会让冷却永不清理。buddy 侧的 `requestConfig` 因此新增 `ok` 字段
+  —— **不能**靠「`promotions` 是否为空」反推（上游真的没有促销时它也是空的）。
+- 服务层用 `lastCatalogOutcome` 出参对象原地写入（`CodeArtsAuth` /
+  `BuddyAuth` 各一份，由 `index.ts` 构造时注入初值两个 `false`）。
+- 适配器短路判据改成 `if (this.remoteComplete) return`，完整性由接线层桥接的
+  `catalogComplete: () => …` 回调给出（与 `onCatalogLoaded` 同一模式）。
+  ⚠️ **回调缺席时退回「完整」**（`?? true`）—— 那是既有单测替身的形态，
+  把「判不出」当残缺会让 provider 反复重拉、架空冷却。
+
+⚠️ **反向验证**（逐条独立，别当同义反复删掉）：
+
+| 变异 | 变红 |
+|---|---|
+| codearts 短路改回 `remoteModels !== undefined` | **1 条** |
+| buddy 短路改回 `remoteModels !== undefined` | **1 条** |
+| codearts `remoteComplete` 恒 `true` | **1 条** |
+| buddy `remoteComplete` 恒 `true` | **1 条** |
+| codearts 形状判据放宽（形状不可识别也算取到） | **1 条** |
+| buddy `configOk` 恒 `true` | **2 条** |
+| codearts 无凭据早退时默认成 `true` | **1 条** |
+
+⚠️ 最后两条是**补漏**：初版用例只覆盖了适配器层，把数据源的
+`configOk` 恒置 `true` 时**全绿 0 红**（198 条）。补上
+`tests/unit/buddy-oauth.spec.ts` 的「各来源成败」7 条后才有 2 条变红。
+
+**测试**：`tests/unit/models.spec.ts`（新增 8 条：两来源各自的成败格、
+形状可识别但合法为空、形状不可识别、无 AK/SK 早退、不传 outcome 的兼容性）+
+`tests/unit/buddy-oauth.spec.ts`（新增 7 条，同构）+
+`tests/unit/llm-adapter.spec.ts` / `buddy-adapter.spec.ts` 各 3 条
+**行为**用例（残缺 → 展示但不永久缓存 → 清冷却后**真的重拉补齐** → 转为完整
+不再重拉；完整 → 清冷却；未注入回调 → 退回旧行为）。
+
+⚠️ buddy 那条的观测点必须选**只由远端下发**的字段（`creditsRate`）：
+`reconcileWithFallback` 是**白名单重建**，兜底表里的 id 残缺时**仍在**列表里，
+故「id 是否出现」判不出补齐；而 `hy4-preview-f` **不在**兜底表里，
+要靠 `agentReferenced: true` 这条例外才保留（真实形态：服务端声明可选）。
+
+### 其余六个 provider：确认**无需**处理
+
+lobsterai / loomy / minimax / raccoon / trae / zcode 都是**单来源**目录
+（`models.length === 0 → return false`），**没有「部分成功」形态**
+⇒ `complete` 恒等于 `got`，短路判据无需改动。
+⚠️ buddy 的 `reconcileWithFallback` 是**白名单重建**（本地合成），不是残缺 ——
+但它上游的 `fetchModels` **是**多端点，见上一节。
+
+**仍未处理**（与本 PR 正交，建议单独立项）：
+- issue 末尾那条「Node 原生 `fetch` 不读系统代理、目前只有 opencode 通道支持
+  per-account 代理」与本 PR 的两个根因**正交**，但它会**加剧**缺陷①
+  （代理不可达 ⇒ 首拉必失败），建议单独立项。
+
 ### ⚠️ 设置页目录必须走 `listAllModels`，不能复用 `listModels`
 
 **真实缺陷**（用户报障「打开的显示了倍率，关闭的就没有显示倍率」）：
@@ -288,6 +826,83 @@ ctx.remote.$on('credentials/reference-updated', () => this.catalog.refresh())
 ⚠️ **同名消歧必须基于未过滤的全量集合**（`displayNameFor(model, source)` 而非
 `listed`）：用过滤后的集合会让「关掉其中一个同名模型」改变另一个的变体标记，
 名字随开关跳变。
+
+### ⚠️⚠️ 判「某个 id 在不在目录里」时，**两个目录来源都必须取并集**（Issue IKJW33）
+
+**真实缺陷**（Gitee issue IKJW33，用户报障 2026-10-08）：对**已从远端目录消失**的
+模型 id 调 `on`/`off`，命令返回「✅ 成功 1」但**实际什么都没发生、且零警告**。
+用户实测两例：`cline/cline-free/deepseek-v4.1-flash` 与
+`cline/stealth/space-bunny-alpha` 在记录「上游 model not found」后从 cline 目录
+消失（490 → 489）。后果：① 脚本/AI 助手据「成功 1」误判开关已生效（**作者本人
+就据此误判过一次**）；② 黑名单里残留幽灵条目，GUI 看不见、关闭记录却还挂着。
+
+修法是照常写入 + 响应里补 `warnings[]`（**不改成 `ok:false`+`not-found`**：
+打开方向是幽灵条目的**唯一**清理路径，且目录可能读不出来）。但**判据本身**踩了
+两个方向相反的坑，**每个方向都被实测证伪过一次** —— 这是本节最该记住的：
+
+| 只用 | 症状 | 实测证据 |
+|---|---|---|
+| `listAllModels()` | **误报**：冷缓存下它返回**编译期兜底表**（`model-catalog.ts` 的 `cached ?? config.syncCatalog()`），而兜底表是**子集** | 探针实测 cline 冷缓存只有 **3** 条，远端有 **460** 条 ⇒ 远端任意正常模型都被判「不在目录」。而 issue 的复现路径**恰恰是冷缓存**（脚本直接调 `on`，从未先跑 `list`） |
+| `listModels()` | **反向误报**：`opencode` 的 `listAllModels()` **恒返回**编译期兜底表（永不读远端），而 `listModels()` 在**只有匿名槽**时还会 `filter(isFree)` | 审计端到端实测：无付费账号时关闭 13 个**设置页可见**的模型，**13/13 全部收到假警告**（「该模型可能已被上游下架」，而它并没下架，只是当前身份看不到） |
+
+⇒ **取并集**：`llm.listModels()` ∪ `modelAdapters[provider].listAllModels()` ∪
+黑名单里 `true` 的 id。方向刻意是「**宁漏勿误**」：`known` 越大 ⇒ 误报越少。
+提示类信息的**误报比漏报糟得多**（用户会对整类提示脱敏），故宁可漏报。
+
+四条**不能省**的实现约束：
+
+1. ⚠️ **`listModels()` 读失败（超时/抛错/空目录）必须整体放弃核对**，**不得**
+   退化成「只用 `listAllModels()` 兜底表」—— 那会退回上表第一行的误报形态。
+   代价是「首次拉取就失败」时**漏报**（issue 的原始场景最可能命中），
+   **这是刻意的取舍，别当漏写删掉**。空目录另有一层理由：
+   `createModelCatalog` 在「无已登录账号」时返回 `[]`（门控隐藏整个 provider），
+   空目录意味着「看不到」而非「全部下架」。
+2. ⚠️ **黑名单必须在 `await` 之后读**（放在核对函数内部，不由调用方传快照）：
+   提前取快照会让「快照」与「实际写入」之间隔着一次 `listModels`（最长 2 秒），
+   期间另一路 RPC 的写入使快照失真 ⇒ 实测「**实际产生了变更却报『本次没有产生
+   任何变更』**」（与 issue 要消除的误导同型）。放在 await 之后，从读黑名单到
+   写入全是**同步代码、无 await** ⇒ 窗口归零。
+3. ⚠️ **必须带超时**（`CATALOG_READ_TIMEOUT_MS = 2000`）：`listModels()` 冷缓存下
+   会真的发远端拉取 ⇒ 「写开关」这个原本纯本地的操作多了一条网络依赖。
+   开关**绝不能**被远端拖住。GUI 路径缓存通常已热（先看到列表才会去点开关），
+   是纯内存读；只有脚本冷启动直调开关才可能等一次拉取。
+4. ⚠️ **`listAllModels()` 抛错要吞掉**（单独 try/catch）：开关是主操作，
+   核对只是提示层，失败只少一半来源、不能让开关失败。
+
+⚠️ **「有效清理」静默这条语义只由一处承担**（并回黑名单里的 id）——
+`catalogWarnings` **不再判一次 `before[id]`**：那会是**同义的两套判据**
+（本仓库踩过「一文件两套同义判据必然先腐坏一套」），且内层在生产路径上**不可达**
+（实测：把 `before` 换成「操作后」快照，**没有任何用例变红**）。
+
+⚠️ **`dead` 表里的 id 算「不在目录」，但文案必须可操作**：失效模型被
+`withDeadModelPruning` 从**两个来源**同时剔除，而 `model.list` 又把它们补回
+设置页（`dead:true`）供用户点「重新显示」⇒ 它们天然落在「目录外」。
+issue 的两例正是这个形态 —— 只说「不在目录」不够，必须给出
+「可在模型列表里点『重新显示』恢复」这条指引。
+
+⚠️⚠️ **本节的测试曾整片恒真，是本 issue 最隐蔽的一处缺陷**（审计内存变异实测）：
+`model-groups.spec.ts` 里对客户端渲染的断言写成独立的
+`toMatch(/'data-tone': 'warn'/)` + `toMatch(/role: 'status'/)`，而这两个字面量在
+**全文件**分别出现 **5 次**与 **2 次**（别的面板也有）⇒ 断言被别处满足。
+实测四个变异**全部仍绿**：删掉整个渲染块 / 改成 `'warning'`+`role:'alert'`
+（**正是注释自称防住的那个坑**）/ 删掉 `data-tone` / GUI 完全不展示。
+⇒ 源码级断言必须**锚定到片段**再断言相邻关系：
+
+```js
+const start = client.indexOf('toggleWarnings.length > 0')
+const block = client.slice(start, client.indexOf(': null,', start))
+expect(block).toMatch(/'data-tone': 'warn',\s*\r?\n\s*role: 'status'/)
+```
+
+⚠️ 同理，「两个入口都接了」这类**并列断言**要用**计数**（`match(...).length === 2`），
+`toMatch` 只要求任意一处命中 ⇒ 只接一个入口时照样绿（审计变异 E2 实测）。
+
+回归用例：`tests/unit/jet-hub-rpc.spec.ts` 的「目录外 id 的开关必须给出 warnings
+（Issue IKJW33）」段 + `tests/unit/model-groups.spec.ts` 的三条渲染/接线断言。
+⚠️ **条数以 `pnpm test` 输出为准**（本节刻意不写数字：接一个 provider 就会失效）。
+⚠️ 已做**反向验证**（10+ 条变异各自独立锁死）：去掉并集、失败时退化用兜底表、
+不吞 `listAllModels` 异常、黑名单改在 await 之前读、去掉超时、去掉 dead 指引、
+两个方向文案对调、客户端不渲染/不消费、`tone` 写错 —— **每条都有对应用例变红**。
 
 ## 目录门控：没有已登录账号就隐藏整个 provider
 
@@ -624,6 +1239,185 @@ fallback**（宁可取不到值时背景异常、能一眼看出，也不要一�
 绝不能「关不掉模型就只停账号」—— 那会让供应商显示成已关闭而模型其实还在，
 用户按「已关闭」的预期却仍能选到它。前端把这种情形表现为**开关禁用**并给出原因
 （`providerSwitchState` 的 `reason`），而不是让用户点下去只得到一句错误提示。
+
+#### ⚠️⚠️ 但「拿到目录」必须取**两个来源的并集**（真实缺陷，2026-10-11）
+
+上面那条约定立了很久，却**有一个入口绕过了它**：`fullCatalogIds` 原先是
+「**优先** `modelAdapters[provider].listAllModels()`，只要它存在就短路、
+**根本不读 `llm.listModels()`**」。
+
+而 `listAllModels()` 在**冷缓存**下返回各家**编译期兜底表**
+（`model-catalog.ts` 的 `cached ?? config.syncCatalog()`）—— 它是**子集**：
+实测 `cline` 冷缓存只有 **3** 条，远端有 **460** 条。
+
+⇒ 两个关闭方向都只写兜底表那几条进黑名单，**其余几百条仍可选**，而端点返回「成功」：
+
+| 端点 | 后果 |
+|---|---|
+| `model.setAllDisabled` | 用户以为整个供应商已关闭，对话框里那几百条**仍能选中** |
+| `provider.setEnabled` | **更重**：`provider.status` 的 `closed` 判据是 `total > 0 && disabled === total`，而 `total` **也**取自 `listAllModels()` ⇒ 界面**显示已关闭**、模型却仍可选（正是上一节列为必须避免的形态的镜像） |
+
+⚠️ 用户报障路径**恰恰是冷缓存**：脚本/设置页首次打开就点「关闭全部」。
+⚠️ 而上一节那句「读失败时不落盘」的守卫**拦不住它** —— 冷缓存兜底表返回子集时
+它**不算失败**。这正是「判据写得对，但判据的**输入**是错的」这类缺陷的典型：
+守卫本身没问题，问题在它拿到的目录不完整。
+
+**修法**：`fullCatalogIds` 取 `适配器目录 ∪ 远端目录`，并把「目录是否可用」
+如实回报给调用方（`FullCatalogResult.complete`）。三个调用点按**各自的完整度要求**
+分流（这是它不能再返回单一 `{ ids } | { error }` 的原因）：
+
+| 调用点 | 需求 | 目录不可用时 |
+|---|---|---|
+| `model.setAllDisabled` | **有新增项时必须完整**（要写黑名单） | **拒绝且不落盘**；⚠️ 并集**已全在**黑名单时**幂等成功**（见下） |
+| `provider.setEnabled` | **远端读成功即可** | 判 `remoteError`：读失败**拒绝**；读到但为空**照常关闭** |
+| `account.test` | **尽力而为**（只要一个 id 就能测） | 用拿到的那些照常测 |
+
+⚠️⚠️ **两个关闭端点刻意不同判据**（2026-08 修订，原先两行合并为「必须完整」）：
+`provider.setEnabled` 是**供应商级**开关，「远端读到但为空」（无账号门控）时并集只剩
+适配器兜底表，而该供应商本来就没有账号 ⇒ 模型选择器里一条都选不到，用兜底表写黑名单
+**不会**造成「显示已关闭而模型仍可选」；若按 `complete` 拒绝，**无账号的供应商将永远
+无法关闭**（远端目录按已登录账号门控，不登录永远读到 `[]`）。
+`model.setAllDisabled` 是模型级批量操作，语义上要求目录完整，维持原判据。
+两者共用 `fullCatalogIds`（目录来源只此一处），差异只在失败时的动作。
+
+⚠️⚠️ **「远端读到但为空」有第二个成因，且与「无账号」完全同形**（2026-08 实测）：
+**黑名单已覆盖全部模型**时 `createModelCatalog.listModels` 的
+`listed = all.filter(entry => !disabled.has(entry.id))` 也会返回 `[]` ⇒
+`remoteIds.length === 0` 且无 `remoteError`，与「无账号门控」**逐字段同形**。
+⇒ 目录侧**无法**区分二者，判据只能建在**结果**上（黑名单是否已覆盖并集）。
+漏了这条的后果（真实缺陷）：用户在**已经全关**的状态下再点一次「关闭全部」，
+会得到「该供应商没有可关闭的模型」——而它明明有 N 个、只是都已关；
+⚠️ 前端联动路径（停用最后一个账号时问「是否同时关闭全部模型」）会命中它，
+用户看到误导告警「账号已停用，但关闭模型失败：该供应商没有可关闭的模型」。
+⇒ `model.setAllDisabled` 的关闭方向因此是**四段**（顺序即语义，别重排）：
+① `remoteError` 有值 ⇒ 拒绝；② 并集为空 ⇒ 拒绝；③ **并集已全在黑名单 ⇒ 幂等成功**
+（什么都不写，故不需要完整目录也能安全作答）；④ 有新增项但 `!complete` ⇒ 拒绝。
+
+⚠️ **`complete` 不是「凡 false 即拒绝」的开关**（2026-08 修订）：它只回答
+「远端那一半是否可用」，**不回答**「本次有没有东西要写」。调用方必须自己判
+「有没有新增项」——两者混同就是上面那个「已全关却报错」的缺陷。
+⚠️ 判据仍是 `complete` 而**不是**「`ids` 是否为空」：冷缓存下兜底表会让并集看起来
+非空，而它只是**子集**，据此写黑名单正是本 issue 的原始缺陷。
+
+⚠️⚠️ **「目录不可用」有两种形态，必须都判**（我第一版只判了前者，漏了后者）：
+
+1. **远端读失败**（超时 / 抛错 / 无 llm 服务）—— 有 `remoteError`；
+2. **远端读到但为空** —— `createModelCatalog` 在「无已登录账号」时门控返回 `[]`，
+   含义是「**看不到**」而**不是**「该 provider 一个模型都没有」。
+   ⚠️ 此时适配器兜底表**仍可能有内容**，照它写黑名单就是**同一个缺陷的另一个入口**
+   （实测：远端 `[]` + 兜底表 1 条 ⇒ 「关闭全部」只关那 1 条并返回成功）。
+   这一种**没有** `remoteError`（它不是错误）。
+
+⇒ 判据收敛为 `complete: boolean`（= 远端读到且非空），**别让调用方各自拼**
+「`remoteIds === undefined` 或 `remoteIds.length === 0`」—— 那正是本仓库踩过的
+「一文件两套同义判据必然先腐坏一套」。`remoteIds` 字段已因此**删除**
+（保留它就是留下第二套同义判据，审计独立指出过这一点）。
+
+⚠️ **`account.test` 的「尽力而为」是刻意的、不可改成拒绝**：它只要**一个** id 就能测，
+而「适配器有目录 + llm 临时故障（令牌过期）」是真实且常见的组合。
+若那里也拒绝，该端点会从**能测**退化成
+`bad-request: 无法确定要测试的模型：读取模型列表失败：令牌已过期` ——
+而它自己的注释明确把这类退化列为「**自造的失败**」（实测确认过这个收缩）。
+
+⚠️ **两种不可用的文案必须分开**（它们对用户意义不同）：
+`account.test` 的「没账号」（`… 没有可测试的模型`）vs「读不到」
+（`无法确定要测试的模型：读取模型列表失败：…`）；
+`provider.setEnabled` 同理（`该供应商没有可关闭的模型，未做任何变更` vs 带 `remoteError`）。
+
+⚠️⚠️ **两个关闭端点的文案必须逐字同构**（审计报的「缺口 4」）：`model.setAllDisabled`
+原先用 `remoteError ?? '当前读不到完整的模型目录，未做任何变更'` 一刀切，
+于是**同一个 `complete === false` 在两个端点给出不同可读性** ——
+「远端读到但为空」（没账号）在它这里落到通用文案、在 `provider.setEnabled` 却走分流。
+现统一为同一个三元表达式。
+
+⚠️ **断言只 `toContain('没有可关闭的模型')` 是恒真的**（审计实测）：
+文案退化成 `没有可关闭的模型：undefined`（把 `remoteError` 的 `undefined` 拼进模板）
+**也含该子串** ⇒ 变异无法察觉。必须补
+`expect(message).not.toContain('undefined')`。
+⚠️ 同型缺口还有 `account.test`：把判据从 `remoteError !== undefined` 改成
+`!catalog.complete`，生产 spec **全绿**而行为已分叉成 `无法确定要测试的模型：undefined`
+—— 「远端读到但为空」这条组合**零守卫**（既有用例只覆盖 `withoutLlm` 与
+`listModelsError`，两者**都带** `remoteError`）。已补用例。
+
+⚠️ **「`ids` 可能为空」的分支在 `provider.setEnabled` 里现在是必需的，不再是死代码**
+（2026-08 修订 —— 本节原先写「删掉它、实测加回全绿」，那条结论**只对旧的
+`!complete` 判据成立**，判据换成 `remoteError` 后它变成唯一的「真没东西可关」落点）：
+
+- 旧判据 `!catalog.complete` ⟺ 「远端读失败 **或** 远端空」，而后者已改判为「照常关闭」
+  ⇒ 若没有 `ids.length === 0` 分支，「并集也为空」（适配器缺失 + 远端空）会**静默成功**
+  并写一次空黑名单（`setModelsDisabled` 对空列表直接返回，故也不落盘 —— 但端点会
+  报 `ok:true`、`models: 0`，用户以为关掉了）。
+- ⚠️ 它与 `!complete` 分支**不再同义**：两者的判断对象不同（一个看并集、一个看远端），
+  在「远端空 + 适配器有目录」这一格上**动作相反**（照常关闭 vs 拒绝）——
+  那正是供应商级与模型级**刻意分道**的地方。
+- `model.setAllDisabled` 侧的对应落点同理（见其四段判据的第 ② 段）。
+
+⚠️ 反向断言仍必须保留：`expect(message).not.toContain('undefined')` ——
+删掉它会让文案退化成 `没有可关闭的模型：undefined` 仍通过 `toContain` 断言。
+
+⚠️ **新增代价**：`fullCatalogIds` 现在**总是**读一次远端（旧实现在适配器存在时根本不读）。
+已用 `CATALOG_READ_TIMEOUT_MS`（2 秒）封住，超时即按「远端读失败」处理 ⇒
+两个关闭方向**拒绝**、`account.test` 照常测。GUI 路径缓存通常已热（纯内存读）。
+
+#### ⚠️⚠️ 读取侧：`provider.status` 的 `closed` 也必须核实（同一根因的残留）
+
+写入侧修好后**读取侧还没修**（独立审计发现）：`provider.status` 的
+`closed = total > 0 && disabled === total` 仍**只基于 `listAllModels()`**（子集）
+⇒ 冷缓存 + 旧版本写下的**不完整**黑名单会**误报已关闭**：
+
+```
+兜底表 [hy3]（冷缓存）+ 黑名单 { hy3: true }（旧版本「关闭全部」的产物）
+⇒ total=1, disabled=1 ⇒ closed:true
+而远端还有 glm-5.2 / deepseek-v4-flash 可选 ⇒ 界面显示「已关闭」却仍能选
+```
+
+⇒ **只在子集判据说「已关闭」时才核实**（用 `fullCatalogIds` 取并集重算）。
+理由：`closed` 的**危险方向只有 `true` 这一个**（报 false 是安全的 ——
+用户可点开关，点了会得到明确错误）。故常见路径（未关闭）**零网络**，
+只有「真的可能已关闭」才付一次读取。
+
+⚠️⚠️ **核实的判据是「远端读成功」，不是 `complete`**：`complete` 额外要求远端
+**非空**，而这里恰好有一个**正常**的空形态 —— 「全部模型都已关闭」时
+`listModels()` 被黑名单**过滤成 `[]`**（那正是本端点要回答的那个状态！）。
+用 `complete` 会让「一关全就永远显示未关闭」（本修复第一版踩过，两条既有用例当场变红）。
+⚠️ 核实不了（远端读失败）时**保守报未关闭**（安全方向）。
+
+⚠️ **代价与边界**：多个「已关闭」的供应商会串行各读一次目录（每次上限 2 秒）；
+⚠️ 「远端读到但为空」（无账号门控）与「全部已关闭」在远端**同形**，
+此时并集只剩兜底表 —— 若兜底表全命中仍报已关闭（用户确实没有可选模型），可接受。
+⚠️ 存量**已修复**（不再误报），但**不回溯**：升级前写下的不完整黑名单本身仍在
+配置里（用户点一次「关闭全部」或「打开全部」即可重写为完整集合）。
+
+回归用例：`tests/unit/jet-hub-rpc.spec.ts` 的
+「disabled:true 取两个目录来源的并集（冷缓存兜底子集不得当权威）」、
+「关闭供应商：冷缓存兜底子集不得当权威」、「远端读到但为空（无账号门控）→ 同样拒绝且不落盘」、
+「⚠️ 远端读失败时拒绝且不落盘」、「⚠️ 适配器有目录 + 远端读失败 → 仍用适配器目录照常测」、
+「⚠️ 兜底子集判据说「已关闭」时必须核实」、「⚠️ 真的全关时仍报已关闭」、
+「⚠️ 核实不了（远端读失败）时保守报未关闭」、「未关闭时不核实目录（子集判据为 false 即返回，零网络）」等。
+⚠️ **条数以 `pnpm test` 输出为准**（本节刻意不写数字）。
+⚠️ 已做**反向验证**（每条变异都有对应用例变红）：退回短路、去掉适配器半边、不回报
+`remoteError`、改判 `ids` 是否为空（两个端点各一）、`account.test` 改拒绝、
+不判远端为空、不吞适配器异常、`account.test` 判据改成 `!complete`、
+文案恒用带原因那句、`provider.status` 退回不核实、核实用 `complete`、
+核实失败不保守、未关闭时也核实。
+⚠️⚠️ **2026-08 修订两条已失效的旧结论**（判据换过之后它们不再成立，别再照抄）：
+1. 原先记「加回 `ids.length === 0` 分支**全绿 ⇒ 确认是死代码**」—— 那是**旧判据
+   `!complete` 下**的结论；判据改成 `remoteError` 后该分支是唯一的「真没东西可关」
+   落点，**必须有**（见上文）；
+2. 原先记「`provider.setEnabled` 按 `complete` 与 `model.setAllDisabled` 同判据」——
+   现已**刻意分道**（供应商级判 `remoteError`），见上文的两端点对照表。
+
+⚠️ **2026-08 新增的三条变异验证**（本次修复引入，各自独立锁死）：
+- 去掉 `model.setAllDisabled` 的**幂等短路**（`pending.length === 0`）⇒
+  「已全部关闭时再点关闭全部」用例**变红**（报「没有可关闭的模型」）；
+- 把幂等条件放宽成 `catalog.ids.length === 0 || !catalog.complete` ⇒
+  **2 条**变红（「远端读到但为空 → 仍拒绝」+「只有部分已关 → 仍拒绝」）——
+  证明幂等短路**没有**掩盖「拿兜底子集当权威」那个真缺口；
+- 把 `provider.setEnabled` 的 `modelCount` 从 `pending.length` 改回
+  `catalog.ids.length` ⇒「models 报实际变更数」用例**变红**（报 3 而非 1）。
+  ⚠️ 该用例的 fixture 必须让**适配器目录给出全部 id**（那 2 条「早就关着」的只能
+  来自它，因为 `listModels` 会把黑名单命中的过滤掉）；只给子集则两种计数相等，
+  用例**无法区分** —— 初版就是这么写的，变异实测**全绿**（假守卫），已修正。
 
 ### ⚠️ 开关**不在**左侧行尾（2026-10-01 用户要求搬到页头弹窗）
 
@@ -1024,7 +1818,7 @@ JS，里面的 JSDoc 写反引号没问题 —— 但**从它们复制片段进 
 
 ⚠️ 实测数值（无头浏览器，比较 `getBoundingClientRect` 的渲染宽度与自然宽度 ——
 不能用 clientWidth / scrollWidth，两者会四舍五入）：带角标后 193.56px → **202.19px**，
-名字与读数都不出省略号，仍在 216px 上限内。
+名字与读数都不出省略号，仍在 216px 上限内。
 
 ## ⚠️⚠️ 一键签到的汇总**必须按单位分列**，不得跨单位求和（2026-10-04 真实报障）
 
@@ -1230,7 +2024,7 @@ CRLF=725 / LoneLF=0），而脚本里的锚点是用 `\n` 写的。不做归一�
 ⚠️ **教训的普遍性**：这是本仓库第二次栽在「**跨量纲求和**」上（第一次是胶囊把
 `credit`/`credits` 拆成两组，见上一节）。凡是把**带单位的量**累加成**裸数字**，
 单位就一定会在那一层丢掉；正确做法是让单位**跟着数字一起走**（分桶 / 分组），
-把「怎么显示」推迟到最后一层。
+把「怎么显示」推迟到最后一层。
 
 ## 账号池与多账号
 
@@ -1256,8 +2050,9 @@ buddy: no usable credential; log in from the Jet Hub panel first
 
 **链路**（四个环节都正确，合起来却报出假原因）：
 
-1. 唯一的启用账号带该模型的未过期限流标记 → `pickBuddyCredential`
-   （`src/index.ts`）的候选筛成**空集**；
+1. 唯一的启用账号带该模型的未过期限流标记 → 候选筛（原
+   `src/index.ts` 里 buddy 系那段编排闭包，符号名已随 Task 6 删除
+   —— 见 git 历史 `d35d9e3`）筛成**空集**；
 2. `select()`（`src/buddy-balance-selector.ts`）对空候选只能回一个笼统的
    `{kind:'exhausted'}`，**未锁定时 `reason` 被丢弃**；
 3. 调用方退到**单凭据 ref** `BUDDY_ACCESS_TOKEN` —— 而 Jet Hub 登录只写
@@ -1458,7 +2253,7 @@ QUOTA_EXCEEDED
 
 ⚠️ 本缺陷与 Cline 那条（下面「429 有**三种**语义」）、qoder `10605`/`110`、
 zcode `3009`/`1005` 是**同一个病根**：**用状态码的默认归类代替了对业务语义的判断**。
-接新的 429/限流分支时，先把「这个码的正确动作是什么」问清楚再写。
+接新的 429/限流分支时，先把「这个码的正确动作是什么」问清楚再写。
 
 ## 模型黑名单（Jet Hub「显示列表」开关）
 
@@ -1537,7 +2332,7 @@ ctx.remote.$on('credentials/reference-updated', () => this.catalog.refresh())
 
 ⚠️ **同名消歧必须基于未过滤的全量集合**（`displayNameFor(model, source)` 而非
 `listed`）：用过滤后的集合会让「关掉其中一个同名模型」改变另一个的变体标记，
-名字随开关跳变。
+名字随开关跳变。
 
 ## 目录门控：没有已登录账号就隐藏整个 provider
 
@@ -1601,7 +2396,7 @@ ref（`CODEARTS_ACCESS_TOKEN`），该模式**已移除**，`extraCredentialRefs
   否则用户关掉模型后连开关都看不到，更无法重新打开（这是此前修过的真实缺陷）。
 - 六个适配器的 `listModels` 都要加（`llm-adapter` / `buddy` / `lobsterai` /
   `qoder` / `trae`）。`buddy` 与 `workbuddy` 共用同一个适配器类，但
-  `this.product.id` 不同 → 两者按各自 provider 独立判定，互不影响。
+  `this.product.id` 不同 → 两者按各自 provider 独立判定，互不影响。
 
 ## ⚠️ 停用账号时可选「同时停用该 provider 的模型」
 
@@ -1661,7 +2456,7 @@ ref（`CODEARTS_ACCESS_TOKEN`），该模式**已移除**，`extraCredentialRefs
 回归用例：`tests/unit/model-filter.spec.ts`（27 条）、
 `tests/unit/account-model-link.spec.ts`（18 条）、
 `tests/unit/jet-hub-rpc.spec.ts` 的 `model.setDisabledBulk` 段（14 条）、
-`tests/unit/account-pool.spec.ts` 的 `setModelsDisabledState` 段（8 条）。
+`tests/unit/account-pool.spec.ts` 的 `setModelsDisabledState` 段（8 条）。
 
 ## ⚠️ 模型行布局：长 id 会把开关挤出可视区（真实缺陷）
 
@@ -1724,7 +2519,7 @@ body 横向滚动 = 否
 
 该文件整体是 **JS 模板字符串**（`const STYLES = \`...\``），注释里的反引号会
 **提前终止字符串**、导致 esbuild 报 `Expected ";" but found "..."`。
-本次就因此构建失败过一次 —— 说明 CSS 属性时一律不加反引号。
+本次就因此构建失败过一次 —— 说明 CSS 属性时一律不加反引号。
 
 ## 模型面板的搜索与筛选（**不含多选、不含渲染上限**）
 
@@ -1829,3 +2624,434 @@ fallback**（宁可取不到值时背景异常、能一眼看出，也不要一�
 - 回归断言问题 1 的布局（开关被挤出 **0 / 8 行**）。
 
 ⚠️ 单测抓不到布局与 CSS 变量解析，故用源码级断言 + 该脚本双重锁住。
+
+## ⚠️⚠️ 注入的 `<style>` **必须署名** `data-plugin`，否则会被别的插件认领后连带删除（Issue IKK764）
+
+**用户报障**：Jet Hub 面板的整套 `.dim-jh-*` 样式，在**安装 / 更新 / 禁用任意一个别的插件之后**
+立刻退化成浏览器默认样式（标题没层级、按钮变原生控件、卡片配色圆角全丢）；
+**F5 刷新（或重启 DSH）后恢复**，但下一次再装/改插件又复发 —— 用户侧看起来就像「这个插件坏了」。
+
+### 根因：不是 CSS 写错，是注入的 `<style>` **没有署名**
+
+宿主 `@deepseek-ai/dsh-client-modules`（`lib/client.js`）对样式标签有**归属机制**：
+
+| 函数 | 判据 | 位置 |
+|---|---|---|
+| `claimStyles(id)` | 对 `querySelectorAll('style:not([data-plugin])')` 的**每一条** `setAttribute('data-plugin', id)` | `client.js:492-498` |
+| `removeOwnedStyles(id)` | 删除 `style[data-plugin="<id>"]` | `client.js:194-197` |
+| `materialize` 调用点 | factory 执行**之后** `claimStyles(ownerId)` | `client.js:684` |
+
+即：**任何无主的 `<style>` 都会被认领给「当前正在物化的那个插件」**。
+而 `installJetHubStyles()` 是在 `ctx.effect(...)`（插件 apply 阶段）里注入的，
+**必然晚于自己那次 `claimStyles`** ⇒ 旧实现（无署名）下这条标签**始终无主**。
+
+之后任何一个插件物化都会把它认领走；等那个插件热重载 / 被 prune / 被禁用 / factory 抛错，
+宿主就把「它名下」的样式**连根删掉**：
+
+| `removeOwnedStyles` 的触发路径 | 行 |
+|---|---|
+| `updateManifest`（该行 revision 变化） | `client.js:796` |
+| `prune`（该行不再被引用） | `client.js:821` |
+| 条目被替换 `replace` | `client.js:367` |
+| factory 抛错 | `client.js:690` |
+
+宿主 README 把它写作设计：*graph updates discard stale unowned factories, their styles*。
+而「安装/修改插件」本身就是一次 graph update ⇒ **每次都必然踩到**。
+
+⚠️ **让问题无法自愈的是模块级 `injected` 布尔**：标签被外部删除后，即使 apply 再跑
+也直接 `return`，永远不再补注 —— 这就是「只有整页刷新才恢复」的成因。
+
+⚠️ **影响是全局的**：`lib/client/jet-hub.js` 整包**只有这一处**
+`document.createElement('style')`（源码 1 处、产物 1 处，已用 grep 精确计数），
+该标签承载全部 `.dim-jh-*` 规则 ⇒ 掉的是**整套 UI**，不是局部。
+
+### 修法：署名 + 幂等改 DOM 存在性判断
+
+`plugin-src/client/jet-hub-styles.js`（DSH 自家构建预设产出的插件就是这个形状，
+本机实测 `dshmarket` / `dsh-rewind-plugin` 都写了 `tag.dataset.plugin`）：
+
+```js
+const PLUGIN_ID = 'dsh-providers-hub'          // = build.mjs 的 loaderId（必须等于包名）
+const STYLE_TAG_ID = PLUGIN_ID + '/jet-hub.css'
+const STYLE_SELECTOR = 'style[data-plugin-css=' + JSON.stringify(STYLE_TAG_ID) + ']'
+
+export function installJetHubStyles() {
+  if (document.querySelector(STYLE_SELECTOR) !== null) return () => {}   // DOM 存在性，不是模块级布尔
+  const style = document.createElement('style')
+  style.dataset.plugin = PLUGIN_ID        // ← 关键：署名
+  style.dataset.pluginCss = STYLE_TAG_ID
+  style.textContent = STYLES
+  document.head.appendChild(style)
+  return () => { document.querySelector(STYLE_SELECTOR)?.remove() }
+}
+```
+
+⚠️⚠️ **`PLUGIN_ID` 必须等于包名**（同一条腿的另一个入口，见
+[issue IKLUME](#⚠️⚠️-包名--插件身份四处载体必须逐字相同issue-iklume)）：宿主用的
+`ownerId` 是 `stripClientSuffix(registration.id)`，而 `registration.id` 就是构建脚本
+注入的 loader id（本插件产物顶部 `window.__ModuleLoader__.load({ id: "dsh-providers-hub", ... })`）。
+
+⚠️ **代价要说准，不要夸大**（2026-10 审计修正）：署名错了**不会**让 IKK764 原样复发 ——
+本插件自己闭包里的 disposer 照样会删掉自己那张表。真实代价只有两条，且都**静默**：
+
+1. 宿主侧样式 inventory 里**没有它**（`claimStyles(ownerId)` 认不走 ⇒ `data-plugin-css`
+   这条腿在宿主那里等于不存在）；
+2. 宿主的两道安全网对它失效（别的插件的 `claimStyles` 认领不走它、宿主的 `prune`
+   也回收不掉它）—— 失效方向是「少了一层保护」，不是「多了一次误删」。
+
+⚠️ **本文件不得再出现模板字符串**：整份文件只允许 `STYLES` 首尾那两个反引号
+（三条既有护栏用例会计数，2026-10-08 我加 `data-plugin-css` 时用模板字符串
+接线，一次触发 3 条红）。故 `STYLE_TAG_ID` / `STYLE_SELECTOR` 一律用 `+` 拼接。
+
+⚠️ **不需要 MutationObserver**：署名之后，唯一还能删掉这条标签的是
+`removeOwnedStyles('dsh-providers-hub')`，它只出现在两条路径 ——
+`replace(自己)`（factory **必然重跑**，DOM 存在性判断随之复位）与
+`prune`（此时本插件已不在模块图里，删样式是**正确**行为）。「DOM 存在性判断」已覆盖。
+
+### 验证（可复用）
+
+`tests/unit/jet-hub-styles-ownership.spec.ts`（10 条）：
+
+- 断言全打在**可观察 DOM 结果**上（标签条数 / `data-plugin` 归属 / 认领与回收后是否幸存），
+  不是源码字符串 —— 因此对实现方式中立；
+- 宿主那侧的 `claimStyles` / `removeOwnedStyles` **优先取真实实现** —— 从已安装的 DSH
+  （`require.resolve` → 全局 `node_modules` → 用户 profile）里抽取两个函数的**真实源码**求值；
+  找不到时（干净克隆 / CI）退化为同语义内联实现，并**干净跳过**对拍用例；
+- 一条「扫描面有效性」护栏：定位到宿主时硬断言其**判据语义**未变
+  （`style:not([data-plugin])` / `factory(...)` 后紧跟 `claimStyles(ownerId)`），
+  否则本文件会静默失效。
+
+⚠️ **已做反向验证**（四种变异各自独立锁死，**不是同一反复**）：
+
+| 变异 | 变红条数 |
+|---|---|
+| 去掉署名（保留 DOM 存在性幂等） | 6 |
+| 幂等改回模块级布尔（保留署名） | 5 |
+| `PLUGIN_ID` 与 `loaderId` 不一致 | 7 |
+| disposer 改成删「所有」`style[data-plugin]`（过度删除） | 1 |
+
+⚠️ 变异 4 最初**全绿**（用例没抓住）—— 因为原 disposer 用例只验「删自己」、
+没验「不删别人的」，现已补上该断言。**这就是反向验证的价值**。
+
+⚠️ 另用独立脚本驱动**真实发布产物** `lib/client/jet-hub.js`（本机 profile 是 `link:` 到它）
+跑过同样的 8 步：署名正确、别的插件认领不到、回收后幸存、外部删除后 apply 能自愈。
+产物与源码构建结果经 sha256 逐字节比对确认同源。
+
+⚠️ 变异验证时**不要**用 `git checkout -- <文件>` 还原（AGENTS.md 明令禁止）——
+本项目已因此丢过两次未提交的修复（2026-10-08 一次、2026-10 审计 IKLUME 一次）。
+还原应当用**事先备份的副本**（如 `$env:TEMP` 下的备份），或 `git stash` 之外的安全手段。
+
+## ⚠️⚠️ 包名 = 插件身份：四处载体必须逐字相同（issue IKLUME）
+
+**真实缺陷**（Gitee issue IKLUME）：`0.2.0-rc.11` 把包名从 `dsh-codearts-auth` 改成
+`dsh-providers-hub` 时，`build.mjs` 的 `loaderId` 与 `jet-hub-styles.js` 的 `PLUGIN_ID`
+**一起**留在了旧名上，而宿主那侧从来没有变 —— 它按**加载行名解析出的包名**建 client entry。
+于是前端产物注册 `dsh-codearts-auth`、宿主等 `dsh-providers-hub` ⇒ 该 entry 永远
+import 不到，启动即 `N entry did not activate`，桌面端落进恢复模式并把插件自动禁用。
+
+### 四处载体（缺一处都是静默失效）
+
+| # | 位置 | 谁在读它 |
+|---|---|---|
+| ① | `package.json` 的 `name` | **唯一真源**。宿主 `locatePkgJson()` 用 `nearestPackage(moduleUrl, expectedPackageName)` 校验它，`reconcilePackage(packageName)` 以它作 client graph 的**行 id** |
+| ② | `cordis.patch.yml` 加载行的 `name:` | 宿主 `resolveSource()` 读的**输入**；不匹配则 client 半边**静默跳过**（不是报错） |
+| ③ | `build.mjs` 产物首行 `__ModuleLoader__.load({ id })` | 前端 `register(registration)` 用 `registration.id`；宿主按它报 `loaded without registering "<pkg>"` |
+| ④ | `jet-hub-styles.js` 的 `PLUGIN_ID` | 样式标签的 `data-plugin` == 宿主 `ownerId`（见上一节） |
+
+⚠️ **① 之外的三个都必须从 ① 派生或与 ① 对齐**。③ 现在**直接由 ①（`package.json.name`）
+生成**，不再有字面量；④ 仍是字面量（浏览器模块运行期读不到 `package.json`，
+彻底消除它需要 esbuild `define` 构建期注入，**本轮刻意不做**），但已被
+**安装期闸门** + **行为用例**双重锁住。
+
+⚠️ **不要动**这两个里的 `codearts-auth`：`cordis.patch.yml` 加载行的 `id: codearts-auth`
+（loader 行锚点，与包名无关）与 `src/index.ts` 的 `export const name`（cordis 插件名）。
+同理 `JET_HUB_NS = 'jet-hub'`、`~/.dsh/jet-hub/` 状态目录、日志前缀、凭据 ref 前缀
+**全都与包名解耦**，改名时一个都不要跟。
+
+⚠️ 上面这组「与包名解耦」是**核过读点**的（2026-10 审计要求补证据，原先属未举证断言）：
+`git grep codearts-auth -- src/ plugin-src/` 命中的全部是**日志前缀**、五处 store 的
+`schema`、`BACKUP_FORMAT`（真读点，见本节末尾的落盘标记表）与 `cordis.patch.yml` 的行
+`id:`；**没有任何一处把它与 `package.json.name` 比较**。`src/index.ts:184` 的
+`export const name = 'codearts-auth'` 是 cordis 插件名 —— 它的对齐对象是 patch 行的
+`id:`，**不是**包名，所以它不是第 5 个身份载体；但它同样没有守卫，改名时容易被顺手
+误伤，故在此点名。
+
+### ⚠️⚠️ 安装期闸门：`pnpm add git+…` 不跑 vitest
+
+`plugin-src/client/build.mjs` 在构建前跑一次**身份自检**（判据本体住在
+`plugin-src/client/registration-id-check.mjs`，与单元测试**共用同一份**），不一致就
+**抛错中止**。⚠️ 它检查的**不是**「②③④ 都与 ① 逐字相同」这么整齐的一件事
+（2026-10 审计指出原话夸大：③ 本来就是从 ① **派生**的，谈不上「对齐」）——
+真正被检查的是这四条：
+
+1. ② `cordis.patch.yml` 的**加载行 `name:`** == ①；
+2. ④ `jet-hub-styles.js` 的 `PLUGIN_ID` **声明** == ①；
+3. ④ 的**署名使用点**没有写死字面量（`.plugin = '…'` / `setAttribute('data-plugin', '…')`）；
+4. **产物文本里回读到的注册 id** == ①（这一条与 ③ 的生成方式是两件事）。
+
+这条**必须**放在构建脚本里，理由（审计实测）：
+
+- `pnpm add git+https://…` 走的是 `prepare → build:all`（`tsc` + `copy-assets` + `build.mjs`），
+  **一次 vitest 都不会执行** ⇒ 单元测试里的守卫在**安装路径上保护力为 0**；
+- 构建脚本在**两条路径上都跑**（安装时经 `prepare`、开发时经 `pnpm build:client`）。
+
+熔断形态（改一处身份载体 ⇒ 文案指名到具体载体；改**产物生成方式** ⇒ 走下面第二条）：
+
+```
+Error: 客户端注册 id 自检失败（issue IKLUME）：
+- plugin-src/client/jet-hub-styles.js 的 PLUGIN_ID 必须是 "dsh-renamed-again"，实际 "dsh-providers-hub"（…）
+- cordis.patch.yml 的加载行 name: 必须是 "dsh-renamed-again"，实际 "dsh-providers-hub"（…）
+```
+
+```
+Error: 内部错误：产物里注册的 id 是 "dsh-codearts-auth"，与 package.json 的 name "dsh-providers-hub" 不一致
+```
+
+⚠️ 第二条是 **2026-10 对抗审计第一轮打穿后补的**，也是唯一「**不改任何身份载体、
+只改产物的 id 生成方式**」也拦得住的一格（见下）。
+
+### ⚠️⚠️ 闸门自己的四个洞（2026-10 两轮对抗审计，均已修）
+
+第一版闸门能拦「载体之间不一致」，但它自己有四个洞，其中三个是**零守卫**：
+
+| # | 洞 | 审计实测 | 现在的判据 |
+|---|---|---|---|
+| F1 | 写盘前的自检 `if (!wrapped.startsWith(header))` 是**恒真式**（`wrapped` 就是用 `header` 拼出来的） | 把产物 id 换成**写死的旧名** ⇒ 构建 **exit 0**、产物注册错名，而 stdout 照样打印 `registered id: dsh-providers-hub`（**成功日志谎报**） | 从**最终文本回读** `readRegisteredId()` 再比对（实测：同一变异现在 exit 1、且**产物没被写坏**） |
+| F2 | 只校验 ④ 的**声明**，不校验**使用点** | 把 `style.dataset.plugin` 的取值写成字面量 ⇒ 闸门 exit 0（单测红 8 条） | 闸门扫使用点；单测有专门一格（实测红） |
+| F3 | 闸门**本体零守卫**：`if (problems.length > 0)` 改成 `if (false)` ⇒ **21/21 全绿**（全仓找不到一条**代码**引用 `build.mjs`） | 同上 | ① 判据搬进 `registration-id-check.mjs`，单测用**临时目录夹具**直接打（6 条，含反向验证）；② `build.mjs` 改成**顶层无条件调用**（没有分支可以短路）；③ 再加一条**接线断言**（必须 import 且顶格调用）—— 实测：删掉调用 ⇒ 恰好那条红 |
+| F8 | 同一判据**两份**且语义不同（闸门「每一处 `name:` 都等于包名」vs 用例 `toHaveLength(1)`） | `cordis.patch.yml` 里放两条**都正确**的 `name:` ⇒ 闸门绿、用例红 | 收敛成**共享模块**：用例只断言「真实仓库 `checkRegistrationId(…) === []`」 |
+
+⚠️ 还修了两类**假红**（判据把合法写法判成错）：
+
+- **合法 YAML 尾注释**：`name: "dsh-providers-hub" # 加载行` 被旧判据报成
+  「**没有找到**加载行 name:」并让安装硬失败 —— 最坏的一种误导（把惯用写法说成
+  「你没写」），而真实的 `yaml` 解析器读到的值是对的（审计实测）。现在**先剥行尾
+  注释**（引号内的 `#` 不当注释）。
+- **产物头部逐字节锚定**：旧用例断言 `toContain('window.__ModuleLoader__.load({\n  id: "…",')`，
+  把头部**多行改单行**（行为等价，只读探针实测 `executed=1`）判红 2 条。现在用
+  `readRegisteredId()` 的正则回读，对形态不敏感（⚠️ 而**回读本身**必须有，否则就是
+  F1 那个恒真式 —— 两者是一枚硬币的两面）。
+
+⚠️ **已知射程**（不要当成全覆盖）：
+
+- 使用点判据只拦「直接写字面量」；把正确的声明复制进同名遮蔽作用域再用它署名
+  （审计 G13）拦不住 —— 那一格由**行为用例**拦（实测 8 条红），而行为用例在安装
+  路径上不跑。
+- 加载行判据**对缩进深度不敏感**：`config:` 块里的 `name:` 也会被当成加载行
+  （审计 G5，合成场景；10 个真实 patch 无反例，标**推断**）。
+- `package.json` 的 `name` 首尾带空白 ⇒ 已单列一条指出**真因就是它自己**
+  （审计 F9：原先两条 problem 都在指责另外两处载体，把该改的地方藏起来了）。
+
+### ⚠️ 宿主真身不在场时：需要宿主的那两条断言会**整组跳过**
+
+`tests/unit/client-registration-id.spec.ts` 里只有**两条**断言真的需要宿主真身
+（`@deepseek-ai/dsh-client-modules/lib/client.js`）：装载成功、以及它的反向验证。
+本仓库 devDependencies **不含**这个包（宿主侧包，只随 DSH 安装），所以：
+
+- 找不到时那两条 `describe.skip`，并**在控制台显式告警**（审计 F6：原先整组静默跳过、
+  `vitest` 仍 exit 0 —— 等于把「绿」当成「验过」）；
+- **不需要**宿主的断言（产物 id 回读、安装期闸门本体、三处载体一致性）**刻意留在
+  skip 组之外**，干净克隆 / CI 上仍然真的在验；
+- 要强制验真身（例如 CI 里挂了 DSH）用 **`DSH_HOST_CLIENT=<client.js 绝对路径>`**；
+  此时路径不存在会**抛错**而不是回退 —— 那是「必须验」的显式承诺，静默回退会骗人。
+
+⚠️ 三级查找（本仓库依赖树 → 运行测试的 node 的全局 `node_modules` → 用户 profile）
+的**排序**只有源码可读，本机只有一份宿主副本故未实测；换一台装了多个 DSH 的机器时
+可能拿到与运行时不同版本的那一份。
+
+### ⚠️⚠️ 判据必须打在**行为**上，不能读源码正则
+
+上一版守卫（PR !98 引入）用正则读 `build.mjs` / `jet-hub-styles.js` 里的字面量再比对包名。
+变异验证（10 个变异体 + 5 个边界体）实测它同时具备**三类假红**与**两类假绿**：
+
+| 形态 | 变异 | 旧守卫 |
+|---|---|---|
+| 假红 | `build.mjs` 改从 `package.json` 读包名（issue 自己推荐的修法；产物 SHA256 **逐字节不变**） | 红 |
+| 假红 | `const loaderId = "dsh-providers-hub"`（改双引号，行为等价） | 红 |
+| 假红 | 真定义上方多一行**写着旧名**的注释（`// const loaderId = 'dsh-codearts-auth'`）—— 正则读到注释里的值，而产物其实是对的 | 红 |
+| **假绿** | 注释诱饵写新名、真定义留旧名、且**不重建** ⇒ 被断言的**真定义**根本不生效 | **全绿** |
+| **假绿** | 只动产物：`id: "wrong-id", // was id: "dsh-providers-hub"` | **全绿** |
+
+⚠️ 第三行**原先写作「注释放新名也红」，那是错的**（2026-10 第二轮审计实测纠正）：
+旧正则 `/const loaderId = '([^']+)'/` 取**首个**匹配，注释里放新名时读到的就是正确值
+⇒ 照常**绿**。要让这一格红，注释里必须放**旧名**，而那时它是「产物对、断言红」的
+假红 —— 与第四行「同一个变异、相反结论」，这本身就说明旧判据不可信。
+
+⇒ 现行判据换成 **`tests/unit/client-registration-id.spec.ts` 的端到端装载**：
+拿**真实的** `lib/client/jet-hub.js` 字节，交给**真实的** `dsh-client-modules` 加载器
+（`createClientModuleSystem` + 一行 boot 图）按包名 `prefetch`，装载不上就红。
+它对引号形态、注释诱饵、产物陈旧免疫；对头部**形态**重构（多行改单行）也免疫
+（回读用正则，不逐字节锚定 —— 见上面那一组假红）。并且内含一条**反向验证**
+（把产物 id 换掉 ⇒ 必须以 issue 原文的三段报错刷红），证明它**不是恒真**。
+
+⚠️ 而「② 的直读断言」（`cordis.patch.yml` 的 `name:`）现在**与安装期闸门共用
+`registration-id-check.mjs` 的 `checkRegistrationId()`** —— 这一处在旧守卫下**零守卫**
+（`git grep cordis.patch.yml tests/` = **0**，把它改回旧名全绿），而且两份判据语义不同
+还会互相矛盾（闸门「每一处都等于包名」vs 用例「恰好一条」），已收敛为一份。
+
+⚠️ 本节数字（「17/17」等）已按 AGENTS.md 自己的规矩删除：条数是**必然腐坏**的快照，
+以 `pnpm test` 输出为准。
+
+### ⚠️ 改名的**第三条腿在用户机器上**（本仓库修不完）
+
+宿主在 **profile** 里按**包名字符串**寻址 bundle
+（`dsh-app-boot` 的 `resolveBundleDir()` → `node_modules/<name>`，**不校验** manifest 的
+`name`），而老 profile 两处都锁着旧名：
+
+```jsonc
+// ~/.dsh/profiles/<name>/package.json
+{ "dependencies": { "dsh-codearts-auth": "link:…" },
+  "dsh": { "profile": { "bundles": [ …, "dsh-codearts-auth" ] } } }
+```
+
+⚠️ **这一格的失败是静默的**：`resolveBundleDir` 抛错 ⇒ 该 bundle 进 `skippedBundles` ⇒
+**插件行根本不插入**，宿主只在 stderr 留一行（无异常、无 UI 提示）。
+
+⚠️ 别把它与「两处**都**不改成」那一格混为一谈（2026-10 审计指出同一补丁里三处表述
+互斥：README 顶部说「静默消失」、README 对照表第一格说「界面不出现」、本节说
+「`N entry did not activate` + 自动禁用」）。权威表述是本节的这一条：
+
+- **两处都锁旧名**（老 profile 的现状）：bundle 目录**解析得到**，但包里 patch 的
+  加载行写的是**新包名**、它在「profile 目录」这个解析基准下解析不到 ⇒ **该行在宿主
+  侧 import 失败** ⇒ 宿主报 `N entry did not activate` 并把插件**自动禁用**；
+  宿主 `preflight()` 只 deny「兼容性冲突」，其余失败**留给 cordis Loader 自己报**。
+  这与「静默消失」**同向但更准确** —— 症状不是「UI 少了一块」，而是插件被禁用。
+- **只改一处**（无论哪一处）：走上面那条 `skippedBundles` 的**静默**路径。
+
+两处**必须一起改**。推荐不手改，用 `dsh plugin --profile <name> remove/add` 各走一遍，
+且**逐个 profile 都要走**（本机 `desktop` / `headless` / `tui` / `web` 四个都锁旧名）；
+迁移说明见 README「⚠️ 从旧包名 `dsh-codearts-auth` 升级」。
+
+### ⚠️ 改名时**必须保留旧值**的落盘标记
+
+| 位置 | 是否真读点 | 依据 |
+|---|---|---|
+| `src/types.ts` 的 `BACKUP_FORMAT`（`dsh-codearts-auth/backup`） | ✅ **真读点** | `src/backup.ts` 里 `record.format !== BACKUP_FORMAT` 即抛 `BackupFormatError` ⇒ 改了老备份**全部读不出**；`plugin-src/client/backup-convert.js` 里同一字面量的副本也真读（`looksLikeForeignAccountList()` 会因此把老备份**误判成外域账号清单**） |
+| `plugin-src/client/backup-crypto.js` 的 `format` | ⚠️ **写点无读点** | `isEncryptedBackup()` 只判 `kdf` + `ciphertext`；`decryptBackup()` 不读 `format` |
+| 五处 store 的 `schema`（auto-checkin / badge-preferences / dead-model-store / permanent-lock-store / token-ledger） | ⚠️ **写点无读点** | 逐条核过读路径：`locksFieldOf()` 只判 `schema === undefined`，其余四处**不比较值** |
+
+⇒ 结论：**都保留旧值**（改了对存量用户没有收益，只有风险），但理由要写准 ——
+**只有 `BACKUP_FORMAT` 是兼容读取点**，其余是「写点无读点」的落盘标记
+（真实用户的 `~/.dsh/jet-hub/*.json` 里确实躺着这 5 个旧值）。
+⚠️ 把整组说成「跟着改名会让用户读不出已落盘状态」是**过度陈述**（2026-10 审计）。
+
+## ⚠️⚠️ 聚合的三态门控与手工排序（2026-10-15，issue IKL7F9 + IKLQR2）
+
+> 规格：`docs/superpowers/specs/2026-10-15-aggregate-gating-manual-order-design.md`
+> 计划：`docs/superpowers/plans/2026-10-15-aggregate-gating-manual-order.md`（均**不入库**：`docs/superpowers` 被 gitignore）
+
+### 1. 三态判据**只留一份**（客户端只渲染、不判定）
+
+权威实现是 `src/aggregate-core.ts` 的 `resolveCandidateGate`（零 import 纯函数），
+优先级 **显式拒绝 > 显式允许 > 默认**（已接入折算 ⇒ 参与；未接入 ⇒ 默认不参与）。
+宿主在 `aggregate.catalog` 里把结果**直接下发**（每个候选带 `state` 与 `expiryWired`）
+⇒ 客户端**不得**自己重算（「同一语义两套判据」是本仓库首条红线）。
+
+⚠️ 两个字段的**分工**不要混：
+- `state` = 三态**判定结果**（`allowed` / `rejected` / `default-rejected`）；
+- `expiryWired` = **渠道级事实**（该渠道接不接入折算），**只**用来回答一个问题：
+  「关掉这条候选时该写**拒绝表**还是**白名单**」—— 见 `candidateToggleAction` 的四行表。
+
+### 2. ⚠️⚠️ 未接入渠道的候选必须赋 `NEVER`，**不能**落到 probe 的 `UNUSABLE`
+
+`src/aggregate-adapter.ts` 的 `candidatesFor` 里有一段**看起来可以删掉**的分支：
+
+```ts
+if (!WIRED_EXPIRY_PROVIDERS.includes(candidate.provider)) {
+  candidate.expiry = NEVER    // 可用、只是没有临期信息
+  continue
+}
+```
+
+**为什么不能让它走 probe**：`credentialExpiry` 对未接入渠道**恒返回 `UNUSABLE`**
+（`aggregate-expiry.ts` 的短路）⇒ `rankCandidates` 会把它剔除 ⇒ 症状是
+「我明明在面板上打开了，它还是不参与」，**零报错、零日志**。
+
+⚠️ **它的前提是「门控已经跑过」**：能走到这里的未接入候选必然是白名单里**显式放行**的
+那几条。⇒ 用例必须**两个方向都覆盖**，否则把门控整段删掉用例仍然全绿
+（本任务变异验证实测：第一版「未放行 ⇒ 不在池里」那条用例**无牙**，因为
+buddy 先成功、永远走不到 raccoon）。
+
+### 3. ⚠️ 目录身份与用户门控**无关**（`:636` 的过滤为什么删、为什么不能再加回来）
+
+`refreshCatalog` 里**曾经**有一条 `WIRED_EXPIRY_PROVIDERS` 过滤，2026-10-15 **整条删除**：
+
+1. **判据已恒真**：`providerIds()` = `AGGREGATE_CHANNELS ∩ 存活路由` ⇒ 每条候选的
+   `provider` 必然在 `AGGREGATE_CHANNELS` 内 ⇒ 换成渠道全集即恒 `true`；
+2. **它让用户点不动**：未接入渠道的**独有模型**会被整条剔掉 ⇒ 用户在面板里手工打开后，
+   选择器里**仍然看不到它**（打开白做）。
+
+⚠️⚠️ **不得改成「至少一个候选当前参与轮换」**：那会让「用户把某模型的候选全部拒绝」
+把该模型**从选择器里移除**，而仓库有**两处成文不变式**明文禁止：
+`jet-hub-store.ts` 的 `AggregateRejectionMap` 上方（「候选全被拒 ≠ 关闭模型」）与
+面板的 `isAllCandidatesRejected`（「面板需对候选全被拒给出显式提示」）。
+附带好处：`this.catalog` 保持稳定 ⇒ `provider.status` 的 `total` **不随用户点击漂移**。
+
+### 4. ⚠️ 面板显示顺序 = 真实轮换顺序（跨层一致性用例）
+
+客户端 bundle 是**独立 entry、不 import 宿主模块**（`build.mjs`）⇒ 比较器无法复用，
+只能在 `plugin-src/client/aggregate-panel-logic.js` 里写第二份
+（`rankCandidatesForPanel`）。**唯一守卫**是一条**跨层一致性用例**
+（`tests/unit/aggregate-panel-logic.spec.ts` 的「与宿主 rankCandidates 同序」）：
+同一份 fixture 过两个实现、逐项相等。**改动任一侧先跑它。**
+
+⚠️ 两处都必须保留 `expiryA !== expiryB` 这一格：两个 `Infinity` 相减得 `NaN`
+（非法比较器返回值，`sort` 会当 `0` ⇒ 顺序随引擎漂移）。
+
+### 5. 两张表**各有各的域，不做互斥归一**（用户 2026-10-15 的修正）
+
+| 渠道类型 | 默认态 | 例外靠哪张表 |
+|---|---|---|
+| **已接入**折算 | 参与 | **拒绝表**（黑名单语义：只有「不参与」需要显式记录） |
+| **未接入**折算 | 不参与 | **白名单**（只有「参与」需要显式记录） |
+
+两表的键域由 `expiryWired`（渠道级编译期事实）划分 ⇒ **天然不相交** ⇒
+写一侧**不得**改另一侧（顺手清另一侧会静默改掉**属于别的操作**的用户状态：
+拒绝一条候选不该顺手关掉同渠道其它手工打开的候选）。
+判定优先级 `rejected > allowed > 默认` 保留为**纵深防御**。
+
+⚠️ 但**落笔时我第一版按「互斥归一」实现**（写一侧清另一侧），用户看过设计后推翻 ——
+「同一枚开关的两个方向」听起来对称，但两表的**语义域**不对称。设计文档 §5.1 有留档。
+
+---
+
+## ⚠️⚠️ 源码文本断言的**共同弱点**：`if (false)` 短路禁用（2026-10-16 对抗审计）
+
+PR #102 合并后跑了对抗性审计，它用 **5 条 `if (false)` 型变异**打穿了本仓库一批
+**源码文本断言**（`toMatch(/字面量/)` / `toContain('字面量')`）：
+
+| 变异写法 | 原判据 | 结果 |
+|---|---|---|
+| `if (false) { event.dataTransfer.setData('text/plain', …) }` | `/dataTransfer\.setData\('text\/plain'/` | 🟡 **绿**（无牙）|
+| `if (false) { void commitOrder(…) }` | `/void commitOrder\(/` | 🟡 **绿** |
+| 保留条件行 + 加一句**无条件** `await onSortByExpiry()` | 字面量存在性 | 🟡 **绿** |
+| `onDragEnd: draggable ? () => {} : undefined`（保留方法名） | `/onDragEnd/` | 🟡 **绿** |
+
+**根因**：判据打在**文本存在性**上，而字面量在死分支里**照样存在**、代码却永不执行。
+⇒ 这类断言能防「整行被删」，但防不住「今天能跑、明天被包进死分支」。
+
+**为什么不能改成行为判据**：客户端单测环境**没有 react、`environment: 'node'`（无 DOM）**
+⇒ 组件内部逻辑（`AggregatePanel` 的 effect / 事件处理器）**够不到**。
+本仓库的既有做法是「把判据抽成纯函数」（`aggregate-panel-logic.js` 的模块注释），
+但**接线本身**（谁调谁、有没有被条件包住）仍然只能靠源码断言。
+
+**已落地的补强**（`tests/unit/aggregate-panel-logic.spec.ts`）：
+1. **常量假条件检测**：命中行往上找最近的 `if (false)` / `if (0)` / `while (false)`，
+   遇到属性起始（`onDrop:` 等）就停 ⇒ 判「不得被包进死分支」；
+2. **无条件调用检测**：用**缩进级别**判「每个 `onSortByExpiry()` 都被条件包住」
+   —— 无条件调用的缩进与其上那条 `if` **同级**，有条件的会**更深**。
+
+⚠️ **两条过程教训（比结论更重要）**：
+1. **判据没抓住，先怀疑判据本身，别先怀疑被测代码。** 我第一版「往上找 6 行内有无
+   `if (`」的启发式**抓不到** —— 它找到了**相邻**那条语句的 `if`，把无条件调用
+   误判成有条件的。改成缩进比对才成立。
+2. **变异「全绿」不等于「守卫无牙」——也可能是变异根本没注入。**
+   我第一次注入 M4 时用单行精确匹配，而文件里是 `\r\n` ⇒ `replace` **静默不生效**
+   ⇒ 我据此以为判据无牙，其实**什么也没改**。对抗审计方也在同一处误报过
+   （多行正则锚点在 CRLF 上不匹配）。
+   ⇒ **变异脚本必须区分「锚点未命中」与「无牙」**：注入后**打印实际片段**确认，
+   锚点未命中要单独报 `PATCH-NOT-APPLIED`（不算结论）。这条已写进本仓库的变异纪律。
+
+**仍未覆盖（如实登记）**：`onDragEnd` 那类「保留方法名、函数体改成 no-op」的变异
+**无法用文本判据区分**（`onDragEnd: ` 后面接 `() => {}` 与接真实现，正则都命中）
+—— 要覆盖它需要 AST 或真 react 渲染，本期不做。

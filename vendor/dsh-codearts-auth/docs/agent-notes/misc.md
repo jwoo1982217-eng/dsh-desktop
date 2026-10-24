@@ -3,7 +3,7 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的一个插件（`dsh-codearts-auth`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`qodercn`（**Qoder 中国版**，与 `qoder` 同协议族、共用同一份 WASM）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）、`loomy`（讯飞 **Loomy** 办公助手）、`raccoon`（商汤 **Raccoon Work** / 小浣熊）与 `minimax`（**MiniMax Code 中国版**，首个 **Anthropic Messages** 协议族）十个 LLM provider 路由。
+本项目是 DeepSeek Harness 的一个插件（`dsh-providers-hub`），提供华为云 CodeArts 浏览器登录与凭据管理功能。插件还附带 `buddy`（腾讯 CodeBuddy 中国版）、`workbuddy`（腾讯 WorkBuddy **国际版** / WorkBuddy AI）、`lobsterai`（有道 **LobsterAI** / 龙虾）、`qoder`（阿里系 **Qoder**）、`qodercn`（**Qoder 中国版**，与 `qoder` 同协议族、共用同一份 WASM）、`trae`（字节跳动 **TRAE**）、`cline`（**Cline** 桌面端 / Cline API）、`loomy`（讯飞 **Loomy** 办公助手）、`raccoon`（商汤 **Raccoon Work** / 小浣熊）、`minimax`（**MiniMax Code 中国版**，首个 **Anthropic Messages** 协议族）与 `minimaxintl`（**MiniMax Code 国际版**，与 `minimax` 同协议族、共用同一份实现，差异只在 `src/minimax-product.ts`）等 LLM provider 路由。
 
 `buddy` 与 `workbuddy` 同源：共用同一 CLI 内核与同一认证协议，差异全部收敛在 `src/product.ts` 的产品配置中。关键差异是 **`endpoint`**：中国版为 `copilot.tencent.com`，国际版为 `www.workbuddy.ai`，两者返回不同模型池，因此 endpoint 必须随产品切换、不可当作全局常量。此外 `platform` 分别为 `ide` 与 `workbuddy-ai`，国际版登录 URL 还追加 `version` / `loginSessionId`。
 
@@ -674,11 +674,206 @@ Jet Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限
 新增同族产品**不要**在四处分支各加一条平行 case —— 平行 case 越多，漏接概率越高
 （`workbuddy` 的「刷新」按钮就是这么一直坏着的）。
 
-- **包名**：`dsh-codearts-auth`
+- **包名**：`dsh-providers-hub`
 - **入口**：`lib/index.js`（宿主侧）、`lib/client/jet-hub.js`（客户端 bundle）
 - **构建**：`pnpm build:all`（`tsc` 编译宿主侧 + `esbuild` 打包客户端）
 - **语言**：TypeScript
 - **许可**：MIT
+
+## ⚠⚠️ Gemini 必须过墙而插件不读系统代理（Issue IKLTZ2，2026-10-18 修）
+
+**症状**（用户报障形态）：浏览器**能**打开 Google 授权页并点「同意」，回到面板却
+报授权失败、账号列表里始终没有 `gemini`。**极易被误判成 `client_secret` /
+`redirect_uri` 问题** —— `gemini-oauth.ts` 文件头第 1 条注释描述的正是同一种现象，
+而那个 bug 早已被修掉。
+
+**根因**：`gemini` 全部端点（`oauth2.googleapis.com/token`、userinfo、
+`cloudcode-pa.googleapis.com` 的 `loadCodeAssist` / `retrieveQuotaSummary` /
+`streamGenerateContent`）都在墙外；插件走 Node 内置 `fetch`（undici），而它
+**既不读 Windows WinINET 系统代理（浏览器读，所以浏览器能用）、也不读
+`HTTP(S)_PROXY`**。
+
+### 本机实测（Node 22.19 / 24.21 / 26.10，用假代理记录 CONNECT）
+
+| Node | 仅设 `HTTPS_PROXY` | 再加 `NODE_USE_ENV_PROXY=1` |
+|---|---|---|
+| 22.19 | ❌ 不读 | ❌ 不读 |
+| 24.21 | ❌ 不读 | ⚠️ 读，但失败后**无限重试**（假代理收到成千上万条 CONNECT），界面长时间无响应 |
+| 26.10 | ❌ 不读 | ✅ `UND_ERR_PRX_CONN`（20ms，CONNECT 已命中） |
+
+⚠️ 「Node 22 完全不读」这条**修正了 issue 原文**（它只测了 24 与自己的版本）。
+
+### ⚠⚠️ 宿主已有一层全局代理，但它**不读系统代理**（决定了这不能算「issue 无效」）
+
+DSH 启动器在**第一个插件加载前**调 `installProxyFromEnvironment`
+（`@deepseek-ai/dsh` 的 `lib/profile-boot-*.js`），内部
+`setGlobalDispatcher(agent)` 装一个按策略路由的 Agent ⇒ **Node 内置 fetch 解析的
+正是它**。实测：调用它之后发**裸 fetch**，`CONNECT oauth2.googleapis.com:443`
+确实命中假代理；`127.0.0.1` 被 loopback bypass 放行（未进代理）。
+
+**但它只读环境变量**（`resolveProxyPolicy` 只查 `all_proxy` / `http_proxy` /
+`https_proxy` / `no_proxy`，**全仓无 `winreg` / 注册表读取**）⇒
+「只开了系统代理开关、没导出变量」的用户仍然 `source === 'none'`、全局直连，
+**issue 原样复现**。本机实测正是这一格（`ProxyEnable=0`、`ProxyServer` 是残留键、
+端口无监听、环境变量为空）。
+
+⇒ 结论：宿主那层覆盖了「导出了变量」这一格，插件补的是**剩下那一格**（per-账号）。
+
+### 修法与取舍
+
+| 方案 | 评价 |
+|---|---|
+| **文档 + 可诊断性** | 性价比最高，已落地（README「出不去墙外服务」一节 + 四条腿的指路文案） |
+| **per-账号代理** | 已落地。复用 `opencode-proxy.ts` 的 `proxyFetch`（**不**自己写第二份） |
+| **插件装全局 dispatcher** | **不建议**：`opencode-proxy.ts` 模块头记着 opencode2dsh 的 R1 教训（抢全局槽位会互相短路整个路由层），且宿主已占用该职责 |
+
+### ⚠⚠️ 四个极易漏的接线点（本次实做时踩全了）
+
+1. **`gemini-adapter.ts` 的推理腿此前连 seam 都没有** —— `stream()` 里
+   `streamGenerateContent` 是**写死的裸 `fetch`**。issue 建议说「接上已有的 seam」，
+   **照字面实现会让推理主路径漏掉代理**，而它恰恰是用户唯一会卡住的那条路。
+   ⇒ 新增 `fetchImpl`（推理）与既有的 `projectFetcher`（探测）**两个**字段，
+   合成一个会让「只拦探测」的测试用例意外拦到推理。
+2. **登录时凭据还没落盘**，只有池里的**占位条目**认得那个账号 ⇒
+   `startLogin` 必须显式收 `accountId` 并传进 fetcher 解析器。
+3. **适配器会换号**（限流 / 401 时 `getAvailableAccount`）⇒ fetcher 解析器
+   **必须在循环内按 `currentAccountId` 现取**。固化在循环外的症状是
+   「换了号还是超时」，且**零报错**。
+4. **积分路径有两份表**（`src/index.ts` 的 `creditsTable` 与 `src/jet-hub-rpc.ts`
+   的 `credits`），只接一处 ⇒ 「面板能刷新、聚合折算却失败」。这与 `minimaxXff`
+   （issue IKMEVG）是**完全同型**的坑。
+
+⚠️ `ProviderCallContext` 新增 `accountId` 的理由：账号 id 与 `credentialRef`
+**没有可逆映射**（ref 由 RPC 随机生成），而按账号取出口必须知道 id。
+⚠️ **两处消费点必须都透传**：`jet-hub-rpc.ts` 的 `collectCreditBalances`
+（逐账号包装成**每账号一份** callContext —— 共享单例会让所有账号都查到
+「最后一个」账号的代理）与 `index.ts` 的 `fetchBalanceReading`
+（`entry.id` 就是 `accountId`）。
+
+### ⚠️ 池字段**刻意分成两个**而不是复用 `opencodeProxy`
+
+两者语义不同：opencode 的代理是「多账号要分份额度」，Gemini 的是「单账号能不能
+连通」。共用一个字段 ⇒ 「清掉 Gemini 的代理」连带清掉 opencode 的出口配置。
+
+### ⚠⚠️⚠️ 代理字段来自**用户可编辑的备份文件** ⇒ 读取侧必须过 `asProxyText`
+
+**实测的真缺陷**（独立于两轮审计，由实现者自查发现）：
+`sanitizeAccounts`（`src/jet-hub-store.ts`）对未知字段用 `{ ...candidate }`
+**原样透传**、**不校验形状**（对照 `modelRateLimits`：那个已由 `isValidResetAtMs`
+加固）。于是手编备份里的 `"geminiProxy": 12345` 会**原样进池**，而
+`normalizeProxy` 第一句是 `input.trim()` ⇒ 抛
+`TypeError: raw.trim is not a function` ⇒ **该账号永久不可用且无自愈**
+（症状与「代理配错了」同形，排障者会去查代理配置，而真因是备份脏数据）。
+
+⚠️ **opencode 同样中招**（`poolEntrySnapshot` 把 `proxy` 原样透传 →
+`buildProxyDispatcher` 读 `proxy.url`）—— 这正是 `src/types.ts` 里 `expiresAt`
+注释记的那句「**补了 A 格、漏了同族 B 格**」的又一次实例。
+
+⇒ 修法 = `asProxyText(value)`（`account-pool.ts` 导出，**两个**读方法共用）：
+只放行字符串，其余（数字/对象/数组/布尔/null/undefined）一律降级为空串（= 直连）。
+⚠️ 刻意**不删键、不改盘**：读侧只保证「不崩、行为确定」，用户仍可在面板里
+重新配一次覆盖掉它。
+⚠️ 守卫必须**两个读方法都断**（只断 `setGeminiProxy` 的函数体是「改了一半」的
+形态 —— 读取侧串成别的字段时写入侧完全看不出来；对抗审计 M21 实测过这条）。
+
+### ⚠⚠️ 诊断函数的 `aborted` 形参一度是**死参数**（恒传字面量 `false`）
+
+`geminiNetworkHint(error, aborted)` 的三处调用点**全传 `false`**，而其中两处
+**恰恰自己 arm 了** `AbortSignal.timeout(GEMINI_OAUTH_TIMEOUT_MS)` ⇒ 墙外连接
+超时（**不带** `UND_ERR_*` 码，正是 IKLTZ2 的主症状）反而拿不到提示。
+
+⚠️ 这是「**写进去却没人读**」的形态，也是本仓库反复记的那类：形参存在、签名正确、
+tsc 全绿，**没有任何机制**提醒它没被真正使用。
+⇒ 三处改为真读 `signal.aborted`；`refreshCredential` 因此多一个 `onSignal`
+回调把 signal 透给 catch（⚠️ **每账号各一个局部量**，共享会让 B 的日志引用
+A 的 signal）。
+
+⚠️ 可推广：**给函数加形参时，「所有调用点都传了值」不等于「那个值有意义」** ——
+要问的是「调用点**为什么**该传这个值」，而不是「它有没有传」。
+
+### ⚠⚠️ 重登 = 新造 id ⇒ 代理配置必然丢失（**死锁**，已修）
+
+「refresh_token 失效 ⇒ 删号重登」是面板明示的既定动作，而 `account.create`
+的 `id` 是**每次新造**的（`jet-hub-rpc.ts` 里**全仓仅此一处**生成）⇒ 旧号上的
+代理配置必然丢。而换 token 那一步恰好发生在**凭据落盘之前**（只有池里的占位条目
+认得这个账号）⇒ 不带代理就**登录恒失败**；用户又**没法给一个还不存在的账号配
+代理**（面板的「代理」按钮按 `accountId` 打开）⇒ **死锁**，唯一出路是导出
+`HTTPS_PROXY`。
+
+⇒ 修法 = 占位条目落地时带代理，两级来源：① 载荷显式带（`RpcCreateAccountRequest
+.geminiProxy`，为将来 UI 提供输入留口）；② **从同 provider 的已有账号继承** ——
+只在**恰好一个**账号带代理时生效（多账号时无法判断该继承哪个，**宁可直连也不要
+猜错出口**把凭据发到错误的代理上）。
+
+⚠️ 全仓 0 处 `account.relogin` ⇒ 「保留 id 原地重登」这条路当时确实不存在
+（审计实测 grep 确认），不是漏搜。
+
+### ⚠️ 「测试连接」必须打 Google，**不能**打出口 IP 服务
+
+opencode 的测试打 `ip-api.com`（能显示出口 IP 与地区）。Gemini 这里照抄会产生
+**假阳性**：代理能通 `ip-api` 却被 Google 拒（DNS 污染 / 分流规则 / Google 侧封禁），
+用户看到绿色以为配好了，面板依然失败。
+⚠️ 也不能用 `https://www.google.com/` —— 它 302 跳地区域名、undici 会自动跟随，
+「通」与「被墙」的响应差异不干净。选 `oauth2.googleapis.com/token`：`POST` 无参数
+回 `400`，**拿到任何 HTTP 状态码即证明 TCP + TLS + 代理握手全通**，
+且**不能判 `response.ok`**（400 也是通的，判了会让正确配置报红）。
+
+### ⚠⚠️ 判据必须读 `cause` 链上的**错误码**，不能读 message
+
+`fetch failed` 是 undici 把**所有**传输层失败压成的同一句话，真因只在 `cause`。
+`refresh.ts` 原先的正则把它一律归成「1 分钟后重试的瞬时抖动」⇒
+「墙外出不去」被当成抖动 ⇒ **永远静默重试**，面板零线索（issue 原话）。
+
+⇒ **诊断**侧修法 = `isUnreachableNetworkError`（`src/refresh.ts`）读
+`UND_ERR_CONNECT_TIMEOUT` / `EHOSTUNREACH` 等**码**（不读 message），供
+`geminiNetworkHint` 给出带根因的指路文案。
+
+### ⚠⚠️⚠️ 「拉长重试间隔」那一版已被推翻：它是净损害（两次独立审计）
+
+第一版把 `refresh.ts` 的退避三元链改成三格（新增 `REFRESH_UNREACHABLE_RETRY_MS`
+= 30 分钟）。**两次独立审计各自确认这是错的**，理由是**两条独立**的：
+
+1. **对 gemini 自身零作用**：gemini **不使用** `RefreshScheduler`（全仓 7 处
+   `new RefreshScheduler` 在 buddy / workbuddy / cline / qoder / trae /
+   lobsterai / autoclaw，`gemini-auth.ts` **没有**）。gemini 走账号池 `refreshAll`，
+   由 `MultiAccountRefreshScheduler` 驱动，那里间隔是**固定 30 分钟**、
+   **没有任何错误分类** ⇒ 「1 分钟 → 30 分钟」对 gemini 一行都不生效
+   （它本来就是 30 分钟），commit message 的说法与实现不符。
+2. **误伤另外七个 provider**：它们与墙无关，把一次 DNS 抖动（`ENOTFOUND`，
+   典型临时故障）从 60 秒拉长到 30 分钟，代价是「代理抽风一次，用户 30 分钟
+   不能用」。
+
+⇒ **判据仍有用（诊断），间隔不该动**。若将来 gemini 真要独立退避策略，该加在
+`MultiAccountRefreshScheduler` 上（它目前无错误分类能力），**不能**在
+`RefreshScheduler` 这条**七家共享**的链上动。
+
+⚠️ 方法论可推广：**「给某个 provider 加一条全局策略」时，必须先确认它用的是
+哪条策略链**。gemini 与其余十家走的根本不是同一个调度器 —— 而 commit message
+里那句「1 分钟 → 30 分钟」读起来完全合理，正是因为**没人核对过 gemini 走哪条链**。
+
+### ⚠⚠️⚠️ 探测路径刻意不挂 `accountPool` ⇒ 账号代理在探测上是**空接线**
+
+**真实缺陷**（两轮独立审计各自查出，第一版「已修复」的说法是假的）：
+
+- `account-probe.ts` **刻意不传 `accountPool`**（它的既定语义：只测这一个账号、
+  且**不写**任何标记）⇒ `GeminiAdapter` 内「按 `access_token` 反查账号 id」
+  那条路**根本不存在** ⇒ `currentAccountId` 恒为 `''` ⇒
+- `gemini-proxy.ts` 的解析器按「空 id = 直连」处理 ⇒ **该账号的代理被完全绕过**。
+- 症状与 issue 原话**同形**：墙外环境下「测试 / 重测」**恒失败**，而这个失败与
+  「账号已失效」在 UI 上**完全同形** ⇒ 用户会去**误删好号**。
+
+⇒ 修法 = 给 `GeminiAdapterOptions` 加 `accountIdOverride?: string`（**优先于**
+反查），并让 `probeById.gemini` 的 `createProbeAdapter` **接下第三个形参 `entry`**
+（原先形参只有 `(ref, credential)`，`entry` 被**直接丢弃** —— 对照 opencode 的
+`(ref, credential, entry)`）。
+
+⚠️ **为什么不给探测也挂池**：那会把探测接进换号/写标记的整套编排，而探测的既定
+语义恰恰是「不写任何东西、只测这一个账号」。改 `account-probe.ts` 会破坏那套语义
+并**波及十家适配器**。
+
+⚠️ 这条同时暴露了原守卫的假绿：判据是
+`/gemini: \{[\s\S]{0,600}fetchFor:\s*geminiFetchForAccount/` —— 它只证明**字面量在**，
+不证明**那个 id 是对的**。两次审计实测的「删掉接线、字面量留在注释里」全绿。
 
 ## ⚠⚠️ 客户端**不得**注册 `settings.models.provider-card` 槽（Issue IKJLHQ）
 
@@ -892,7 +1087,7 @@ console.log('0.3.0-rc.1 must be false:', s.satisfies('0.3.0-rc.1', R, { includeP
   否则前端 `login.poll` 查不到该账号、永远 `done:false`
 - 前端**不得**再出现 `window.location.href = loginUrl`：弹窗被拦截时改为展示
   可点击链接（`loginUrlForManual`）。`tests/unit/jet-hub-rpc.spec.ts` 有源码级
-  断言锁死这条（剔除注释行后匹配，因注释里保留了该缺陷的叙述）
+  断言锁死这条（剔除注释行后匹配，因注释里保留了该缺陷的叙述）
 
 ## ⚠️ 两条通用判据：一文件两套同义判据 / `String(undefined)`（PR !62 复审，2026-10-06）
 

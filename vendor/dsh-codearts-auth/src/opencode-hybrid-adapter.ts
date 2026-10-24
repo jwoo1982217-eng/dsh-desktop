@@ -23,11 +23,11 @@ import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { IdentitySlot } from './opencode-auth.js'
-import type { OpencodeAdapter } from './opencode-adapter.js'
-import { OpencodeAdapter as ZenAdapter } from './opencode-adapter.js'
+import type { OpencodeAdapter } from './opencode-inference-adapter.js'
+import { OpencodeAdapter as ZenAdapter } from './opencode-inference-adapter.js'
 import type { OpencodeLocalAdapter } from './opencode-local-adapter.js'
 import { deriveProjectId } from './opencode.js'
-import { OPENCODE, OPENCODE_INFERENCE_MODELS, usesInferenceLane } from './opencode-product.js'
+import { OPENCODE, OPENCODE_INFERENCE_MODELS, usesInferenceLane } from './opencode-inference-product.js'
 
 /** 快通道的匿名槽（`Bearer public`，直连出口 IP 记账）。 */
 export function opencodeInferenceSlot(): IdentitySlot {

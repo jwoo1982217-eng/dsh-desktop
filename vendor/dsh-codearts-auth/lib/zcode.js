@@ -97,3 +97,4 @@ export function isZcodeExpired(_credential) {
 }
 /** ZCode 是否可续期 —— 见 {@link isZcodeExpired}，**否**。 */
 export const ZCODE_REFRESHABLE = false;
+//# sourceMappingURL=zcode.js.map

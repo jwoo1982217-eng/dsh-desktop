@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, rm, cp, lstat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, cp, lstat, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { installDesktopUpstream, restoreDesktopUpstream } from './install-desktop-upstream.mjs';
@@ -32,6 +32,10 @@ async function restored(f) {
 test('desktop upgrade restores core, plugins and launcher after successful installation', async t => {
   const f = await fixture(t), result = await installDesktopUpstream(f.desktop, f.profile);
   assert.equal(result.version, '0.2.1-alpha.4');
+  const installed = JSON.parse(await readFile(path.join(f.profile, 'package.json')));
+  assert.equal(installed.dsh.profile.bundles.filter(n => ['dsh-codearts-auth', 'dsh-providers-hub'].includes(n)).length, 1);
+  assert.ok(installed.dsh.profile.bundles.includes('dsh-providers-hub'));
+  assert.equal(await realpath(path.join(f.profile, 'node_modules/dsh-codearts-auth')), await realpath(path.join(f.profile, 'node_modules/dsh-providers-hub')));
   assert.ok((await lstat(path.join(f.desktop, 'node_modules/@deepseek-ai/dsh'))).isSymbolicLink());
   await restoreDesktopUpstream(result.backup); await restored(f);
   assert.equal(await readFile(path.join(f.desktop, 'node_modules/@deepseek-ai/dsh/marker'), 'utf8'), 'old core');

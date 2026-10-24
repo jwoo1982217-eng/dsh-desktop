@@ -64,3 +64,4 @@ export function retryAfterMsFromRecord(headers, nowMs = Date.now()) {
         return undefined;
     return parseRetryAfterMs(headers['retry-after'] ?? headers['Retry-After'], nowMs);
 }
+//# sourceMappingURL=retry-after.js.map

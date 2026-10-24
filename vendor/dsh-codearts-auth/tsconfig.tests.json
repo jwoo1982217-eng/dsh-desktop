@@ -1,0 +1,38 @@
+{
+  // ⚠️ 2026-10-08 复审 Finding 5：compilerOptions 原先**逐字复制**自
+  // `tsconfig.json`（target/module/lib/strict/skipLibCheck/…），两处会各自漂移
+  // ——改了一处忘了另一处就是「`typecheck` 过了，但 `typecheck:tests` 用的还是
+  // 老设置」这类静默分叉。⇒ 改为 `extends` 继承，只覆写**本配置特有**的四项：
+  //   - `noEmit`：测试只做类型检查，绝不产出 .js；
+  //   - `declaration` / `declarationMap` / `sourceMap`：`noEmit` 下无意义的
+  //     产物选项，继承来的 `true` 会让配置读起来自相矛盾；
+  //   - `rootDir`：**必须**覆写 —— 继承来的 `"src"` 与下面 `include` 里的
+  //     `tests/**` 冲突，`tsc` 直接报 `TS6059`（实测：去掉本项即 exit 2）。
+  //   - `include`：见下。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "rootDir": "."
+  },
+  // ⚠️ 只有**需要类型层检查**的测试才列在这里（其余 spec 由 vitest/esbuild
+  // 转译，不做类型检查）。`src` 一并纳入，使测试里对生产类型的用法也被检查。
+  // ⚠️ 2026-10 审计 F10：`tests/unit/dsh-host-client.ts` 与它唯一的消费者
+  // `tests/unit/client-registration-id.spec.ts` 原先**不在任何 tsconfig 的
+  // include 里** —— 往它们里面注入一个类型错误（例如把
+  // `locateHostClient(): string | null` 改成 `(): string`）不会有任何反应。
+  // 本仓库的约定是「只有需要类型层检查的测试才列在这里」，而这两个文件恰好是
+  // IKLUME 的**唯一行为守卫**，值得列。
+  "include": [
+    "src",
+    "tests/unit/jet-hub-rpc-signature.spec.ts",
+    "tests/unit/astudio-errors.spec.ts",
+    "tests/unit/astudio-auth.spec.ts",
+    "tests/unit/astudio-stream.spec.ts",
+    "tests/unit/astudio-login-credits.spec.ts",
+    "tests/unit/client-registration-id.spec.ts",
+    "tests/unit/dsh-host-client.ts"
+  ]
+}

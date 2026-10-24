@@ -15,3 +15,7 @@
 - `dsh-pocket`：手机扫码访问插件，固定 npm 2.10.6，来源 [shaobeichen/dsh-pocket](https://github.com/shaobeichen/dsh-pocket)，沿用 GPL-2.0 许可证；通过锁文件安装，未改写上游包。
 
 各上游组件沿用其目录中 LICENSE 或 package.json 声明的许可证。本仓库不将第三方代码重新许可，也不包含从其他应用提取的原生运行库、APK 或私人素材。
+
+## JetHub 桌面增量跟进（2026-10-21）
+
+固定上游 `iJetLi/deepseek-harness-codearts@78dc506cf42bb1821a20cd4378f2b81cd8de8ded`（`dsh-providers-hub@0.2.1-rc.2`），在既有增强代码上三方合并；桌面核心保持 `0.2.1-alpha.4`，不替换其它插件或用户数据。兼容性和保留策略见 `vendor/dsh-codearts-auth/docs/desktop-local-integration.md`。源文件中的个人账号示例已脱敏；未发布本地私有备份与验证夹具。

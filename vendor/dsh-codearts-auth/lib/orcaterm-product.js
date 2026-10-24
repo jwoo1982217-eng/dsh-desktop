@@ -96,3 +96,4 @@ export function orcaTermModelName(id) {
 export function isKnownOrcaTermModel(id) {
     return ORCATerm_FALLBACK_MODELS.some((model) => model.id === id);
 }
+//# sourceMappingURL=orcaterm-product.js.map

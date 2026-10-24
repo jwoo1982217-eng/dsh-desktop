@@ -520,6 +520,96 @@ cline-pass 部分模型为什么不全**，例如当前这个模型就看不到�
   `cline: 模型 "cline-pass/deepseek-v4.1-flash" 不支持图片输入`）
   与 `models.dev 补全 cline-pass 目录`。
 
+#### ⚠️⚠️ models.dev 失败会**永久固化**：`complete` 判据漏了它（Issue IKKZUG）
+---
+
+#### ⚠️ 目录健康快照：让「没拉到」可观测（Issue IKKZUG 第 5 点）
+
+**排障困境**：models.dev 拉不到时只有一行 `console.warn`（宿主不落盘），
+现象只是「贴不了图」，**无从判断**是「这个模型不支持图片」还是「目录还没拉到」。
+用户 @oct_heaven 正是靠手工推演才定位到这一层 —— 那不该是排障的常规成本。
+
+**落点（既有端点 + 可选钩子，零新端点）**：
+
+- `ProviderStatus.catalog`（**可选**字段）+ `CatalogHealth` 类型；
+- `ModelCatalogSource.describeCatalogHealth?()`（**可选**钩子，
+  与既有的 `describeCatalog?` / `clearChoiceCache?` 同构）；
+- `provider.status` 逐供应商调用它。
+
+⚠️ **不新开端点**：设置页已经在读 `provider.status`，新端点等于让前端多一次
+往返；而 `model.list` 每次调用都要重组全量目录，不适合承载诊断。
+
+**三条纪律（都有专门用例守着）**：
+
+1. **零 IO**：设置页挂载时对**每个**供应商都会调它，一旦触发网络请求就会拖慢
+   首屏（本端点全程只用同步内存副本正是为此）。有用例断言
+   `describeCatalogHealth()` 连调 5 次**不触发任何拉取**。
+2. **钩子抛错必须被吞**：诊断不得反噬主流程 —— 否则适配器里一个诊断 bug 会让
+   整个设置页打不开。字段缺席而非整个状态丢失。
+3. **字段缺席 = 该适配器不提供诊断**，不是「一切正常」。前端与排障脚本必须按
+   `undefined` 判「无信息」—— 把「没测」当成「没问题」正是本仓库反复出现的
+   静默形态。其余 13 家不实现该钩子，有用例守住。
+
+⚠️ `note` **只在异常时给**：完整时不写该字段 —— 一句「一切正常」对排障毫无价值
+（真正需要看的正是异常时），也省掉前端一处永远为真的渲染分支。
+
+⚠️ 文案里**必须写明「会自动重试」**：`complete: false` 不是故障，插件会按闸门
+冷却自动重试，用户无需做任何事。不写这一句会让用户以为要自己去修。
+
+⚠️ **第 3 点建议的最后一条退路（内嵌 `cline-pass/*` 模态兜底表）有意不做**：
+它会引入第二份需长期维护的快照，而本次修好的恰恰是「手工能力表与远端漂移」
+这个毛病（`applyModelsDevCatalog` 把 models.dev 的「明确 false」吞成「未知」）。
+要做也只能标注为纯兜底、且远端优先。
+
+**真实报障**（用户 oct_heaven，2026-10-12）：`cline-pass/*` 整段时间贴不了图、
+读不了图，**只有重启才能恢复**（实测桌面端 10-11 23:02 启动 → 10-12 00:30
+仍稳定拒图）。
+
+**根因三处叠加**，第 3 条最隐蔽：
+
+1. **能力来源单一**：`cline-pass/*` 的条目与图片能力**只由 models.dev 提供**
+   （网关 `recommended-models` 实测只下发 14 条，models.dev 有 18 条）；
+2. **models.dev 经常拉不到**：目标 `api.json` **解压后 5.39 MB**、Brotli、
+   无 `Content-Length`；用户直连实测三次 = `20010ms 超时` / `20010ms 超时` /
+   `1908ms 成功` ⇒ **不是「慢」，而是「要么很快、要么整段挂住」**；
+3. ⚠️⚠️ **`remoteComplete` 判据漏了 models.dev**：`complete` 只反映**两个
+   Cline 端点**（`remote.complete`），而短路判据是 `if (this.remoteComplete)
+   return` ⇒ models.dev 超时后它仍为 `true` ⇒ **闸门的冷却永远读不到**
+   ⇒ models.dev 整个进程生命周期只被调 1 次。
+
+⇒ 修法：`complete && this.modelsDev !== undefined`。判据用「**读到过**」
+（含读到**空表** —— 上游确实没有 `cline-pass` 块时那也是「已就绪」，
+不该无限重试）。方向是「宁可多试一次」：多试只是多发一次请求（自带 TTL +
+闸门 30 秒冷却），漏判的代价是整个 provider 的图片能力永久失效。
+
+**同源的第二个坑（被三态改造暴露）**：`applyModelsDevCatalog` 原先写
+
+    ...entry.supportsImage ? { supportsImage: true } : {}   // false 被吞成「缺席」
+
+⇒ models.dev **明确说 false**（实测 `cline-pass/glm-5.3` 就是不带图的）时字段
+**缺席** ⇒ 三态下被读成「**未知**」，而它其实是「**确认不支持**」。
+两个方向都真实有害：宿主按「未知」**放行**图片（发到不支持图的服务端）、
+门禁文案说「能力尚未加载完成」。⚠️ 这条在**两态**下无害（两边都归 `['text']`），
+是三态改造**暴露**的。**两个入口都要改**（补缺分支 + 已有条目的合并分支）。
+
+**拉取健壮化**（同 issue 第 3 点）：超时 20s → **60s**、显式
+`Accept-Encoding: br, gzip`（Node 原生 `fetch` **默认不带**，一直在下 5.39 MB
+明文 —— 代价不只是慢，而是**极易撞上超时上限**）、ETag 条件请求。
+⚠️ **304 必须回落成上次的结果**，绝不能当成「空目录」（那会把所有模型的图片
+能力一次性打回纯文本）；⚠️ 服务端撤掉 ETag 时必须清空，否则一直带着失效的
+`If-None-Match`；⚠️ 没有上次结果却收到 304 时**抛错**，让调用方按「未就绪」
+处理 —— 返回空表就是把「没读到」说成「不支持」。
+
+**三态判定**（同 issue 第 1 点，通用纪律见 `misc.md`）：`inputModalitiesFor`
+必须判 `supportsImage === undefined`（**字段缺席**）而不是 `!== true`；
+未知时 `toCatalogEntry` **省略** `inputModalities`；`stream()` 门禁分流为
+`INVALID_REQUEST` + 可区分文案（**不用 `TRANSPORT`** —— 它在
+`DEFAULT_RETRYABLE_CODES` 里，会白重试 5 次）。
+⚠️ `cline` 已按 `model-catalog-parity` 的显式例外机制登记进
+`OMIT_UNKNOWN_MODALITIES` —— **不是把 buddy 的做法推广**，而是先确认了它
+确实存在「未知态」（能力来源会在进程运行中拿不到）。有些家的目录是编译期表
+恒可用、根本不存在未知态，那些**不**该加进来。
+
 ⚠️ **排障提示（本次顺带查明的第三种「看不到」）**：目录里有 14 条 `cline-pass`，
 但**用户的黑名单关掉了 10 条**（`~/.dsh/jet-hub/state.json` 的
 `disabledModels.cline`，实测 474 条 cline 模型被关），模型选择器里因此只剩
@@ -951,7 +1041,7 @@ POST /api/v1/chat/completions  model=cline-pass/deepseek-v4.1-flash
 |---|---|---|
 | 1 | 标记时长取值序：`retry-after` 头（秒数 / HTTP 日期，**0 是合法值**）→ **报文里的 `Try again in 19h 39m`** → 通用绝对时刻句式 → 兜底快照 | `src/cline-rate-limit.ts` 的 `clineRateLimitResetAt` |
 | 2 | `recordsClineRateLimit` **只认 429**（402 不写徽章，但仍换号 —— 「不写徽章 ≠ 不换号」） | 同上 |
-| 3 | cline 的 `resolveCredential` 接上 `throwIfAllAccountsRateLimited(CLINE, modelId)`，且**必须先于**单凭据 ref 兜底 | `src/index.ts` |
+| 3 | cline 的 `resolveCredential` 接上共享的限流判定助手（`throwIfAllAccountsRateLimited`），且**必须先于**单凭据 ref 兜底。⚠️ Task 6 起该判定已下沉进 `src/credential-resolver.ts` 的共享工厂：接线判据变成「cline 的工厂配置项把该助手交给了工厂」，不再是逐个 provider 的调用点文本 | `src/index.ts` |
 | 4 | 全部账号失败时按「免费额度 / 短时限流 / 402」给**三种不同**建议；**识别出语义就不再复述上游原文**（只在没识别出时附上），文案保持简短 | `clineExhaustedAdvice` |
 | 5 | 每个失败账号（含最后一个）都写标记 | `cline-adapter.ts` 的 `markLimited` |
 
@@ -1025,7 +1115,8 @@ HTTP 日期 / **★ 实测报文 → 19h39m，且文案**不含**原文、含「
 长度 < 150** / **★ 轮次用尽时最后一个账号也被标记** / 402 不写标记且文案含「充值」 /
 无池账号不写标记）、`tests/unit/retry-after.spec.ts`（10 条）、
 `buddy-ratelimit-misreport.spec.ts` 的「cline 同型缺陷」接线段（4 条）。
-⚠️ 已做**反向验证**：把「报文时长」那条分支短路 → 2 条变红；去掉循环后的补标记 → 2 条变红。
+⚠️ 已做**反向验证**：把「报文时长」那条分支短路 → 2 条变红；去掉循环后的补标记 → 2 条变红。
+
 
 ## ⚠️ Cline provider：`workos:` 前缀不可剥、免费集合动态下发
 
@@ -1904,3 +1995,80 @@ empty / 列表四个分支**全部**在 modalBody 里，只有 modalHead / modal
 
 顺带吸收参考实现的既有经验：时间列**定宽 82px**（防时间戳被截断）、
 模型名 `word-break: break-word`（长模型名不撑宽表格）。
+
+### ⚠️⚠️ 模型目录构建的 O(N²)：`remoteModels.find` 热点 + `resolveModel` 每次整份重建（issue IKL3YH）
+
+**用户报障**（Windows，DSH 桌面版）：宿主进程风扇周期性狂转 —— 每 ~15 秒被唤醒一次、
+持续 ~7 秒、峰值 1.1–1.5 核；Node inspector 函数级剖析的热点落在
+`toCatalogEntry → inputModalitiesFor`。用户自己做的 A/B 是「把 `.find` 换成 Map 索引后
+宿主 CPU 从 0.425 核降到 0.160 核」。
+
+**根因有两层，第二层才是主因**（用户只诊断出第一层）：
+
+1. `inputModalitiesFor` 对**每个**模型做一次 `this.remoteModels?.find(...)`。
+   实测**全仓该形态只有这一处** —— 其余家都是 `remoteMeta.get()` /
+   `fallbackIndex.get()` 或直接吃已解析的 entry。
+2. `resolveModel` 每次都 `await config.loadCatalog()` **整份重建** `CatalogEntry[]`。
+   DSH 的 `buildModelCatalog` 形状是「1 次 `listModels` + **每模型一次**
+   `resolveModelInfo`」（`dsh-api-session-controller` 的 `catalog.js`），而
+   `dsh-llm` 的 `resolveModelInfo` **直连适配器、不做任何缓存**
+   （`normalizeModelInfo` 只是校验）⇒ N 次调用造成 N² 次条目构造。
+
+实测（本仓 `lib/` 产物，宿主调用形状，3 轮中位数，N=471 的真实目录量级）：
+
+| 实现 | N=100 | N=471 | N=1000 |
+|---|---|---|---|
+| 修复前 | 13.6 ms | **312.6 ms** | **5498.7 ms** |
+| 修复后 | 0.5 ms | **1.5 ms** | **5.4 ms** |
+
+计数实验（N=471，一次宿主调用形状）：`inputModalitiesFor` 被调 **221,841** 次
+（= 471×471），`CatalogEntry[]` 被整份重建 **471** 次、每次 471 条。
+
+**同一处还掩盖着一个潜伏缺陷**：`inputModalitiesFor` 的搜索源只有 `remoteModels`，
+离线 / 首拉失败时它是 `undefined` ⇒ 兜底表里 `supportsImage: true` 的策划条目
+（`stealth/space-bunny-alpha`、`cline-free/mimo-v2.6-flash`、
+`cline-free/muse-spark-1.3-contributor`）被误报成**纯文本**（实测确认）。
+后果不是「少个功能」而是「支持图片的模型发不了图」—— DSH 见到不含 `image` 的
+声明会**静默把图片投影成文本占位符**，正是本文件 §「图片能力只查本地兜底表」
+记过的同型缺陷。
+
+**修法三条**（都在 `src/cline-adapter.ts`）：
+
+1. `toCatalogEntry(model)` **直接读 `model.supportsImage`** —— 手上就是那条条目，
+   回头拿 id 查表纯属多余。这同时修好了离线误报（兜底条目自己带该字段）。
+2. `catalogIndexFor(source)`：`stream()` 门禁用的 `id → 条目` Map 索引，**按来源数组
+   身份失效**（`.get()` 是 O(1)：221,841 次查找不再各扫 471 条）。
+3. `catalogEntries(source)`：按来源数组身份缓存 `CatalogEntry[]`。
+   ⚠️ **这一条是主因修复点**，别只做前两条（只做前两条仍留 121 ms/次）。
+
+**⚠️ 三个实现约束（各自都有反向验证）**：
+
+- **失效判据必须是「来源数组身份变了」，不能是「长度变了」**。目录补齐换的是
+  新数组，条数可能完全相同（用户改某个模型的图片能力、或换掉同数量的条目）
+  ⇒ 按长度判会一直用陈旧索引，**永不恢复**。`ensureRemoteModels` 每次落目录都赋
+  新数组（`this.remoteModels = merged`），身份判据因此天然正确。
+- **`fallbackCatalog()` 必须记忆化**：它是 `? :` 另一侧的来源，若每次返回新数组，
+  上面两个缓存的失效判据被**架空**（每调用一次就白建一份新缓存）—— 缓存等于没有，
+  且**症状完全静默**（只是慢，没有任何报错）。有用例专门守这一条。
+- **`stream()` 的门禁与目录必须同源**：`inputModalitiesFor` 自己也回落到
+  `fallbackCatalog()`（而不是只查 `remoteModels`），否则会出现
+  「`listModels` 说支持、发图被拒」的分叉。
+
+**反向验证（已做，逐条独立）**：去掉 `CatalogEntry[]` 缓存 → O(N²) 用例变红
+（实测 3660 次 vs 上限 120）；`fallbackCatalog()` 去掉记忆化 → 兜底路径用例变红；
+把索引失效判据改成比长度 → 「残缺目录重拉后等长但内容变了」用例变红；
+只还原 `inputModalitiesFor` → 「listModels 与 stream 判据同源」变红；
+两处一起还原（= 修复前）→ 「兜底条目的图片能力照常播报」变红。
+⚠️ 注意「**只**还原 `toCatalogEntry` 一处」**不会**变红 —— 那是**故意**的两道防线
+（纵深防御），不是漏守卫；要按上面那两条分别做。
+
+**⚠️ 规模是会变的**：以上数字取决于目录条数（实测生产 488 条 / 其中 466 条来自
+`/api/v1/models`）。O(N²) 的代价随 N 平方增长，**不要**按「才几百条、无所谓」判断
+—— N=1000 时单次就是 5.5 秒的同步阻塞，而它发生在**模型目录构建**路径上。
+
+**⚠️ 未在本机复现的一条**：用户称「每 ~15 秒重建一次」。master 里**找不到** 15 秒
+周期的触发源 —— DSH 客户端的 `ModelCatalogDirectory` 只在 4 个宿主事件上重拉
+（且有 `status === 'ready'` 短路），插件自己的 `catalog-prewarm` 是 **0/35s/75s
+三轮有界**，客户端两个轮询（5 秒 `readActiveProvider`、60 秒余额）都是**纯内存读**、
+不触达宿主目录重建。故周期数字**未定案**；但缺陷本身与周期无关：任何一次模型选择器
+打开 / 目录事件都会吃满一次 N² 重建。

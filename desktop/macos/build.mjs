@@ -5,6 +5,7 @@ import {createHash} from 'node:crypto';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import path from 'node:path';
 import {rebaseReleaseLinks} from './release-links.mjs';
+import {JETHUB_PACKAGE, JETHUB_LEGACY_PACKAGE} from '../../scripts/jethub-package.mjs';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(directory, '../..');
@@ -36,7 +37,7 @@ await cp(path.join(root, 'desktop-runtime/node_modules'), modules, {recursive: t
   filter: from => !['.cache', '.install-lock', '.DS_Store'].includes(path.basename(from))});
 
 const sources = {
-  'dsh-codearts-auth': 'vendor/dsh-codearts-auth', '@zseven-w/dsh-noema': 'vendor/dsh-noema',
+  [JETHUB_PACKAGE]: 'vendor/dsh-codearts-auth', '@zseven-w/dsh-noema': 'vendor/dsh-noema',
   'dsh-peer': 'peer', 'dsh-local-knowledge': 'knowledge', 'dsh-desktop-browser': 'desktop-browser', 'dsh-team': 'team',
   'dsh-desktop-chatgpt': 'desktop-chatgpt', 'dsh-appearance-center': 'appearance',
   'dsh-model-routing': 'model-routing', 'dsh-knowledge-workbench': 'knowledge-workbench',
@@ -50,6 +51,9 @@ for (const [name, relative] of Object.entries(sources)) {
   await cp(source, target, {recursive: true, verbatimSymlinks: true,
     filter: from => !rejected.has(path.basename(from)) && !/\.(?:log|bak|jks|keystore|p12|apk|aab)$/.test(from)});
 }
+// 旧路径只作兼容别名，不能注册第二份 provider/accountPool。
+await rm(path.join(modules, JETHUB_LEGACY_PACKAGE), {recursive: true, force: true});
+await symlink(JETHUB_PACKAGE, path.join(modules, JETHUB_LEGACY_PACKAGE));
 for (const file of ['chatgpt.js', 'chatgpt-page.html', 'chatgpt-account.js', 'chatgpt-protocol.js', 'chatgpt-adapter.js'])
   await cp(path.join(root, 'phone-account', file), path.join(modules, 'dsh-desktop-chatgpt', file));
 // The desktop version imports the shared skill receiver under this name.

@@ -620,3 +620,4 @@ export class TraeAuth extends Service {
         this.ctx.logger?.warn?.(`[trae-auth] ${message}`);
     }
 }
+//# sourceMappingURL=trae-auth.js.map

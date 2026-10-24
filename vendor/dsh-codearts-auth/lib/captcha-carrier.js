@@ -159,3 +159,4 @@ export class CaptchaCarrier {
         return { param: await this.mintWithChromium(options), source: 'chromium' };
     }
 }
+//# sourceMappingURL=captcha-carrier.js.map

@@ -4,6 +4,49 @@
 
 ## 常见开发任务（续：调试与协议排障）
 
+### ⚠️⚠️ 测试里取仓库路径**必须用 `fileURLToPath`，不能用 `URL.pathname`**（Issue IKLBSH A3）
+
+**真实缺陷**：`URL.pathname` 对路径里的空格做**百分号编码**
+（`D:\Vibe coding\…` → `/D:/Vibe%20coding/…`），而原先的
+`new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')`
+只修**盘符前缀**、**不修 `%20`** ⇒ 仓库路径含空格时 `readFileSync` 恒 ENOENT。
+
+⚠️ **症状极具误导性**：vitest 把它报成**整份 spec 收集失败**
+（`Error: ENOENT … scandir`，不是单个用例失败），看起来像测试基建坏了，
+而不是「路径判据错了」。且**本机路径不含空格时永远看不到** —— 本地全绿、
+报障者全红。
+
+修法：
+```ts
+import { fileURLToPath } from 'node:url'
+const here = fileURLToPath(new URL('.', import.meta.url))   // 目录，末尾带分隔符
+```
+
+⚠️ **`new URL('.', …)` 给的是目录，`URL.pathname` 给的是文件路径** ——
+换成 `fileURLToPath` 后**不要再套 `path.dirname`**：我改的第一版多套了一层，
+把 `tests/unit` 削成 `tests`，实测 ENOENT（`aggregate-panel-logic.spec.ts`）。
+
+**涉及 4 个 spec、6 处**：`aggregate-badge.spec.ts`、`aggregate-panel-logic.spec.ts`
+（1 处顶层 + 3 处函数内）、`auto-badge-restore.spec.ts`。
+
+⚠️ **反向验证的边界（对抗审计实测证伪了「可验证性」）**：把 6 处全部改回
+`URL.pathname` ⇒ 那 3 个 spec 在**本机当前路径（不含空格）下 98 条全绿**。
+即「改回去在本机全绿」——这条修复是**结构性**的，逐文件变异验证**测不出来**。
+
+⇒ 已补 `tests/unit/path-source-read.spec.ts`，用**两条互补判据**把它变成
+「所有人都会红」：
+1. **活体**：在临时目录里真建一个**含空格**的目录，断言
+   `fileURLToPath` 得到的路径**可读**、`URL.pathname` 得到的**不可读**
+   （阳性对照——若 Node 哪天改了 `pathname` 行为，该格会红）；
+2. **结构性扫描**：`tests/` 下任何 `import.meta.url).pathname` **用法**都判违规
+   （剥注释后匹配，避免把讨论该写法的注释误判）。此判据**与仓库路径无关**，
+   故在任意环境下都能抓住回归。
+
+⚠️ **该扫描必须排除它自己**：守卫 spec 的用例标题与报错文案里**必然**出现那串
+被禁写法（否则说不清「禁止什么」）—— 本 spec 第一版漏了这一步，**立刻自伤**
+（自己扫自己）。守卫类 spec 的惯例：`resolve(fileURLToPath(import.meta.url))`
+与扫描结果比对后剔除自身。
+
 - **响应根本不是 SSE**（网关直接回了 JSON，没有任何 `data:` 帧）：
   早期同样静默空结束。现抛错并**带上原文片段**，否则用户只能看到一个没有原因的失败。
 
@@ -550,6 +593,59 @@ textOut = stripBareThinkCloseTagIfEnabled(textOut)       // 兜底，默认关
 与 `text-chunks` 相隔 348ms、逐字相同、`outputTokens` 两者都计入）。
 **这是上游行为，不是我们的重复发射**（帧是独立的两条，非同一帧二次发射），
 **不需要处理**。
+
+#### ⚠️⚠️⚠️ 「没有任何报错就中断」怎么查（DSML 篇：内容凭空消失比标签泄漏更糟）
+
+用户报障（2026-10-13 晚）：**「用聚合 provider 的 ds v4.1 flash 发起会话很快
+就结束了没有原因」**、**「指定 codebuddy 的 ds v4.1 flash 重复执行后出现
+DSML tag 泄露并终止」**。怀疑与最近几个 DSML 提交有关。
+
+**排查路径（可复用）**：这类现象**无法靠读代码推断**，必须回会话日志。
+`inspect-session.mjs` 不在仓库里时，用 `zstdDecompressSync` 直接读
+`~/.dsh/sessions/<工作区转义名>/<session-id>/session.v4.jsonl.zstd`
+（工作区名把 `\` `/` `:` 换成 `-`）。三步：
+
+1. **找现场**：`model/selection` 事件给出每轮的 provider/model；
+   `assistant/message` 的 `data.message.content` 给出落盘的块。
+2. **看块结构与 finish**：只有 reasoning+text、零 tool-call、`finish=stop`、
+   usage 全 0 ⇒ 工具调用被吞（不是模型抖动）。
+3. **看原始 chunk 流**（`data.stream`）：`text-delta 数=0` 而 `block-end`
+   的 `block.text` 是整段原文 ⇒ 走的是 `flush()` 补回开标签那条路
+   ⇒ 提取器**从未认出**这个块。
+
+**本次真相**：模型输出
+
+```
+<｜DSML｜ calls>\n<｜DSML｜ invoke name="pwsh">\n<｜DSML｜ parameter name="command" string="true">…</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>
+```
+
+`｜DSML｜` 之后**带空格**，且 `invoke` / `parameter` 同样中招 —— 而归一正则
+`(<\/?)｜DSML｜\s*(?:tool_)?calls>` **只覆盖 `tool_calls` / `calls` 一种名字**。
+⇒ `indexOf(DSML_INVOKE_OPEN_PREFIX)` 恒不命中 ⇒ `parseDsmlToolCalls` 返回
+**空数组** ⇒ `in-dsml` 分支把它当「解析成功但无调用」⇒ **整段被静默丢弃**。
+
+⚠️⚠️ **`[]` 与「解析出一个调用」在旧实现里走同一支**（`toolCalls.push(...parsed)`，
+空数组 push 0 个）⇒ 静默。这是本仓库反复出现的那类缺陷的又一变体：
+**「空」被当成「正常的无」**。判据必须显式区分，且方向取「**宁可漏判不可误伤**」
+—— 放行原文让用户看得见，远比凭空消失好诊断。
+
+⚠️ **`aggregate` 为何也中招**：它只透传 `options` 给下层
+（`ctx.llm.stream({ provider: target.provider, model: target.realId })`），
+下层 codearts 注入 DSML 提示、模型写 DSML、解析器读不出 ⇒ **聚合层零改动
+也照样中招**。⇒ 这类缺陷的排查**不能停在聚合层**，必须追到真实 provider。
+
+**其它同型现场（同一根因的不同表现）**：
+
+| 表现 | 触发条件 |
+|---|---|
+| 内容凭空消失、`finish=stop` | 空格形态 + 空数组被当成功（**拆帧**路径） |
+| 690 字符 DSML 原文进 text 块 | 空格形态但**整帧**到达（`flush()` 补回开标签） |
+| `unknown tool "command"` | `parseDsmlInvoke` 在整块上搜 `name=`，误命中 parameter 名 |
+| 半修形态 `<｜DSML｜invoke` | `fixDsmlMarkers` 的 `DSML` 后前视漏了字母 |
+
+完整修法与守卫见 `providers-officeace.md` §5.6「第四次事故」，
+行为级守卫 `tests/unit/dsml-label-forms.spec.ts`（23 条，二分帧穷举），
+反向验证 `scripts/reverse-verify-dsml.mjs`（7/7 有效）。
 
 #### ⚠️ 正文（text 通道）死循环：必须**独立实例**且**绝不 `cancel()`**
 

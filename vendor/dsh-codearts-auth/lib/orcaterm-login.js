@@ -81,3 +81,4 @@ export function orcaTermNickname(credential) {
     }
     return '腾讯云 OrcaTerm';
 }
+//# sourceMappingURL=orcaterm-login.js.map

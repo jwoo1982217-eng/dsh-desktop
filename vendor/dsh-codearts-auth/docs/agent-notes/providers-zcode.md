@@ -1155,3 +1155,1104 @@ diff 里却带着这一整段 ⇒ 维护者按描述复审会放行一段未复�
 
 ⚠ 同批关联：IKJMQ5（CWD 竞态）与 IKJPBJ（墙钟定时器）由 PR #75 一并关联关闭。
 
+#### 六之补、⚠⚠ 那条结构判据**自己也漏了调用点** —— 单维度判据各漏一半（IKJS58 复核，2026-10-08）
+
+PR #75 + `9f133b0` 合入后，判据的**扫描域是「三个分支函数体 + 一个赋值点」**，
+而**调用点不在内**。于是把注入搬到调用方即可全绿（本机 Windows 实测）：
+
+```ts
+for (const candidate of browserCandidates({ home: process.env.USERPROFILE })) {
+```
+
+`zcode-browser-*.spec.ts` **34 条全绿**（含新加的两条结构判据）。它在
+「`USERPROFILE` 被沙箱/CI 改写」时与坏实现**行为等价** —— 正是本文件
+「### 2」要防的场景，只是换了个位置。
+
+**修这条判据时踩了多次坑 —— 结论是：判据需要「属性 + 位置」两个维度，
+但即便如此，纯文本判据也堵不住这类绕过。**
+
+| 版次 | 判据 | 漏掉的绕过（均实测） |
+|---|---|---|
+| 初版 | `process.env` **出现次数 == 1** | `process['env']`（无该字面量）、裸 `const p = process` |
+| 二版 | 只锁**属性名**白名单 `{platform, env, kill}` | `process.env` 搬到**调用点**（属性名 `env` 仍合法） |
+| 三版 | 加位置维度，用 `split(ENV_DEFAULT).join('')` **剔除** | ⚠ **自身缺陷**：剔除是全局的，把 `(input.env ?? process.env).USERPROFILE` 里的**坏用法连同合法串一起剔除** ⇒ 自豁免 |
+| **现版** | 属性白名单 **+** 位置用**计数 == 1**（不自豁免） | 见下方「原理上不可判定」清单 |
+
+⚠⚠ **`split/join` 剔除法是反例，别再用**：它让「合法串出现第二次」即可豁免自己。
+计数法（`process.env` 恰好 1 处）不会自豁免 —— 那个坏实现会数到 2 处、直接变红。
+（这条修正是**审计实测**发现的，不是推理。）
+
+⚠⚠ **`fnBody` 必须跳过参数列表**（本轮修的真实缺陷）：早期实现直接
+`indexOf('{', start)` 取第一个 `{` —— 对 `browserCandidates` 这种**参数是对象
+字面量类型**的函数，那个 `{` 落在**参数类型注解**里，于是「函数体」只截到
+`{ platform?: …; env?: … }` 就结束（实测 len=103），**真正的函数体一行都没扫到**
+⇒ 依赖它的断言**静默恒真**。修法：先按圆括号配对跳过参数列表，再取 `{`。
+这次是「扫描类断言必须自带护栏」的又一实例。
+
+⚠⚠ **判据只扫候选链的 5 个函数体，不扫全文件**：扫全文件会让
+`process.pid` / `process.hrtime` / `process.stdout` / `process.env.NODE_ENV`
+这类**与家目录无关**的新增用法全部**假失败**（审计实测 4 例）。
+窄域把假失败面压到「与家目录真正相关的区域」。
+
+⚠⚠ **裸 `process` 的负前瞻不能用 `\s*`**：`\s` 会**跨行**，
+`const p = process` + 换行 + 下一行的标识符被当成续接，负前瞻失效
+⇒ 实测漏掉「裸 process 别名」这条。必须用 `[ \t]*` 限定同行。
+
+⚠⚠ **`process . env`（点前后空白）必须归一**再判：`process.  env` 不含
+`process.env` 连续字面量，会**同时**绕过位置维度与正向锚定 ⇒ 实测全绿。
+现版先 `.replace(/process\s*\.\s*env\b/g, 'process.env')` 归一。
+
+#### 六之补二、⚠⚠⚠ 两轮独立审计的结论：**纯文本判据原理上堵不住这类绕过**
+
+我为此开了两个 subagent（一个审计、一个**对抗审计**），两者**各自独立**
+找到同一类关键绕过。以下是必须记住的部分 —— 比上面那条判据本身重要。
+
+**审计实测出的漏网清单**（全部让结构判据 9/9 全绿）：
+
+| 漏网手法 | 机制 | 能否被文本判据堵住 |
+|---|---|---|
+| `import proc from 'node:process'` → `proc.env.USERPROFILE` | 进程对象可从**别的模块名**导入 | ❌ 只能加黑名单，不穷尽 |
+| `import { env as hostEnv } from 'node:process'` | 同上（具名导入） | ❌ 同上 |
+| `const p = process as NodeJS.Process` → `p.env.USERPROFILE` | `as` **断言改名** | ❌ 同上 |
+| `env[['USER','PROFILE'].join('')]` | `env` 是**合法参数**，属性名可计算 | ❌ **文本层不可判定** |
+| `eval('pro'+'cess')['env']['USER'+'PROFILE']` | 动态求值 | ❌ **原理上不可判定** |
+| `env.VITEST ? home : 偷env` | **测试环境自检测** | ❌ 跑在 vitest 下就规矩，**任何在用测试都抓不到** |
+| `input.platform === undefined ? 偷env : home` | **条件门**：只在生产调用形态使坏 | ✅ **已由行为判据封死** |
+
+**⇒ 真正守住这条性质的是行为判据，不是结构判据。**
+
+新文件 `tests/unit/zcode-browser-home-source.spec.ts` 用
+`vi.mock('node:os')` 把 `homedir()` 换成**哨兵值**、
+`USERPROFILE` 换成**另一个哨兵** —— 两者不再相等，「实现到底读了哪一个」
+直接体现在输出里。这**破解了本文件「### 2」那条论断**：
+
+> ~~「Windows 上 `homedir()` ≡ `USERPROFILE`，行为判据不可能区分，只能结构判据」~~
+
+那个论断对**「改 env」**成立，但**漏了一条出路：不改 env，改 `homedir()` 本身**。
+
+⚠⚠ **三条设计要点，缺一条判据就废**（都是实测踩出来的）：
+
+1. **导入时机**：`vi.mock('node:os')` 要在**模块顶层注册**，但被测模块必须在
+   `beforeAll` 里 `await import()` —— 在模块顶层 `await import()` 会让
+   `zcode-captcha.ts` 拿到**真实** `node:os`（Windows 上真实 `homedir()` 恰好
+   就读 `USERPROFILE`），于是**正确实现被误判成红**。
+2. **必须有无参入口用例**：显式传 `platform` 的用例挡不住条件门 ——
+   生产入口 `findBrowserExecutable()` 是 `browserCandidates()` **无参**调用。
+   该用例钉 `process.platform = 'win32'`（`Object.defineProperty` 实测可行，
+   否则判据又退化成「只在 Windows 成立」＝ IKJS58 的病根本身），
+   把 `USERPROFILE` 指向**种好 exe 的临时目录**，断言输出不含该目录。
+3. **测试环境自检测（`VITEST` 门）目前无解**：它让**任何**在用 vitest 判据都
+   看到干净行为。要抓它只能靠**外挂验证**（进程外打包 + 哨兵 shim，无 `VITEST`）——
+   本轮红队就是这么证实「生产已坏」的。**别指望单测能抓这一类。**
+
+**两条判据是互补的，不是冗余**（双向实测）：
+
+| 变异 | 结构判据 | 行为判据 |
+|---|---|---|
+| V2 调用点传 `process.env.USERPROFILE` | 🔴 抓住 | 🟢 漏（不经调用点） |
+| `env[evilKey]` / 条件门 | 🟢 漏 | 🔴 抓住 |
+
+⇒ 结构判据**不能删**（V2 只有它能抓），但注释必须写明**「不穷尽」**，
+且必须配那条无参入口行为用例。
+
+**收尾反向验证矩阵**（12 格，实测全符合预期）：
+
+| 变异 | 类型 | 结构 | 行为 |
+|---|---|---|---|
+| V1 默认链加 `?? process.env.USERPROFILE` | 破坏 | 🔴 | 🔴 |
+| V2 调用点传 `process.env.USERPROFILE` | 破坏 | 🔴 | 🔴 |
+| U2 `process.  env`（点后空格） | 破坏 | 🔴 | 🔴 |
+| V3 `env` 计算属性名 | 破坏 | 🟢 | 🔴 |
+| **M3 条件门** | 破坏 | 🟢 | 🔴 |
+| **M10 `node:process` 导入 + 条件门** | 破坏 | 🟢 | 🔴 |
+| D1 死代码 `void process.env.USERPROFILE` | 死代码 | 🔴（刻意） | 🟢 |
+| F1~F5 无辜（`process.pid`/`hrtime`/`NODE_ENV`/注释/`platform`）| 无辜 | 🟢 | 🟢 |
+
+**可复用教训（比本条本身更重要）**：
+
+1. **单维度判据会漏**：「属性名对」不等于「位置对」。写白名单时先问
+   「**这个白名单元素允许出现在任意位置吗**」——不允许就得再加位置维度。
+2. **锚定标识符，不锚定字面量**：`process.env` 是字面量，`a['env']` 绕过它。
+3. **负前瞻的 `\s` 会跨行**，导致断言**静默恒真**（与它要防的问题同型）。
+4. **`split/join` 剔除法会自豁免**：让合法串出现第二次即可豁免自己。
+   用计数，别用剔除。
+5. **扫描类断言必须证明「真扫到了东西」**：本轮 `fnBody` 因没跳过参数列表，
+   把「函数体」截成了参数类型注解 ⇒ 断言静默恒真。
+6. **反向验证矩阵必须校验「确实执行了」**：本轮首次跑矩阵用
+   `execFileSync('npx', …)` —— Windows 上 `npx` 是 `npx.cmd`，直接 `ENOENT`，
+   输出为空被误判成 GREEN，**「32/32 全绿」其实是没跑**。
+   ⇒ 矩阵必须自带护栏（含目标 spec 名、解析到 `Tests N failed/passed`、
+   退出码与解析一致）。红队还实测到**多行 `old_string` 匹配会因 CRLF/LF
+   变动静默失败**，导致「变异没施加却显示全绿」—— 必须断言 marker 存在。
+7. **纯文本判据的能力边界要写进注释**：本轮注释先写了「根治手段」等过强措辞，
+   审计立刻证明它 7 类漏网。**注释降调不是自我否定，是防止后人误信。**
+
+## ⚠️⚠️ 额度是**按模型分桶**的：8M = 3M(GLM-5.3) + 5M(GLM-5.3-Flash)（真实缺陷，2026-10-12）
+
+**用户报障原文**：
+
+> 智谱账号送的 8m 算力其中分为 5.3-3m 和 5.3flsh-5m，插件判断这个账号没用完，
+> 就不会切换下一个账号使用……可否判定 plan 中的 token 是属于哪个模型专属的
+
+### 一、判据确实存在，而且是上游直接下发的（本机只读实测）
+
+`scripts/probe-zcode-plan-buckets.mjs`（只发 GET，零额度、零 captcha）实测启用账号：
+
+```json
+[bucket] plan_id="zcode-v3-start-plan-0817"  entitlement_id="ent_2_0817_glm_5p3"
+         show_name="GLM-5.3"        capabilities=["model:glm-5.3"]
+         total_units=3000000        remaining_units=3000000
+[bucket] entitlement_id="ent_2_0817_glm_5p3f"
+         show_name="GLM-5.3-Flash"  capabilities=["model:glm-5.3-flash"]
+         total_units=5000000        remaining_units=5000000
+```
+
+⇒ **8M 就是这两个桶（3M + 5M）**，且每个桶带 `capabilities: ["model:<小写 id>"]`
+—— 这是**模型专属**的权威判据。另有 `entitlement_id`（**只作排查用**，
+命名约定改版就可能变，**不参与判定**）。
+
+### 二、缺陷根因：全桶汇总把「某模型专属桶已尽」冲掉了
+
+`zcodeExpiry` 的判据是**全桶汇总**的 `balance.remaining > 0`，它**不接收也不判断
+modelId**。于是 GLM-5.3 的 3M 烧光、Flash 的 5M 还在时：
+
+| 层 | 行为 |
+|---|---|
+| 折算（`zcodeExpiry`） | `remaining = 5M > 0` ⇒ 该渠道「有额度、可用」 |
+| 选型（auto / aggregate） | 该 zcode 仍进候选，可能被派发 **GLM-5.3** |
+| 池的按模型过滤 | `modelRateLimits['GLM-5.3']` 仍是空的（**只有真撞墙后才写**）⇒ 问不出东西 |
+| 结果 | 请求发出 → 上游报额度用尽 → **才开始**换号（用户看到的「不切换」） |
+
+且 `ZcodeBalanceBucket` 此前**根本没有 `capabilities` 字段** ——
+`fetchZcodeBalance` 把它整体丢弃，判据无米下锅。
+
+### 三、修法（新模块 `src/zcode-entitlements.ts` + 折算层写池标记）
+
+1. `zcode-upstream.ts` 补读 `capabilities` / `entitlement_id`；
+2. 新模块 `zcode-entitlements.ts` 提供**纯判据**：
+   `bucketCoversModel` / `entitlementForModel` / `exhaustedModelsOf`；
+3. `zcodeExpiry` 在**已经拿到 balance 的那一次**顺带算出「哪些模型已尽」，
+   经注入的 `markModelsExhausted` 写进账号池 ⇒ **零额外网络请求**
+   （实测报文验证，见 `scripts/verify-zcode-entitlement-scenarios.mjs` 的 7 场景）。
+
+`ProviderRuntime.expiry.credentialExpiry` 因此多了**可选**第二参
+（`accountId` / `catalogIds` / `markModelsExhausted`）—— 另外 6 家**一行都不用改**
+（它们忽略第二参），这是刻意的「可选能力由实现自己声明」模式。
+
+### 四、⚠⚠⚠ 四个最容易写错的格（都做过反向验证）
+
+| 格 | 错误写法 | 后果 |
+|---|---|---|
+| **通用桶**（无 `capabilities`） | 判成「不覆盖任何模型」 | 赠送的 1 亿通用额度被忽略 ⇒ **误封**一个可用账号到次日 |
+| **证据不足**（`bucketCount === 0`，如 GLM-5.2 在本机账号上没有专属桶） | 判成「已尽」⇒ 写标记 | 上游字段漂移时会**一次封掉整个渠道**、用户无法自愈 |
+| **查不到余额**（网络 / 401 / 500） | 当「已尽」 | 同上，且**每次抖动都封一天** |
+| **写标记走 `updateModelRateLimit`** | 顺手复用它 | 它末尾会**沉底**账号 ⇒ 用户每次 auto 选型都看到**账号顺序莫名变化** |
+
+⚠️ **通用桶必须参与判定**（这是用户明确要求的兼容格）：
+
+> 同时要兼容之前除了 8M 的 2 种模型的专用 tokens 外还有赠送的 1 亿 token
+> 专用的用光了赠送的还在也不切换
+
+语义是**取并集**：「专属额度」与「通用赠送额度」都能承接同一个模型，
+**两边都见底**才判该模型已尽。故判据是「覆盖该模型的桶里**任意一个**还有余额」
+（通用桶覆盖一切 ⇒ 它还有余额时任何模型都不会被判已尽）。
+
+⚠️ **专用池 vs 通用池的消费顺序未实测**：用户提到「先花赠送的每日积分、再花专用积分
+则现状已涵盖」。我们**只按余额判**，不假设顺序 —— 任何一方还有余额就不标，
+故顺序如何都不影响正确性（这也让该分支**无需实测**）。
+
+### 五、⚠ 大小写：上游小写 vs 目录大写（本缺陷最容易写错的一点）
+
+| 来源 | 形态 |
+|---|---|
+| 上游 `capabilities` | `model:glm-5.3` ← **小写** |
+| `client/configs` 的 `builtinModels[].modelId`（= DSH 目录 id） | `"GLM-5.3"` ← **大写** |
+
+而池的过滤是 `a.modelRateLimits[modelId]` **精确匹配**（`modelId` 来自 DSH 的
+**大写**目录 id）⇒ 拿小写去写**永远不命中**，且**零报错**（静默失效）。
+
+⇒ 三个环节各自处理，**不需要**额外的归一化函数：
+`modelOfCapability` 统一小写输出 → `bucketCoversModel` 两边都小写再比 →
+`exhaustedModelsOf` 直接回**传进来的** `catalogIds` 元素。
+
+⚠️ **初版写过一个 `normalizeModelId` 专门做这件事，反向验证实测它零生产调用方**
+（上面三格已覆盖）⇒ **已删除**。别再加回来：那是「看起来像关键防线、
+实际没有读者」的代码。同批还删掉了 `entitlementOfBalance`（同样零调用方）。
+
+### 六、回归与反向验证
+
+- `tests/unit/zcode-model-entitlements.spec.ts`：读数（含
+  `capabilities` 缺失 ⇒ `undefined` 而非 `[]` 的三态区分）/ 纯判据逐格 /
+  `exhaustedModelsOf` 的 8M 两桶与通用桶全组合 / **端到端写池 + 不沉底** /
+  折算值不受写标记影响。
+  ⚠️ **本文件刻意不写条数**：初版写「43 条」而实测已 61（条数是**必然腐坏**的快照，
+  本仓库为此专门记过一条约定）。**条数以 `pnpm test` 输出为准。**
+  ⚠️ 另：本节所有「实测」都指向 `scripts/*.mjs`，而那个目录被 `.gitignore` 忽略
+  ⇒ **证据不随提交分发**（审计指出的可复核性问题）。要复核须拿到脚本内容，
+  或按本节写明的判据自行重跑。
+- **四轮反向验证**（均实测能抓住回归）：
+  | 变异 | 变红条数 |
+  |---|---|
+  | 通用桶改成「不覆盖」 | **5**（含端到端那条） |
+  | 两层大小写归一化都删 | **14**（含端到端） |
+  | 证据不足也判「已尽」（危险方向） | **7**（含「空桶」「无覆盖桶」两格） |
+  | 写标记改走 `updateModelRateLimit`（沉底） | **1**（专为它加的契约用例） |
+- ⚠️ **「不沉底」那条用例初版是假绿**：它让探针跑一轮再看顺序，而桩 fetch 对
+  两个账号返回同一份余额 ⇒ **两个都被标记** ⇒ 若实现会沉底恰好沉底两次、
+  顺序回到原样 ⇒ 用例照样绿（变异实测确认）。改成**直接测池方法**并只标第一个
+  账号，同时加一条**反向对照**（`updateModelRateLimit` **必须**沉底）——
+  没有那条对照，「顺序不变」在沉底功能被整体删掉时也会绿。
+- ⚠️ **纯函数用例挡不住「函数没有调用方」**：初版给 `entitlementOfBalance` 写了
+  5 条三态用例、全绿，而它**零生产调用方** ⇒ 生产路径的保守性完全无人看守。
+  现已全部改打在 `exhaustedModelsOf` 上。
+
+取证脚本（**均只读、零额度**）：`scripts/probe-zcode-plan-buckets.mjs`（桶结构）、
+`scripts/probe-zcode-model-id-casing.mjs`（两边大小写对比）、
+`scripts/verify-zcode-model-entitlements-live.mjs`（真实报文过生产解析）、
+`scripts/verify-zcode-entitlement-scenarios.mjs`（7 场景行为对照，零网络）、
+`scripts/verify-zcode-direct-selection.mjs`（直选路径读标记，含反向对照）、
+`scripts/verify-zcode-routing-effect.mjs`（真实池 3 账号的改道效果 + 不沉底）、
+`scripts/verify-zcode-marker-latency.mjs`（60 秒滞后窗口）、
+`scripts/verify-zcode-marker-race.mjs`（并发写不丢标记）、
+`scripts/verify-zcode-catalogids-lazy.mjs`（只有 zcode 读目录）、
+`scripts/verify-zcode-available-vs-remaining.mjs`（口径同源）、
+`scripts/verify-zcode-abort-and-marker-failure.mjs`（标记失败不影响折算）、
+`scripts/verify-zcode-string-units.mjs`（**字符串额度字段 ⇒ 不得误封整天**）、
+`scripts/verify-zcode-fallback-bypass.mjs`（回退绕过标记的边界）、
+`scripts/verify-zcode-mark-self-heal.mjs`（额度恢复自愈）、
+`scripts/verify-zcode-real-model-strings.mjs`（**真实会话日志**里的 model 形态 —— 键假设的唯一权威）、
+`scripts/verify-zcode-catalog-edge.mjs` / `verify-zcode-blank-key.mjs`（目录空白 id 边界）。
+
+### 七、⚠ 覆盖边界：标记**写在折算时**，但**读在两个路径上**
+
+分清「谁写」与「谁读」——这决定了当前收益的准确范围：
+
+| | 路径 | 会写标记吗 | 会**读**标记吗 |
+|---|---|---|---|
+| auto / aggregate | 选型时调 `createExpiryProbe` | ✅ **是**（本轮的落点） | ✅（`availableByModel` / `hasUsableAccountFor` 按模型问池） |
+| **对话框里直选** `zcode/GLM-5.3` | `zcode-adapter` 的 `resolveCredential(model)` | ❌ **不写**（不经过折算） | ⚠️ **只在池那一层读**（见下方两个边界） |
+
+⇒ 准确的收益是：
+
+1. **auto / aggregate 不再选中「该模型已尽」的账号**（本轮修的主症状）；
+2. 直选路径**只要标记已被任何一次折算写下、且池里还有别的未标账号**，
+   也会立刻被过滤掉 —— 即修复**不需要**等用户先撞一次墙。
+
+⚠️⚠️ **第 2 条有两个必须说清的边界**（对抗审计实测 2026-10-12，我已独立复现）：
+
+| 边界 | 事实 |
+|---|---|
+| **池被该模型筛空时，`fallback` 会绕过标记** | `createCredentialResolver` 在池返回 `null` 时落 `fallback`，而 zcode 的 fallback 是 `zcode.current()` —— 它**既不看 `enabled`、也不看 `modelRateLimits`** ⇒ 单账号或全池标尽时**仍返回凭据**，请求照常发往已尽的模型。实测：`scripts/verify-zcode-fallback-bypass.mjs`（场景①② 返回 `jwt-zcode-A`；场景③「只标 A、B 未标」正确取到 B）。 |
+| **这是既有设计，不是本轮的缺陷** | `src/index.ts` 在 2026-10-06 实测后**刻意**保持原样（注释原文：「zcode 没有 IKJOZ9 的症状，不该被『顺手修』；加判定反而会把本来能跑通的一发变成硬失败」）。⚠️ 但本轮**改变了它的后果**：以前只有「真撞限额」才写标记，现在折算层会**主动**写 ⇒ 绕过路径被触发的频率显著上升。 |
+
+⚠️ **两个方向的处置都未做，理由如实登记**：
+- **不改 fallback**：那是刻意的既有语义（见上），改它需要重开 IKJOZ9 的判定；
+- **不改文档口径**：故本条**如实写成两半**，不再宣称「直选一律认标记」。
+
+⚠️ 准确的表述是：**标记只在「池查询」这一层生效**；`fallback` 是它之外的一条旁路。
+
+⚠️ **第 2 条不是推断，已用生产代码路径实测**
+（`scripts/verify-zcode-direct-selection.mjs`：真建账号池 + 真的
+`createCredentialResolver`，零网络）：
+
+| 步骤 | 结果 |
+|---|---|
+| ① 无标记时直选 `GLM-5.3` | 取到 `zcode-A`（手动序第一） |
+| ② 给 A 写下 `GLM-5.3` 已尽后直选 `GLM-5.3` | 取到 **`zcode-B`**（A 被过滤） |
+| ③ 直选 `GLM-5.3-Flash`（A 未被标记） | 取到 **`zcode-A`**（未误伤） |
+
+⚠️ 第 ③ 格是必需的**反向对照**：没有它，「取到 B」可能只是因为池顺序变了。
+
+⚠️ **真实选取路径的端到端实测**（`scripts/verify-zcode-routing-effect.mjs`：
+真账号池 3 个账号 A/B/C，A 手动序第一且在 `GLM-5.3` 上已尽）——
+这一条回答的是「**修复有没有真的让请求改道**」，而不只是「池里有标记」：
+
+| 查询 | 取到的账号 | 期望 | 含义 |
+|---|---|---|---|
+| `GLM-5.3` | **`zcode-B`** | B | ★ 已尽的 A 被跳过（本缺陷主症状已修） |
+| `GLM-5.3-Flash` | **`zcode-A`** | A | A 未被误伤（手动序优先仍生效） |
+| 空 `modelId` | **`zcode-A`** | A | 空串跳过模型过滤（既有语义未变） |
+| 写标记后的顺序 | `[A, B, C]` | 不变 | ★ **不沉底** |
+
+⚠️ 最后一行与「A 在 Flash 上仍取得到」是**一对**：它们共同证明标记是
+**按模型**的，不是把账号整体封掉。少任一条，都可能掩盖「误封」这一危险方向。
+
+⚠️⚠️ **但上面全部用我自己构造的 model 字符串** —— 键形态若与**真实请求**不符，
+标记仍会是永不命中的死键，而**单元测试抓不到**（它们用同样的构造字符串）。
+⇒ 用**真实会话日志**当裁判（`scripts/verify-zcode-real-model-strings.mjs`，
+扫 781 个会话文件提取 `{provider:'zcode', model}` 的实际取值）：
+
+```
+"GLM-5.3-Flash"   x1359        ← 只出现这一个
+```
+
+⇒ 形态与目录 id **完全一致**（大写、无 ` · x0.1` 后缀）⇒ 修复写入的键
+**确实能被真实请求命中**。这是「键形态」假设的唯一权威依据，
+**不要只靠单元测试就认为它成立**。
+
+⚠️ 仍未覆盖的一格：**冷启动后从未跑过 auto/aggregate、用户直接选模型**时，
+标记还没被写下（折算层没跑过）⇒ 那一发仍会发出去，由上游拒绝后走既有的
+`switchAccountOnQuota` 切号（= 修复前的行为）。
+
+⚠️ **还有一个 60 秒的滞后窗口**（本机实测，`scripts/verify-zcode-marker-latency.mjs`）：
+写标记发生在 `zcodeExpiry` **真的被调用**时，而它有 `EXPIRY_CACHE_TTL_MS`（60 秒）
+缓存 ⇒ 「上一次折算时某模型还有额度、之后被烧光」的那个窗口内，缓存命中会
+**跳过 `zcodeExpiry`**，于是标记最长晚 60 秒才写下（清缓存后才写，实测已确认）。
+
+| 时刻 | 折算值 | 是否写标记 |
+|---|---|---|
+| 首次折算（GLM-5.3 还有 3M） | 当日 24:00 | 否（都还有额度） |
+| 上游已烧光，**同缓存窗口内**再折算 | 与上次相同（缓存命中） | **否**（这就是滞后） |
+| `clear()` 之后 | 当日 24:00 | ✅ 写下 `GLM-5.3` |
+
+⚠️ 这**不是回归**：修复前该窗口同样是「不写标记且继续派发」（永久如此），
+现在只是把它压缩到 60 秒。要彻底消除仍需下面的请求前预检。
+
+若要连这些格子也短路，需在 `zcode-adapter.ts` 发请求前加一次按模型的预检
+（一次本地 TTL 缓存命中的余额查询）——**本轮刻意未做**：它会引入
+「每次请求都可能查余额」的新路径与新的缓存一致性面，而收益只是省下
+**冷启动后第一次**那一发。留待有实测需求时再评估。
+
+### 八、⚠️ 独立审计（2026-10-12，subagent 驱动）
+
+本轮改动经过**两个独立 subagent** 的审计：一个做常规代码审计、一个做
+**对抗性审计**（在隔离副本里跑 53 个变异，专门找「测试全绿但生产行为错」的洞）。
+对抗审计交出 **8 个真实覆盖漏洞 + 1 个致命接线漏洞**，本轮已逐条处置。
+
+#### 八之1 ★★★ 审计发现的**死锁**：折算取号被自己写的标记筛空
+
+**这是本轮最有价值的发现，且它比我修的原缺陷更严重。**
+
+`createExpiryProbe` 取号时传的是 `probeModel = firstModelIdOf(provider)`，
+而 `listAvailableCredentials(provider, probeModel)` **按模型过滤** ⇒
+
+| 步骤 | 发生什么 |
+|---|---|
+| ① | 某次折算把「`GLM-5.3-Flash` 已尽」写进 `modelRateLimits` |
+| ② | 下次折算取号 `listAvailableCredentials(provider, 'GLM-5.3-Flash')` **被过滤** ⇒ 账号筛空 |
+| ③ | `credentials.length === 0` ⇒ 返回 `UNUSABLE` ⇒ **折算根本没跑** |
+| ④ | 于是既清不掉标记、也写不了新标记 ⇒ 挂到次日 0 点 |
+| ⑤ | **整个 zcode 渠道**在这期间对 auto / aggregate 不可见 |
+
+⚠️ 生产 `probeModel` = 目录**第一个**模型 = 兜底表的 `GLM-5.3-Flash`
+—— **正是用户实际一直在用的那个模型**（真实会话日志 1359 次）⇒ 不是边角情形。
+
+**修法**：折算取号改传**空 `modelId`**（= 「不按模型过滤」的既有语义）。
+依据：折算问的是「这个渠道整体最早何时作废」，与**哪个模型**无关；
+按模型过滤在这里**多余**（派发前已有 `hasUsableAccountFor` /
+`filterByModelAvailability` 按真实模型复核）且**有害**（上面的死锁）。
+
+⚠️ **回退路径（`legacySingleCredential`）刻意保留 `probeModel`**：
+`auto-adapter.spec.ts` 有一条**明确禁止空 modelId** 的既有用例
+（「取代表账号时不得用空 modelId（会让限流过滤整体短路）」），它守的是
+**另一个真实缺陷**（空 modelId 让限流过滤失效 ⇒ 把请求发给正在限流的账号）。
+两者冲突 ⇒ 分路径处理；回退路径的死锁形态**如实登记为残余风险**（它只对测试桩可达）。
+
+#### 八之2 ★★ 审计发现的**误封整天**：额度字段读不出来时被判「已尽」
+
+`zcode-upstream.ts` 的 `num()` **只认 `number`**（它自己的注释登记了这一点）。
+上游把 `remaining_units` 下发成 `"3000000"`（字符串）时两个额度字段都是
+`undefined` ⇒ 判据按 0 处理 ⇒ **所有模型都被写持久标记 ⇒ 账号锁死到次日**。
+
+⚠️ **这是本轮放大**的后果：旧行为下同一字段问题只让折算短暂 `UNUSABLE`
+（下一轮自愈），现在会写**持久**标记。实测：`scripts/verify-zcode-string-units.mjs`。
+
+**修法**：`entitlementForModel` 新增 `unreadableBuckets` 计数，
+`modelsByEntitlement` 要求 `unreadableBuckets === 0` —— **读不到时既不写也不清**
+（清也需要正向证据）。原则与「空桶 / 无覆盖桶不标」同一条：**读不到就不猜**。
+
+#### 八之3 ★★★ 审计发现的**接线零守卫**：判定范围（功能规模）无人看守
+
+把 `src/index.ts` 的 `catalogIdsOf` 接线**改名失效**，相关 spec **85 条全绿**，
+而生产行为退化成「判定范围只有 `probeModel` 一个模型」⇒ 需求「两个专属桶都烧光
+⇒ 两个都标」只标得动一个。
+
+⚠️ 根因：本文件的用例全传**手写桩** `catalogIdsOf: async () => [...CATALOG]`
+—— 它们证明「拿到一份目录时算得对」，**完全不证明生产装配真的给了那份目录**。
+
+**修法**：新增「接线守卫」段（源码结构 + 行为对照两条互补），
+并做反向验证确认「改名失效」与「只取 models[0]」都会变红。
+
+⚠️ **结构判据本身踩了一个坑**：初版写 `expect(src).toContain('catalogIdsOf')`
+—— 改名成 `catalogIdsOf_DISABLED` **仍然命中**（子串匹配）⇒ 变异照样全绿。
+改用**键形态锚定** `[\s{,]\s*catalogIdsOf\s*:`（`\b` 拦不住 `_`，它是词字符）。
+
+#### 八之4 其余 5 条可闭合漏洞（已补用例，逐条反向验证过）
+
+| 变异 | 缺失的格子 | 补的用例 |
+|---|---|---|
+| `N04` 写标记丢 `...current` | 分两批标不同模型时，先标的被抹掉 | 「先标 Flash、再标 GLM-5.3 ⇒ 两条都在」 |
+| `M31` 空 `accountId` 守卫翻成 `>= 0` | 空 accountId 不得写标记 | 「空 `accountId` ⇒ 不写任何标记」 |
+| `M04` 去掉 `seen` 去重 | 目录含重复 id | 「重复项被去重」 |
+| `M09` 丢弃 `available_units` | 两字段不一致时以 `available_units` 为准 | 「不一致时口径与汇总同源」 |
+| `M17` 折算去掉 `remaining > 0` | 已尽桶带更早 `expires_at` | 「不得取已尽桶的更早时刻」 |
+
+⚠️ 另有两条由**审计的 scratch 探查**暴露、我随后修掉的缺陷（不在上表内）：
+
+| 缺陷 | 事实 | 修法 |
+|---|---|---|
+| **abort 被吞**（`s3-C`） | 写标记那段的 `try/catch` 初版是**裸的** ⇒ `catalogIds()` / `markModelsExhausted` 抛出的 `AbortError` 被静默吞掉、折算照常返回值。违反本模块铁律「**abort 立刻抛，绝不折算**」（该缺陷在本文件已被踩过三次）。 | `catch` 里加 `if (isAbortError(error)) throw error`。⚠️ **只判这一条**：`zcodeExpiry` 的签名里没有 `signal`，故 `signal?.throwIfAborted()` 不可用 —— 如实登记为「唯一一处判据少于其它 catch」，原因是签名差异。 |
+| **额度读不出来 ⇒ 误封整天** | 见下一节（八之2 已在正文登记），⚠️ 其**独立复现**由 `scripts/verify-zcode-string-units.mjs` 给出。 | `unreadableBuckets` 守卫 |
+
+⚠️ **审计的 12 个 `scratch-*.spec.ts` 实际残留在工作区**（报告的「已清理」不准确）
+—— 已备份后删除。其中 4 个探查（`clearrl` / `selfpoison` / `mech` / `abort`）各有价值：
+`clearrl` 查出「清除路径是否会误清限流标记」（结论：zcode 只有一种标记形态、
+**都是**「次日 0 点」，故清除即正确的自愈，不是误清）；
+`mech` 与 `selfpoison` 佐证了标记在池层的实际效果与自愈。
+
+#### 八之5 ★★★ 审计发现的**两种标记语义互相打架**（死循环，比原缺陷更严重）
+
+**这是第一个审计（代码审计）报的唯一「当前仍存在」的 IMPORTANT，我独立复现了。**
+
+`modelRateLimits` 是**一张共用表**，两个来源写的**键与值完全相同**
+（`accountId` + `modelId` + UTC+8 次日 0 点）：
+
+| 来源 | 语义 | 证据强度 |
+|---|---|---|
+| `updateModelRateLimit`（各适配器） | **撞墙**：上游真的拒绝了 | **强**（一次真实失败的请求） |
+| `markModelsExhaustedForExpiry`（折算观测） | 余额接口说该模型没额度了 | 弱（可能滞后 / 口径不同） |
+
+而折算**每轮选型都跑** ⇒ 我新加的清除路径**无条件**删键，把适配器刚写的标记擦掉：
+
+```
+round0: pick=zcode-A 适配器写标记=true 折算后仍在=false   ← 被擦了
+round1: pick=zcode-A 适配器写标记=true 折算后仍在=false   ← 又被擦
+round2: pick=zcode-A ...                                  ← 死循环，每次真烧一发请求
+```
+
+⚠️ **关掉折算缓存后实测 `3/3` 轮全中**（`scripts/verify-zcode-fight-single.mjs`）。
+⚠️ **不关缓存会误测**：第二轮命中 60 秒缓存、折算根本没重跑，会把死循环
+误测成「只多撞一次」—— 我第一版正是这么测的（得到 `2/3`），差点低估严重性。
+对照组（只撞墙、不折算）里标记仍在 ⇒ 证明差异**确实来自折算路径**。
+
+**修法：按「谁的证据更强」分道。** 新增纯内存的 `expiryMarkedKeys` 登记
+「本机制写下的标记」：
+
+- `markModelsExhaustedForExpiry` 写成功后**登记**来源；
+- `updateModelRateLimit`（适配器）为某键写过 ⇒ **认领**它（从集合移除）
+  ⇒ 观测路径再也擦不掉；
+- `clearModelsExhaustedForExpiry` **只删登记过的**键。
+
+⚠️ 该集合**纯内存、不落盘**：丢失它的后果是「既有标记来源不明 ⇒ 清不掉」，
+属**保守方向**（标记本来就会在次日 0 点自然过期）。刻意不给
+`JetHubState` 加一份需要迁移与对账的新结构。
+
+⚠️ **自愈未被牺牲**：同时实测「额度恢复 ⇒ 本机制的标记仍会被清」
+（`scripts/verify-zcode-mark-self-heal.mjs`），并有**反向对照**用例钉住
+（少了它，「不许擦」会被实现成「一律不清」⇒ 单向门复发）。
+
+#### 八之6 第一个审计报的其余 MINOR（已逐条处置）
+
+| MINOR | 事实 | 处置 |
+|---|---|---|
+| **接线守卫可被「注释掉的接线」满足** | 三条源码正则**不区分注释** ⇒ 把整段接线改成注释（语义失效）后三条仍全绿 | 判据前先 `stripComments`（助手取自 `provider-runtime-wiring.spec.ts`）。⚠️ 实测确认「注释掉接线」现在**会红** |
+| 「结构判据与行为判据**互补**」 | **证伪**：那条行为用例传**手写桩**、不驱动 `index.ts` 真接线 ⇒ 两条都只测桩 | 注释改为如实分工（「结构 vs 范围」），不再宣称互补 |
+| `aggregate-expiry.ts` 两语句挤一行 | 本轮 diff 新增的格式伪影（`tsc` 不管） | 已修；并全仓扫描确认无同型残留 |
+| 文档写「**43 条**」而实测 61 | 条数是**必然腐坏**的快照（本仓库专门记过该约定） | 删掉条数，并写明「以 `pnpm test` 输出为准」 |
+| JSDoc 称清除方法「**返回清除条数**」 | **证伪**：实为 `Promise<void>`（返回条数的是另一个方法 `clearModelRateLimits`） | 改为如实描述 + 注明「别与另一个混为一谈」 |
+| 「写与清**逐格互补**」 | **部分证伪**：「读不到」那一格**两边都不出现**（既非互补也非覆盖） | 注释改为「判据互补，但**不覆盖全部格子**」，并点明那一格的语义是「不知道」 |
+
+⚠️ 审计还指出一条**可复核性**问题（未判为缺陷但值得记）：**所有「实测」都指向
+`scripts/*.mjs`，而该目录被 `.gitignore` 忽略** ⇒ 证据不随提交分发。
+⇒ 已在该节写明；后续若有争议，须按各节写明的判据自行重跑。
+
+#### 八之7 审计点名的其余等价变异与观察
+
+- 删 `if (modelIds.length === 0) return`：下一行同样 return，可观测行为相同；
+- 删 `&& context.catalogIds !== undefined`：抛错被外层 `try/catch` 吞掉，结果相同；
+- 类型谓词改断言：**仅类型层**。
+
+⚠️ 一并纠正一处**误报**：审计称全量 `pnpm test` 有 8 条既有失败
+（`plugin-meta-locale` 6 条等）。我复跑那 3 个文件 **61 条全绿** ——
+审计跑全量时我正在改源码，属**读取竞态**，不是既有失败。
+
+#### 八之8 三条**必须记住的审计纪律**（本轮再次印证）
+
+1. **审计前先固化基线**：对抗审计会改源码跑变异 ⇒ 给它一份**隔离副本**
+   （源码拷贝 + `node_modules` junction），并明令禁止碰真实工作区。
+2. **副本 = 快照**：审计期间你若继续改源码，报告就落在**过期快照**上。
+   ⇒ 收到报告后必须**逐条核对**是否已被后续加固覆盖，不能照单全收。
+   ⚠️ 本轮报告里有 3 条在我加固后已不成立、1 条数字是误报。
+3. **变异/改文件脚本会静默毁坏工作区**（本轮**真实发生两次**）：
+   - 用正则删 `index.ts` 的 `catalogIdsOf` 时，脚本报「未生效」但**实际已把接线删掉**；
+   - 用 PowerShell 的 `List.AddRange` 重排本文档章节时**类型转换异常**，
+     把整份文档写成 **0 字节**（靠另一份 checkout 的副本才救回）。
+   ⇒ ① 变异后**必须独立校验源码状态**（`grep` 目标符号 / `git diff --numstat`），
+   **不能只信脚本自己的返回值**；② 改写大文件**优先用 `edit` 工具**，
+   不要在 shell 里拼接「读—改—写」；③ 批量改写前先确认有可恢复的副本。
+   与本仓库记过的「反向验证脚本自身出错更危险」同型。
+
+⚠️ 改完这些要做的两件事（同 zcode 其它改动）：**两份 checkout 都要同步**
+（`D:\jet\code\js\dsh-codearts` 与 `D:\jet\code\js\deepseek-harness-codearts`）
+并各自 `pnpm build:all`；**必须重启宿主**才生效。
+
+#### 八之9 ⚠️⚠️ 本轮最重要的**流程**教训：审计目标必须冻结
+
+两个审计**都**报告了同一件事，而且它比任何单条缺陷都值得记：
+
+| 审计 | 报告原文（要点） |
+|---|---|
+| 对抗审计 | 「审计副本 = 创建时的快照」⇒ 我在它跑的同时继续改源码，它的变异基线就过期了 |
+| 代码审计 | 「**首要事实：审计期间工作区被另一个 agent 并发修改**」—— 它早期的两个 CRITICAL 在审计途中被我修掉，复核时不成立（它逐条标了「已闭合」并给出前后 hash） |
+
+⚠️ **这不是审计的失误，是我的流程失误**：我在审计运行期间继续修源码
+（死锁、abort、字符串字段…），导致：
+
+1. **审计结论的时效性被打折** —— 必须逐条核对「是否已被后续加固覆盖」；
+2. **代码审计无法做变异验证**（它明确登记：在真实工作区注入变异会毁掉我的状态，
+   而项目笔记明令禁止并行做变异）；
+3. **它跑全量时撞上我改到一半的源码**，误报「8 条既有失败」。
+
+**可复用的规则（下次启动审计前照做）**：
+
+- **审计期间冻结源码**：要么等改完再审计，要么**明确接受「报告会落在快照上」**
+  并在收到后逐条复核（本轮就是后者，代价是多花了一轮核对）；
+- **隔离副本的基线要写进报告**（hash + 时间戳）—— 本轮代码审计做对了，
+  这让「哪几条已闭合」可以精确核对；
+- **报告里的「N 条失败」必须自己复跑确认** —— 并发修改会让它变成误报。
+
+⚠️ 另一条与本仓库旧约定**相印证**的观察：项目 `AGENTS.md` 早已写明
+「同一工作区无法安全并行（subagent 做变异验证会在源码里注入临时变异）」，
+本轮**再次实测到同一形态** —— 只是这次「打架的」不是两个 subagent，
+而是「审计 subagent 与主会话」。⇒ 那条约定应读作
+「**任何**两个会改工作区的参与者都不许并行」，不限 subagent。
+
+## ⚠️⚠️ 3.14.5 起官方**架构上支持**推理带 captcha，开关是服务端下发的 `skip_model_request`（2026-10-12）
+
+**用户要求**（并同时更新了闭源版到 `ZCode.exe` **3.14.5.7961**）：
+「检查一下现在推理过程是不是要 captcha 了，如果推理过程中又要了我们使用 zcode
+对话推理过程中也要对应的调用 captcha 流程」。
+
+### 一、先澄清一个**归属**：不是那次重构造成的
+
+用户同时报「一键领取没有弹出 chromium」并怀疑 `3aa34a3`（抽出共享 `ChromiumSession`，
+为集成库库AI 而做的重构）改坏了 captcha 流程。**逐项取证后：不成立。**
+
+- `git show --stat 3aa34a3` 只动 **3 个文件**（新增 `src/chromium-session.ts`、
+  瘦身 `src/zcode-captcha.ts`、5 个测试），**没有**碰 `zcode-auth.ts` /
+  `captcha-carrier.ts` / `jet-hub-rpc.ts` / `captcha-supply.ts`；
+- 逐字对比重构前后（旧 2119 行 → 新 1138 行）：`spawn` 参数（含
+  `--window-position` / `--window-size` / `--lang` / `detached`）、端口挑选与
+  「应答端口一致性」校验、`taskkill /T /F`、profile 退避删除、`STEALTH_PATCH`、
+  `buildDomExpression` / `buildMintExpression`、页面复用与 `pageBusy` 无条件复位
+  **全部逐字保留**；
+- **114 条** captcha 相关单测全绿。
+
+⇒ 「不弹 chromium」是 `19226ca`（2026-10-01「captcha 全链路重做」）引入的
+**内部载体优先**设计（桌面版走 `dshDesktop.browser` 的隐藏 webview guest，
+取不到才落 chromium）。旧记录已写明其收益口径是「**去掉对 chromium 的依赖**，
+不是提速」。想看 chromium 用 `DSH_ZCODE_INTERNAL_CARRIER=0`；web 版拿不到
+`dshDesktop.browser`，必然弹 chromium。
+
+### 二、逆向**最新闭源版** `app.asar` 得到的官方判据链（3.14.5.7961）
+
+产物：`C:\Users\Jet\AppData\Local\Programs\ZCode\resources\app.asar`（326 MB）。
+captcha 逻辑在 `/out/renderer/assets/styles-C4MhEMbW.js`（6.1 MB，文件名随版本变）。
+
+```js
+// ① 准入：只有智谱积分账号走这条路
+function xnn(e){ return e?.access?.type==='zhipu-account' && e.access.mode==='start-plan' }
+
+// ② 索要 captcha（`model-request` 与 `captcha-retry` 两种 reason 都进这里）
+async function Lnn(e){
+  if (!xnn(e.providerConfig)) return
+  const t = await U4(f3(e.codingPlanSubscriptionService), e.signal)
+  if (t?.enabled===false || t?.skipModelRequest===true) return { headers:{} }   // ← 跳过
+  if (!t || p3(t)) throw Error(Snn)
+  const n = await Pnn(t, { providerId, requestId, source, signal })
+  Inn(e.providerId, n)
+  return { captchaVerifyParam: n, headers: unn({ captchaVerifyParam: n, captchaRegion: t.region }) }
+}
+```
+
+`/out/host/index.js` 侧新增配对机制：
+
+```js
+// schema：requestProviderRuntimeHeaders 的 reason 取值域
+reason: t.enum(["model-request", "captcha-retry"])
+
+// host 把 renderer 回的 runtimeProviderHeaders 合进请求头（**只认这两个键**）
+for (const [le, Ze] of Object.entries(m.response.runtimeProviderHeaders ?? {})) {
+  const De = ["X-Aliyun-Captcha-Verify-Param","X-Aliyun-Captcha-Verify-Region"]
+    .find(Nt => Nt.toLowerCase() === le.trim().toLowerCase())
+  if (De && Ze.trim()) H[De] = Ze.trim()
+}
+```
+
+⇒ **推理请求真的会走 captcha**，且被拒后有 `captcha-retry` 重试一轮。
+
+⚠ **`access` 是本地设置，不是服务端下发**：`znn()` 读的是
+`providerSettingsService.getView().providers[].effectiveConfig.access`。
+故 `xnn` 的准入判据在我们这边**不可复现**（我们不是官方壳）。
+
+⚠ **官方那把 `skip_model_request` 转成 camelCase**（`/out/host/index.js` 的
+`getCaptchaConfig()`）：
+```js
+let { skip_model_request: r, ...o } = n
+return { ...o, ...typeof r === 'boolean' ? { skipModelRequest: r } : {} }
+```
+⇒ **只在真的是布尔时才写字段**，缺席就是缺席 —— 我们的读法必须同口径。
+
+### 三、服务端**当前**把开关关着（本机一手实测，只发 GET、零额度）
+
+`GET /api/v1/client/configs?app_version=3.14.5&platform=unknown`，三个账号一致：
+
+```json
+"captcha": { "enabled": true, "prefix": "no8xfe", "region": "cn",
+             "sceneId": "11xygtvd", "skip_model_request": true }
+```
+
+`skip_model_request: true` ⇒ 官方 `Lnn` 第二行即返回，**不产 param、不注头**
+⇒ **现在推理仍然不要 captcha**，我们既有的「先探后取」依然正确。
+
+⚠ **判据只能来自这两条**（逆向产物 + 一手实测），别再用「官方更新说明」
+推断：3.14.4 的说明写「关闭模型请求验证码校验」，而 3.14.5 的架构**已经把
+推理带 captcha 的能力做进去了**，只是**服务端开关没开** —— 两者不矛盾。
+
+### 四、修了什么（缺陷：这个信号我们**读不到**）
+
+`fetchZcodeCaptchaConfig` 此前只读 `region`/`prefix`/`sceneId`，
+把 `skip_model_request` 与 `enabled` **整体丢弃** ⇒ 「上游要不要验证」不可读，
+门控只能一律「先探后取」。这在 `true` 时最优（那一发必然成功、零成本），
+但服务端一旦翻成 **`false`**，先探**必然**被 `400/3007` 拒 ⇒
+**每一个用户请求都白吃一发往返**（再在适配器内部补产重发）。
+
+**落点（4 处）**：
+1. `zcode-upstream.ts` 的 `fetchZcodeCaptchaConfig` 补读两个字段，
+   **只在真的是布尔时才写**（与官方 `getCaptchaConfig()` 逐字同口径）；
+2. `zcode-captcha.ts` 的 `ZcodeCaptchaConfig` 加两个**可选**字段
+   + 新纯判据 `requiresCaptchaUpfront()`；
+3. `zcode-adapter.ts` 内层循环门控加 `upfrontCaptcha`（**只在 `attempt === 0`**）；
+4. `captcha-requirement.ts` 加第三个观测计数 `upfrontCaptchaCount`
+   （**独立成项**，不并进 `knownRequiredCount`：后者的语义是「跨请求靠 2 分钟
+   记忆少探一次」，本项是「靠上游配置少探一次」，证据来源与失效条件都不同）。
+
+⚠⚠ **方向别写反**：能省的是 `skipModelRequest === false`（明确要 ⇒ 直接带），
+**不是** `true`。`true` 表示上游不校验，先探本来就零成本、无可省。
+
+### 五、三态判据（最容易写错的两格）
+
+| `skipModelRequest` | `enabled` | 首发动作 | 理由 |
+|---|---|---|---|
+| **`false`** | 非 `false` | **直接带 param** | 上游明确要 ⇒ 先探必被 `3007` 拒 |
+| `true` | 非 `false` | 先探 | 上游不校验 ⇒ 先探零成本且省一次 mint |
+| **缺席 / 非布尔** | 任意 | 先探 | **不知道就不猜** |
+| 任意 | **`false`** | 先探 | 上游把 captcha 整个关了 ⇒ 一票否决 |
+
+⚠ **缺席 ≠ `false`**：写成 `skipModelRequest !== true` 这类宽松判据，
+会在老配置/字段漂移时把「不知道」当成「上游明确要验证」⇒
+**每个请求白发一个 param**，白扣的是阿里云**设备级**配额（同设备 150/小时）。
+同「额度桶：读不到就不猜」那条纪律。
+
+### 六、回归与反向验证
+
+- `tests/unit/zcode-captcha-upfront.spec.ts`（新，**三态 + 接线**；
+  ⚠ 条数以 `pnpm test` 输出为准，别在文档里写死）。
+  含**接线守卫**两条：`index.ts` 必须把 `fetchCaptchaConfig()` 的**原样结果**
+  交给 `setCaptchaConfig`（不能重建一个只有三个字段的对象）、
+  适配器必须真的**读**判据并进 mint 门控（不是只 import）。
+- `tests/unit/captcha-requirement.spec.ts` / `zcode-captcha-lazy.spec.ts`
+  的 3 条 `toEqual` 形状断言随之更新（新增观测项 ⇒ **合理的联动**，
+  不是行为回归；已在断言里显式写出新字段并保留「无配置时必须为 0」的守护）。
+- **7 个变异全部被抓住**（`scripts/mutate-zcode-captcha-upfront.mjs`，
+  带三重守卫：旧片段出现次数必须恰好 1、写入后**回读校验**、
+  还原后与备份 **sha256 一致**）：
+
+  | 变异 | 结果 |
+  |---|---|
+  | M1 宽松判据（把「缺席」当「要验证」） | 🔴 1 条红 |
+  | M2 方向写反（只看 `=== true`） | 🔴 4 条红 |
+  | M3 去掉 `enabled` 一票否决 | 🔴 1 条红 |
+  | M4 强制布尔化（缺席压成 false） | 🔴 1 条红 |
+  | M5 适配器门控去掉 `upfrontCaptcha` | 🔴 3 条红 |
+  | M6 `index.ts` 重建对象（丢两个开关） | 🔴 1 条红 |
+  | M7 观测记错桶（upfront 记进 probeFirst） | 🔴 1 条红 |
+
+⚠⚠ **反向验证脚本第一次跑时 M4「未施加」**：工作区文件是 **CRLF**，
+而脚本里的多行片段写的是 `\n` ⇒ `split(old)` 数到 **0 次**。
+**是脚本自带的「出现次数必须恰好 1」守卫把它拦下的**（否则会显示「全绿」，
+被误读成「用例抓不住这个回归」）。修法：匹配与替换都在 `\n` 空间做，
+写回时按原文件行尾还原。**这正是本仓库记过的 CRLF 假绿，第二次踩到。**
+
+### 七、端到端取证（零网络，import `lib/` 编译产物）
+
+`scripts/verify-zcode-captcha-upfront-live.mjs`：用**真实报文**过生产解析函数，
+并逐格对照判据表（14 格全符合），关键三行：
+
+```
+当前线上（skip=true）      → {…,"enabled":true,"skipModelRequest":true}  ⇒ 判据 false（仍先探，行为逐字未变）
+服务端翻开关（skip=false）  → {…,"skipModelRequest":false}               ⇒ 判据 true （首发直接带）
+老配置（无该字段）          → {…,"enabled":true}                          ⇒ 判据 false（不猜，仍先探）
+```
+
+⇒ **当前线上行为与改动前逐字一致**（`skip_model_request: true`），
+修复只在服务端翻开关后生效 —— 这是「**零当前行为变化、换来未来自愈**」的改动。
+
+取证脚本（均只读、零额度，`scripts/` 被 gitignore ⇒ **不随提交分发**）：
+`scan-zcode-captcha-trace.mjs`（asar 全量 captcha 痕迹扫描）、
+`find-zcode-needle.mjs` / `extract-zcode-context.mjs`（按 need 定位并取上下文）、
+`probe-zcode-captcha-config-live.mjs`（**一手**拉服务端 captcha 配置）、
+`probe-zcode-access-mode.mjs`（access 与 providers 结构）、
+`mutate-zcode-captcha-upfront.mjs`（反向验证矩阵）、
+`verify-zcode-captcha-upfront-live.mjs`（端到端判据对照）。
+
+### 八、仍未做（如实登记）
+
+1. **`access.mode` 侧无法覆盖**：`xnn()` 依赖官方壳的本地 provider 设置
+   （`access.type === 'zhipu-account' && access.mode === 'start-plan'`），
+   我们直连上游时没有这个概念 ⇒ 若将来上游改成「只对 `off-peak` 模式索要」，
+   我们的判据（只看 `enabled` + `skip_model_request`）可能不够。
+   **未实测**，故不预先加判据。
+2. **`captcha-retry` 那一轮的语义未对齐**：官方在推理被拒后会带
+   `reason: 'captcha-retry'` **重新要一次** runtime headers。
+   我们的对应物是适配器内 `3007` 分支的补产重发（语义等价），
+   但**没有**「因 3012 而重取」那条 —— 而 3012 按现有实测**不是** captcha 问题
+   （判据是请求体身份块，见本章前半），故不合并。
+3. **3012 与 captcha 的因果关系**：本次**未发现**二者有因果。
+   用户截图里那行诊断（`身份块 2898 字符(42+2856) · HTTP 405`）
+   只出现在**推理**路径的 `describeZcodeRequestShape`；领取路径刻意**不传**
+   `shape`（它只有 `{plan_id}`，照搬会误报「身份块 0 字符」）。
+   ⇒ 那条 3012 是**推理**被拦，与「领取没弹 chromium」是**两件独立的事**。
+
+## ⚠️⚠️ 「web 版一键领取不弹 chromium」的真因：`preview` 回了 `plans=[]`（2026-10-12 续查）
+
+**用户澄清（关键）**：不弹的是 **dsh web** 环境（不是 desktop），
+「以前点领取积分按钮都会弹，现在不弹了」；且界面**有结果文字：
+「今日暂无领取额度」**。
+
+⚠ **上一轮我按 desktop 前提作答，方向是错的** —— 本节是对它的订正。
+「不弹 chromium」与「显示今日暂无额度」**不是两个问题，而是同一件事**。
+
+### 一、判据链：返回点在**任何 captcha 产出之前**
+
+`claimDailyWith`（`src/zcode-auth.ts`）的顺序是：
+
+```
+setCaptchaDemand(true)                 ← 只是置需求位（web 版无人消费它）
+await reportZcodeActivation(...)
+plans = await fetchZcodeClaimablePlans(...)   ← GET /billing/preview
+if (plans.length === 0) return [{ kind:'already-claimed', message:'今日暂无可领额度…' }]
+                                        ↑ ★ 在这里就返回了
+const captchaConfig = await this.fetchCaptchaConfig() ...   ← 下面才开始 mint
+```
+
+而浏览器是**惰性**创建的（`captchaPoolInstance()` 里 `this.captchaBrowser ??= new …`
+才 `spawn`）⇒ **preview 空 ⇒ 一次 mint 都不发生 ⇒ 一台浏览器都不起**。
+
+⚠ **判据与文案自 `90890d0`（2026-09-29 最初实现）起一字未改**
+（`git log -S'plans.length === 0' -- src/zcode-auth.ts` 只命中那一次）
+⇒ **确认不是回归，也与 `3aa34a3` 的 ChromiumSession 重构无关**。
+
+### 二、反向对照（`scripts/verify-zcode-claim-mint-gate.mjs`，零网络零浏览器）
+
+用**生产编译产物**跑 `claimDaily`，只换 preview 的桩：
+
+| preview | mint 调用次数 | outcome | claim 是否发出 |
+|---|---|---|---|
+| **有 plan** | **1** ★ ⇒ 会 spawn 浏览器 | `claimed` | 是 |
+| **无 plan** | **0** ★ ⇒ 一台浏览器都不起 | `already-claimed` / 「今日暂无可领额度…」 | **否** |
+
+⇒ 与用户现象逐字吻合，且**这是正确行为**：没有可领的东西时，
+没有任何理由去起一个 200–400MB 的浏览器、白扣一次设备级 captcha 配额
+（阿里云同设备 150/小时）。
+
+### 三、服务端 side 的一手实测（只发 GET，零额度）
+
+`scripts/probe-zcode-balance-vs-preview.mjs` —— **两个端点语义不同，别混**：
+
+| 端点 | 回答什么 | 本机实测 |
+|---|---|---|
+| `GET /billing/balance` 的 `data.plans[]` | 你**拥有**哪些活动 | 启用账号 **1 条** |
+| `GET /billing/preview` 的 `data.plans[]` | 今天**可领**哪些 | 启用账号 **0 条** |
+
+启用账号（本机唯一 enabled）的 balance 原文：
+
+```
+plan_id=zcode-v3-start-plan-0817  name="ZCode Start Plan"  status=active
+starts_at=2026-10-09 21:40   ends_at=2026-10-13 23:59
+entitlement ent_2_0817_glm_5p3   GLM-5.3        3000000 units  used_units=0
+entitlement ent_2_0817_glm_5p3f  GLM-5.3-Flash  5000000 units  used_units=0
+bucket period_end = 2026-10-12 23:59:59（当日）
+```
+
+⚠ **两个决定性的观察**：
+1. **`used_units` 全为 0** ⇒ 这个账号**一次都没领过**。故文案
+   **刻意不说「今天已领取」**（那会是个谎），只说「今日暂无可领额度（服务端按日刷新）」。
+2. 该账号 `account.createdAt` = **今天 19:02**（`starts_at` 却是 10-09）
+   ⇒ 典型的「**新登录账号、当日份额还没投放 / 活动窗口未对齐**」。
+
+⚠ **「今天已领过」与「活动未投放」在 wire 上无法区分**（都只表现为 `plans=[]`），
+故 `already-claimed` 这个 kind 是**刻意的归并**（两者用户动作相同：明天再来）。
+真正的区分需要上游给「已领」标记，**它没给**。
+
+⚠ **多形态排除**：`app_version`（3.14.3 / 3.14.5）、`platform`（win32 / unknown）、
+带不带 query —— 四种形态对同一账号**都回 `plans=0`** ⇒ 不是请求形态问题。
+
+### 四、排除了哪些「看起来很像」的嫌疑（都实测过）
+
+| 嫌疑 | 结论 | 证据 |
+|---|---|---|
+| `3aa34a3` 的 ChromiumSession 重构改坏了 captcha | ❌ **不成立** | 只动 3 个文件、spawn 参数逐字保留、114 条 captcha 单测全绿 |
+| web 版被内部载体抢走（`supplied > 0`） | ❌ 不成立 | web 版 client 拿不到 `dshDesktop.browser` ⇒ 贡献循环第一行就 return；`supplied` 恒 0 |
+| 退避冷却闸门拦住了 mint | ❌ 不成立 | `remainingMs()=0`（放行） |
+| 找不到浏览器 | ❌ 不成立 | `findBrowserExecutable()` = scoop chromium（存在） |
+| 预取池默认关闭导致行为变化 | ❌ 与「弹不弹」无关 | 池默认 `false` 只影响**已开始 mint 之后**的取参路径 |
+| desktop 实例污染供给槽 | ❌ 本机当时只有 web | 用户确认「只有 dsh web（没开 desktop）」 |
+
+### 五、用户自查方法（下次再遇到「不弹」）
+
+**看结果文字即可定性**，不需要抓包：
+
+| 界面显示 | 含义 | 浏览器会不会起 |
+|---|---|---|
+| 「今日暂无领取额度」 | `preview.plans=[]` ⇒ 上游今天没给可领份额 | **不会**（正确：无物可领） |
+| 「领取成功 +N」/「今日已领取」 | 走通了 mint → claim | 会（或走了内部载体） |
+| 「captcha 产出失败 …」/「找不到可用的浏览器」 | mint 阶段失败 | 尝试过、失败 |
+| 点下去**完全没反应** | 前端重入闸门或 RPC 卡住 | 需另查 |
+
+⚠ 若想**确认** captcha 链路完好，用一个**确实有可领份额**的账号点一次；
+或看下面这条命令（只读、零额度）：
+
+```
+node scripts/probe-zcode-balance-vs-preview.mjs   # balance.plans 有、preview.plans 空 ⇒ 就是本形态
+```
+
+### 六、⚠⚠⚠ 用户反证「以前有额度也会弹」——已复现，且**结论不用改**
+
+用户追问（关键）：**「之前就算弹出今日暂无额度，领取过程中还是弹出 chromium 的」**。
+
+⚠ 我第一版结论只覆盖了**单账号**语义（「preview 空 ⇒ 必不 mint」）。
+用户描述的现象在**多账号**下完全成立 —— 而 `credits.claimAll` 的 zcode 分支
+正是**逐账号循环**（`jet-hub-rpc.ts`），preview 也是**按账号**查的。
+
+`scripts/verify-zcode-multiaccount-claim.mjs`（生产编译产物、零网络）实测：
+
+| 场景 | mint 次数 | 上游调用序 | 各账号 outcome |
+|---|---|---|---|
+| ① 单账号、无额度 | **0** | `preview→0` | `already-claimed` |
+| ② 单账号、有额度 | **1** ★弹 | `preview→1 → claim` | `claimed` |
+| ③ A 有额度 + B 无 | **1** ★弹 | `preview→1 → claim → preview→0` | A `claimed` / B `already-claimed` |
+| ④ A 无 + B 有额度 | **1** ★弹 | `preview→0 → preview→1 → claim` | A `already-claimed` / B `claimed` |
+| ⑤ 全部无额度 | **0** | `preview→0 → preview→0` | 都 `already-claimed` |
+
+⇒ **「弹出 chromium」与「显示今日暂无额度」可以在同一次一键领取里同时出现**
+（场景③④：只要有**任意一个**账号 preview 有 plan）。
+这**精确解释**了用户的历史观感，且**不需要**「preview 空却仍 mint」这种矛盾行为。
+
+⇒ 现在不弹，是因为**本机唯一 enabled 的账号 preview 为空**（场景①或⑤）。
+用户池里其余 4 个账号 `balance.balances=0`（无权益）、且全部 `enabled=false`，
+故当前**没有任何**账号会触发 mint。
+
+⚠ **决定性的一点**：用户问「如果真的还能领积分要 captcha，那不是没生成吗？」
+—— **不会**。判据是**逐账号**的：只要那个账号 preview 有 plan，
+`plans.length !== 0` 就**不会**提前 return，后面 `mintClaimCaptcha` 照常产出 param
+（场景②③④ 实测 mint>0）。**不存在**「该带 captcha 却没生成」的窗口。
+
+### 七、⚠⚠ 排查时踩过的**自我指涉**假证据（别重犯）
+
+我扫会话日志找历史行为时，`找不到可用的浏览器` 这一串在某个会话里命中 **307 次**。
+若当真，会得出「浏览器探测长期失败」的错误结论。
+
+`scripts/inspect-zcode-needle-provenance.mjs` 按**事件类型与角色**拆开：
+
+```
+命中行数: 66
+按事件类型: { "tool/result": 15, "assistant/message": 40, "tool/call": 3, … }
+按角色:     { "tool": 15, "assistant": 40, … }
+```
+
+⇒ **全部来自我自己读 `zcode-captcha.ts` 源码、以及写分析文字**——
+`tool/result` 里是文件内容回显，`assistant/message` 是我的推理与总结。
+**没有一条是真实运行日志**（真实运行日志应是 `assistant/attempt` 或宿主 logger 输出）。
+
+⚠ 这正是本仓库记过的**循环论证**：统计口径命中的是**判据自己的字面量**
+（我写文档时把那句话打进了会话记录），不构成证据。
+⇒ **扫日志找行为证据时，必须先按 `type`/`role` 过滤掉「我自己写的文字」**，
+否则「读代码」与「线上发生过」会被混为一谈。
+
+### 八、★ 决定性验证：激活上报成功、preview 仍空（排除我方缺陷）
+
+`src/zcode-upstream.ts` 的 `reportZcodeActivation` 头注释有一句**很重的断言**：
+
+> ⚠ **这一步不能省**：不补这两条事件，`preview` 恒为空 `plans: []`
+> —— 于是「今天可领」永远是「没有可领」，用户以为签到坏了。
+
+⇒ 它把「preview 为空」的**第一嫌疑人**指向了自己（激活没生效）。
+而该函数**内部吞掉全部异常**（best-effort），故**不能只看「没抛错」就认为成功**。
+
+`scripts/probe-zcode-activation-then-preview.mjs` 按**生产顺序**（先上报、再 preview）
+并**自己发一次**拿到真实 HTTP：
+
+```
+① [app_launch]        HTTP 200  {"code":0,"msg":"","logid":"20261012144129…"}
+   [app_daily_active] HTTP 200  {"code":0,"msg":"","logid":"20261012144130…"}
+①′ 生产封装 reportZcodeActivation() ✅ 返回、未抛
+② 紧接着 fetchZcodeClaimablePlans() → plans.length = 0     ← ★ 仍为空
+```
+
+⇒ **激活上报 200/code:0 成功、紧接着 preview 仍空** ⇒ **排除「激活没生效」**，
+确认是**上游当日对该账号无投放**（我方无法靠改代码解决的一侧）。
+
+⚠ 这一步**必须做**：少了它，「preview 空」究竟是我方没上报、还是上游没投放
+**无法区分** —— 而两者处置完全相反（前者要修 `reportZcodeActivation`，后者只能等/换账号）。
+
+### 九 ⚠ 对「不弹 chromium 是否意味着 captcha 没生成」的正面回答
+
+用户问：**「领取过程如果真的还能领积分要 captcha，那不是没生成吗？」**
+
+**不会漏。** 判据是**逐账号**的，`plans.length === 0` 只跳过**那一个账号**：
+
+```
+for (const account of accounts) {              ← jet-hub-rpc.ts 的逐账号循环
+  accountOutcomes = await zcode.claimDailyFor(credential, mint 回调)
+      └─ claimDailyWith:  preview(该账号) → 空 ⇒ 只有它 return
+                                      → 非空 ⇒ 继续 mint（★ 产 param、弹浏览器）
+}
+```
+
+⇒ 只要**任意一个**账号 preview 有 plan，那一个账号**必然**走到 `mintClaimCaptcha`
+（实测场景②③④的 mint=1）。**不存在**「该带 captcha 却没生成」的窗口 ——
+因为 mint 就发生在**该账号自己**的 plan 循环里，与别的账号空不空无关。
+
+⚠ 反过来说：**preview 空的账号不做 captcha 产出是刻意的正确行为** ——
+没有可领的东西却去起一个 200–400MB 的浏览器、白扣一次设备级
+配额（阿里云同设备 150/小时），那才是缺陷。
+
+### 十、★★ `logid` 进诊断行（2026-10-12，3012 排障的**唯一凭据**）
+
+**动因**：笔记本章第三节早已写着「响应体还带 **`logid`** —— 向用户索取现场时
+**优先要它**（上游侧排障凭据）」，但**它从未被解析过**
+（全仓 `grep -i logid` 在 `src/` 里**零命中**）⇒ 用户报障时我们只能给出
+「账号#1 · 身份块 2898 字符 · HTTP 405」，**没有一样是上游能据以查日志的**。
+
+⚠ 这是典型的「**文档记了、代码没做**」缺口 —— 排查价值最高的一项恰好从未落地。
+
+#### 10.1 一手实测：`logid` 在**两个地方**，且值相同
+
+`scripts/probe-zcode-logid-shape.mjs`（只发 GET、零额度）四个端点
+（`client/configs` / `billing/preview` / `billing/balance` / `event/report`）
+**全部同时带这两个**：
+
+```
+[header] x-request-id = 20261012145652694e8f48d3614ae49634
+[body]   logid        = 20261012145652694e8f48d3614ae49634   ← ★ 逐字相同
+```
+
+#### 10.2 判据：**双来源**（体优先、头兜底）—— 两者覆盖不同故障，都不能省
+
+| 来源 | 覆盖 | 为什么另一条盖不住 |
+|---|---|---|
+| 响应体顶层 `logid` | **业务层错误**（`{"code":3012,…}`） | 主路；值是上游业务日志 id |
+| HTTP 头 `x-request-id` | **边缘/网关 HTML 页**（502 / 504 / 阿里云 ESA） | 那种响应**体里没有 `logid`**，而它是另一类高频故障 |
+
+⚠ **体优先于头**：实测二者相同，故这条只在将来分叉时才有可观测差异 ——
+写成显式优先级是为了「分叉时行为确定」，不是依赖「它们恰好相等」。
+
+⚠ **取不到一律 `undefined`**，绝不编造、也不渲染空壳：
+- 空白（`""` / `"   "`）等同没有（上游确实下发过空 `logid`）；
+- **非字符串**（数字 / 对象）也 `undefined` —— 若 `String()` 化会渲染出
+  `logid [object Object]`，**比没有更糟**（会让人以为拿到了凭据）。
+
+#### 10.3 落点（三处，含两处**在信息最全的地方**提取）
+
+| 文件 | 做什么 |
+|---|---|
+| `zcode-diagnostics.ts` | 新增纯函数 `extractZcodeLogId(body, headers)`；`ZcodeDiagnosticInput.logId`（**可选**）；诊断行末位追加 `logid <值>`（缺则整项省略） |
+| `zcode-adapter.ts`（推理） | `logId: extractZcodeLogId(text, response.headers)` —— 手里就有 `response` |
+| `zcode-upstream.ts`（领取） | `claimZcodePlan` 在**持有 `response` 与完整 `text`** 的那层提取，落进 `ZcodeClaimOutcome.logId`；`zcode-auth.ts` 只负责渲染 |
+
+⚠ 领取侧**必须**在 `claimZcodePlan` 里提取（不能在下游 `toClaimOutcome`）：
+下游只拿得到 `message` 字符串 —— **既没有 header、正文也可能已被
+`text.slice(0, 200)` 截断**。与本章既有那条纪律同源：
+「**在信息最全的地方归一，不要在已经丢过信息的下游猜**」。
+
+⚠ `logid` 排在诊断行**最后**：它最长（32 位十六进制），
+放前面会把「账号 / 计数 / 身份块」这些一眼要看的信息挤出屏幕。
+
+#### 10.4 回归与**反向验证**
+
+- `tests/unit/zcode-diagnostics.spec.ts` 新增一段（体/头/优先级/大小写不敏感/
+  空白与非字符串防御/**接线守卫**两条）。
+  ⚠ 条数以 `pnpm test` 输出为准，别在文档里写死。
+- **8 个变异全部被抓住**（`scripts/mutate-zcode-logid.mjs`，三重守卫：
+  旧片段出现次数必须恰好 1、写入后**回读校验**、还原后 **sha256 一致**）：
+
+  | 变异 | 结果 |
+  |---|---|
+  | L1 体不再优先（改成头优先） | 🔴 2 条红 |
+  | L2 去掉 header 兜底（边缘页就没凭据了） | 🔴 2 条红 |
+  | L3 空白/非字符串不再防御 | 🔴 3 条红 |
+  | L4 诊断行不再渲染 logid | 🔴 1 条红 |
+  | L5 推理路径没接上 | 🔴 1 条红 |
+  | L6 领取路径没接上 | 🔴 1 条红 |
+  | L7 领取侧不在持有 response 的那层提取 | 🔴 1 条红 |
+  | L8 大小写不敏感失效（写死小写键） | 🔴 1 条红 |
+
+⚠ L3 第一版**没有唯一片段**（同一段「非空字符串」逻辑在
+`extractZcodeLogId` 与 `readHeaderCaseInsensitive` 里各内联一份），
+脚本的「出现次数必须恰好 1」守卫把它拦下 ⇒ 顺手抽成共享助手
+`nonEmptyString()`。**这既是给变异让路，也消掉了一处真实重复。**
+
+- 端到端取证（`scripts/verify-zcode-logid-e2e.mjs`，零网络、import `lib/`）：
+  6 格形态全符合，含「阿里云 ESA 页靠头取到」「nginx 502 页无头时如实
+  `undefined`」「真实 `Headers` 对象（有 `get`）」；并复验**红线**
+  （诊断行仍不含 accountId / JWT 的任何子串）。
+
+#### 10.5 这解决 3012 了吗 —— **没有**
+
+⚠ 必须说清：`logid` 是**排障凭据**，不是修复。它把「用户报障时我们什么都问不出来」
+变成「用户能把上游能查的那一串交回来」。3012 的根因**依然未知**
+（「身份块达标仍 3012」仍无解释，见本章前半的 §二）。
+
+### 十一、B1 归因统计：**本机零现场**，且自检证明过滤器没过严（2026-10-12）
+
+原计划用本机历史做「账号级 vs 出口 IP 级」的归因。结论：**做不了，因为没有现场**。
+
+#### 11.1 两个脚本的分工（**第二个是必需的**）
+
+| 脚本 | 做什么 |
+|---|---|
+| `analyze-zcode-3012-attribution.mjs` | 按「真实运行事件」白名单聚合 3012 现场，输出账号/时间窗归因 |
+| `verify-zcode-3012-filter.mjs` | **自检**：把过滤前后的命中全量列出来，证明「0 现场」不是**过滤过严**造成的 |
+
+⚠ **少了第二个脚本，「0 个现场」这个结论是不可信的** ——
+它既可以意味着「真的没发生」，也可以意味着「我的过滤器把真实现场滤掉了」。
+两者结论完全相反（前者 ⇒ 无从归因；后者 ⇒ 我写错了判据）。
+
+#### 11.2 自检结果：994 条命中**全部**是我自己写的文字
+
+含 `unusual activity` 的文件 **71 个**、命中行 **994 条**，按事件类型全量拆开：
+
+| `type` | 条数 | 性质 |
+|---|---|---|
+| `tool/result` | **444** | 我**读文件**的内容回显（`zcode-*.ts` 的源码本体） |
+| `assistant/message` | **343** | 我**写的推理与总结** |
+| `tool/call` | **191** | 我 `write` / `edit` 的**参数**（设计文档、注释） |
+| `agent/inbox/spliced` | 8 | 子代理消息 |
+| `user/message` | 8 | 用户消息里引用的文字 |
+
+⇒ **`assistant/attempt` 与宿主 logger 输出：0 条**。
+即**本机从未真实发生过 3012**；那 994 条**全部是文本层面的自指涉**
+（我写文档、读源码时把 `3012` / `unusual activity` 打进了会话记录）。
+
+⚠ 这是本章 §七 那条教训的**第二次实例**，且这次是**定量**的：
+**71 个文件 / 994 行**听起来像「大量真实现场」，实际**一条都不是**。
+⇒ 凡「从会话日志统计线上行为」，**必须先用 `type` 白名单把运行事件与
+对话文本分开**，否则数字会大到误导（会把「我读过这段代码」当成「线上发生过」）。
+
+#### 11.3 这个结论本身的价值
+
+1. **排除了「本机早就有 3012、只是没注意」这条可能** —— 用户说「本机没有有问题的
+   会话」是**实测成立**的，不是印象；
+2. **归因统计只能等真实现场**。有了 §十 的 `logid`，下次在**有问题的机器**上
+   撞到 3012 时拿到的就是**上游能查日志的凭据** —— 归因从「猜」变成「可查」；
+3. 脚本**已就位**（在 `scripts/`，被 gitignore），下次直接跑即可。
+
+
+
+
+
+
+
+
+

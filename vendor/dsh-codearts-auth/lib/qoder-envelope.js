@@ -200,3 +200,4 @@ export function unwrapQoderEnvelopeStream(response, label) {
         headers: { 'Content-Type': 'text/event-stream' },
     });
 }
+//# sourceMappingURL=qoder-envelope.js.map

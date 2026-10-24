@@ -147,3 +147,4 @@ export async function persistGeminiProject(options) {
         options.logger?.warn(`[gemini] 项目号回写凭据失败（不影响推理）: ${String(error)}`);
     }
 }
+//# sourceMappingURL=gemini-project.js.map

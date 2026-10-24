@@ -253,3 +253,4 @@ export async function refreshMinimaxCredential(refreshToken, fetcher = fetch, pr
     }
     return parseMinimaxTokenGrant(body, refreshToken, product);
 }
+//# sourceMappingURL=minimax-oauth.js.map

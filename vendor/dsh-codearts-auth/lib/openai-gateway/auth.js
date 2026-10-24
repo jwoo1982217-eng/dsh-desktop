@@ -64,3 +64,4 @@ export function loadOrCreateApiKey(home, env = process.env) {
     }
     return { value: key, fromEnv: false, path };
 }
+//# sourceMappingURL=auth.js.map

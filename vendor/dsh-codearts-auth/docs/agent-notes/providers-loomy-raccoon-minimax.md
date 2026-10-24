@@ -1,7 +1,7 @@
 <!-- 搬自 AGENTS.md（2026-10-06 拆分：注入预算 65,536 B，超出部分每轮被截断永不可见）。
      内容逐字节原样保留；本文件按需阅读，不进每轮注入。 -->
 
-## ⚠️ Loomy（讯飞）provider：五个不能凭直觉改的点
+## ⚠️ Loomy（讯飞）provider：七个不能凭直觉改的点
 
 `loomy` 是第 8 个 provider，与其余七者**都不同源**。实现是独立一套
 `src/loomy*.ts`（`loomy-product` / `loomy` / `loomy-sign` / `loomy-oauth` /
@@ -59,7 +59,9 @@
    返回 `Spark X2.5 · x0.1` 而非 `Spark X2.5`（实现时暴露的真实缺陷）。
    该函数**幂等**，单测锁死。
    ⚠️ chat 模型过滤判据是 **`type === 'chat'`**，不能看 `input_modalities`
-   —— 5 个 chat 模型的输入模态含 `image`（能看图），不是生图模型。
+   —— 2026-10-14 实测 9 个 chat 模型里 6 个的输入模态含 `image`（能看图），
+   不是生图模型；另有 1 个（`qwen-3.8-max`）**不声明** `image` 却实测读得出图，
+   见下面第 6 条。
 
 5. **积分是两个池**：永久（`balance`）与每日赠送（`dailyBalance`）分开计算。
    每日额度由 `POST /points/first-login` 触发（官方登录后立即调用），
@@ -71,6 +73,101 @@
    —— 后者是**写**端点，在「打开面板」这种高频路径上调用会意外触发签到。
    ⚠️ `dailyQuota` **只在 `first-login` 响应里**，`points/records` 不返回它，
    故未签到时该字段缺省 —— **不要硬编码 5000**（额度可能随活动变化）。
+
+6. **图片能力要过覆盖表，别照抄 `input_modalities`**（2026-10-14 用户报障
+   「loomy 的 qwen3.8max 输入不能上图」）。远端 `GET /api/v1/models` 对
+   `qwen-3.8-max` 下发 `capabilities.input_modalities: ['text']`（`vision: false`），
+   而实测**它读得出图**。照抄声明值的后果不是「图旁边多个提示」，而是 DSH 在
+   **附件入库阶段**就按目录拒绝（`dsh-api-session-controller` 的
+   `MODEL_DOES_NOT_SUPPORT_IMAGES`）⇒ 用户看到「当前模型不支持图片，请切换支持
+   图片的模型」，而那正是他唯一想用的模型。
+
+   判据是**随机纯色 PNG**（64×64，约 137 B，纯标准库生成）：纯文本模型答不出颜色，
+   读得到的答得出。2026-10-14 用真实凭据直连生产端点逐个实测（一次一色）：
+
+   | 模型 | 远端 `input_modalities` | 实测读图 | 备注 |
+   |---|---|---|---|
+   | `DeepSeek-V4.1-Flash` | text,image | ✅ | |
+   | `Kimi-k2.6` | text,image,video | ✅ | |
+   | `qwen3.8-flash` | text,image,video | ✅ | |
+   | `mimo-v2.5` | text,audio,image,video | ✅ | |
+   | `GLM-5.3-Flash` | text,image,video | ⚠️ | 颜色名答错一次；RGB 3 次中 2 次命中 |
+   | **`qwen-3.8-max`** | **text（漏报）** | ✅ | 4/5 次答对 ⇒ 进覆盖表 |
+   | `MiniMax-M3` | text,image,video | ❌ | 4/4 未命中；答案像经典 CSS 色值（`135,206,235`…）⇒ 疑似在编 |
+   | `deepseek-v4-flash-0731` | text | ❌ | 思考链吃满预算，正文为空 |
+   | `spark-x` | text | ❌ | 自称「我无法读取图片」 |
+   | `auto` | 无声明 | ❌ | 未定论（思考吃满 / 答「灰」） |
+
+   - 覆盖表 `LOOMY_IMAGE_CAPABILITY_OVERRIDES` + 判据函数 `loomySupportsImage()`
+     在 `loomy-product.ts`；⚠️ **远端与兜底表两条路径都必须过它**（同第 3 条
+     旁 `loomyContextWindow` 那条纪律：只改一侧，远端可用时那一侧就白改了）。
+   - ⚠️ **不要写成「该家恒支持图片」**：白名单只覆盖实测确认的个案，恒 true 会把图
+     放给纯文本模型，让上游回一个更晚、更难懂的 400。
+   - ⚠️ `MiniMax-M3` 的**疑似假声明**（声明 image、实测读不出）本次**刻意不降级**：
+     用户当时明确只关心 `qwen-3.8-max`，且降级已声明能力会改变既有可用路径 ——
+     raccoon 的 `sn-glm-5-3` 就有「网关节点不一致、3 次只对 1 次」的先例 ⇒ 单账号
+     证据不足以判死。它按**已知 provider 缺陷**登记在此，待多节点复核后再决定。
+   - ⚠️⚠️ **覆盖表查表必须归一，且两张表同一口径**（2026-10-14 合并后审计发现，
+     修复见 `loomyCatalogKey()`）：原实现是 `Set.has(modelId)` / `OVER[modelId]`
+     **逐字节精确匹配**，而**同一文件**里读远端模态的 `readInputModalities()` 却
+     `.toLowerCase()` 归一了 ⇒ 同一个「模型身份」概念在相邻两处两套标准。
+     后果是**静默失效**：上游一旦把 id 下成 `Qwen-3.8-Max` 或前后带空白，
+     覆盖表恒不命中 ⇒ `inputModalities` 退回 `['text']` ⇒ 准入闸门重新拒图、
+     **用户看到的就是本条要修的症状原样复现**，而**零报错、零日志、测试全绿**
+     （现有用例构造的 id 全小写，结构上抓不到）。与 zcode 的
+     「上游小写 vs 目录大写」是**同一个坑换了个 provider**。
+     ⚠️ **归一只能发生在查表那一刻，绝不改对外 `model.id`** —— 它同时是
+     `fallbackIndex` / `effortsForModel` 的索引键与 DSH 的模型身份，
+     改了会重演 accio「改对外 id ⇒ 聚合补丁索引恒不命中」那类静默连带失效。
+     ⚠️ 附带取舍（**已登记，别当它不存在**）：归一后仅大小写不同的两个 id 会折叠
+     成一个键；判定可接受（上游 8 条 chat 模型本就混用大小写，说明按 id 而非按
+     大小写区分模型；且「不归一 ⇒ 静默拒图」已经真实发生过一次）。
+     守卫在 `tests/unit/loomy-product.spec.ts` 的「查表口径」三条 + 一张
+     「两张覆盖表的键都必须已归一」的机器守卫（加新条目忘了小写会红）。
+
+7. **额度耗尽的冷却终点 = UTC+8 当日 24:00，不是「撞墙时刻 + 24h」**（Gitee
+   **IKL80H**，2026-10-15 修）。每日赠送额度按**自然日**重置，用滑动窗口会让
+   23:50 烧光的账号被封到**次日 23:50** —— 用户原话「0 点后 loomy 能用（自己账号
+   实测），但插件说模型未到重置时间，不给用」。时长判据抽在
+   `loomyCooldownResetAtMs`（`quota` = 当日 24:00、`rate` = 撞墙 +1h）。
+   ⚠️ `raccoon-adapter.ts` 的 `RACCOON_QUOTA_COOLDOWN_MS` 至今仍是 +24h ——
+   **别照抄它**，也别为「跟 raccoon 保持一致」把这里改回去：两家的**失败分类表**
+   必须逐格同构（有对拍用例），**冷却时长**自本条起**刻意分开**（各自取决于额度
+   结算周期）。实测取证与变异验证见下文「loomy 的 `quota` 冷却终点」一节。
+
+### 请求热路径上的凭据探测：**只有** `RefreshTokenExpiredError` 是终态（2026-10-20）
+
+`GET /points/records` 是**只读探测**端点，它能不能通 ≠ 凭据能不能用。适配器原先把
+`options.refresh()` 的任何异常都往上抛 ⇒ 探测端点抖一下，**整轮对话失败**。
+
+实测伤情（会话 `session-bfb9b616`，`/auto-study` 任务）：
+
+| 轮次 | 文案 | 类型 |
+|---|---|---|
+| turn 4 | `Loomy 凭据探测失败：系统内部错误` | HTTP 200 信封内的业务错误 |
+| turn 5（+27 分钟） | `Loomy 凭据探测网络失败：The operation was aborted due to timeout` | 60s 超时 |
+
+两轮之间**面板三个账号余额全部读得到**（9521 / 5000 / 3996），渠道是活的。
+且探测超时上限 `LOOMY_REQUEST_TIMEOUT_MS = 60_000` ⇒ 最坏情况下用户先白等一分钟
+才拿到「失败」。
+
+**口径（已落地）**：热路径 `try/catch` 包住探测，
+`isLoomyTerminalRefreshError()` 命中 `name === 'RefreshTokenExpiredError'` 才抛，
+其余降级为 `warn` 并**继续用现有凭据发请求**。理由：
+
+- 该口径**不是新造的** —— `LoomyAuth.refreshAll()` 早已如此（只把终态记 warn、
+  其余记 warn 后继续下一个账号）。热路径与它不一致属「同一仓库两套同义判据」
+  （PR !62 同型）。
+- Loomy **无续期端点**，探测的唯一产出是「要不要提示重新登录」。真正的失效会在
+  业务请求上以 401 / `100002` 暴露，由换号与 `classifyLoomyFailure` 接住。
+- `expires_at` 是**本地按登录时刻 + 14 天推算**的值（服务端不下发），
+  「本地判过期」本就不等于「凭据已死」。
+
+⚠️ 判据按 `name` 而非 `instanceof`：类在 `loomy-auth.ts`，打包/多副本下
+`instanceof` 会假阴性，把「请重新登录」误降级成「继续用」。
+⚠️ 守卫在 `tests/unit/loomy-adapter.spec.ts` 的「凭据探测失败不得打断本轮」三条
+（业务错误 / 超时 / **反向对照**：终态仍必须抛）。变异验证：把 try/catch 换回
+裸 `await refresh()`，前两条**变红**、第三条保持绿。
 
 ### 短信登录：唯一没有 loginUrl 的 provider
 
@@ -632,7 +729,12 @@ pnpm test:e2e:raccoon-tools  # ⚠️ 发推理：**tools 是否被接受**（�
 `classifyLoomyFailure`（`src/loomy-adapter.ts`）与 `classifyRaccoonFailure`
 （`src/raccoon-adapter.ts`）**逐格同构**：接口形态同族（额度错误没有专用 HTTP
 状态码，文案是主通道）、四个类别同义（`quota` / `rate` / `auth` / `other`）、
-冷却时长同档（`quota` 24h、`rate` 1h）。
+`rate` 冷却同档（1h）。
+
+⚠️ **但 `quota` 的冷却时长自 2026-10-15 起刻意不再同档**（loomy `quota` =
+**UTC+8 当日 24:00**；raccoon 仍是 +24h 兜底）—— 见本节末「loomy 的 quota 冷却终点」。
+**分类表仍必须逐格同构**（有对拍用例），只有**时长**这一格分开了：时长取决于各自的
+额度结算周期，不属于分类判据。
 
 **真实缺陷（同型复发）**：raccoon 在 `7b524ff` 把判据收窄了两处，loomy **未同步**，
 于是同一报文在两个 provider 上被判成**不同类别**，危险方向恒定朝 loomy
@@ -640,11 +742,11 @@ pnpm test:e2e:raccoon-tools  # ⚠️ 发推理：**tools 是否被接受**（�
 
 | 报文 | loomy（未同步时） | raccoon（已修） |
 |---|---|---|
-| `403 + insufficient permissions to access this resource` | `quota` ⇒ **写 24h** | `auth` ⇒ 只换号 |
-| `403 + 积分不足` | `quota` ⇒ **写 24h** | `auth` ⇒ 只换号 |
-| `401 + 余额不足` | `quota` ⇒ **写 24h** | `auth` ⇒ 只换号 |
-| `401 + 14018 Credits exhausted`（网关故障常带余额提示） | `quota` ⇒ **写 24h** | `auth` ⇒ 只换号 |
-| `400 + the context window is insufficient for this model` | `quota` ⇒ **写 24h** | `other` ⇒ 不换号 |
+| `403 + insufficient permissions to access this resource` | `quota` ⇒ **写冷却** | `auth` ⇒ 只换号 |
+| `403 + 积分不足` | `quota` ⇒ **写冷却** | `auth` ⇒ 只换号 |
+| `401 + 余额不足` | `quota` ⇒ **写冷却** | `auth` ⇒ 只换号 |
+| `401 + 14018 Credits exhausted`（网关故障常带余额提示） | `quota` ⇒ **写冷却** | `auth` ⇒ 只换号 |
+| `400 + the context window is insufficient for this model` | `quota` ⇒ **写冷却** | `other` ⇒ 不换号 |
 
 前四行正是 AGENTS.md 记的 **2026-10-06「全池被封」事故形态**（那次触发词是
 `authorization_verify_error`，这次是 `insufficient permissions` / 「不足」类文案）：
@@ -659,12 +761,72 @@ pnpm test:e2e:raccoon-tools  # ⚠️ 发推理：**tools 是否被接受**（�
 2. `insufficient` **单独出现过宽**，必须与邻近的「钱」义词
    （`point` / `credit` / `balance` / `quota` / `token`）**共现**才算额度。
    中文三词（积分 / 额度 / 余额）**不要**收紧 —— 它们的方向是「宁可漏判不可误伤」。
-   漏判只是不换号，误判会封可用账号 24h。
+   漏判只是不换号，误判会封可用账号（loomy 现在封到当日 24:00，raccoon 封 24h）。
 
 **防复发的真正闸门是「对拍」而不是各写一份用例**：单方面把一侧「改严」时，
 两侧各自的用例**都能过**（本次的 loomy 侧就是这样漏掉的）。
 `tests/unit/loomy-adapter.spec.ts` 的「与 raccoon 对拍」段把**同一批真实报文
 喂两个分类器、断言逐条同结论**，分叉即红。
+
+### ⚠️⚠️ loomy 的 `quota` 冷却终点：**UTC+8 当日 24:00**，不是「撞墙时刻 + 24h」
+
+（Gitee **IKL80H**，2026-10-13 用户真机报障，2026-10-15 修复）
+
+用户原话：「**0 点后 loomy 能用，我自己的账号实测。但该插件的 loomy 会说模型未到
+重置时间，不给用，目测是以积分耗尽的 24 小时做判定。**」
+
+**根因**：Loomy 的每日赠送额度（每日 5000，`dailyBalance = dailyQuota - dailyConsumed`）
+按 **UTC+8 自然日**重置，而旧实现写的是 `Date.now() + 24h` 的**滑动窗口**
+（常量 `LOOMY_QUOTA_COOLDOWN_MS`，随 `raccoon-adapter.ts` 同形抄来）。
+用户在 23:50 烧光 ⇒ 标记落到**次日 23:50** ⇒ 跨过 0 点后上游已放行而插件仍判受限。
+
+| | 时刻（失败时刻 = 2026-10-13 23:50 UTC+8） |
+|---|---|
+| 修复前写下的标记 | `2026-10-14 23:50`（**+24h**） |
+| 修复后的自然日终点 | `2026-10-14 00:00`（只差 10 分钟） |
+| 0 点后 10 分钟的判定（修复前） | 仍判「全部账号限流」，距解禁 **23.67 h** |
+
+**症状出口两处**（都读同一个 `modelRateLimits`，故一处根因两处可见）：
+
+- 选号侧 `allAccountsRateLimitedForModel` → `throwIfAllAccountsRateLimited`
+  （`src/index.ts`）报「可用账号均在限流中，最近一个将于 <次日 23:50> 解禁」；
+- 面板侧 `plugin-src/client/jet-hub.js` 的「限额中」徽章与「限额重置」行。
+
+⚠️ 这同时是 AGENTS.md 红线「**同一 provider 内不得有两套同义判据**」的一处违反：
+`aggregate-expiry.ts` 的 `loomyExpiry` 对**同一件事**（Loomy 的每日赠送何时失效）用的是
+`nextUtc8DayStartMs()`，与适配器这里的 +24h 结论不同。现统一到自然日，与
+qoder / zcode / codearts 三家同口径。
+
+**改法与守卫**（`src/loomy-adapter.ts` 的 `loomyCooldownResetAtMs`）：
+
+- 时长**按类别**算，并把它抽成**导出的纯函数**（入参化 `nowMs`）才测得动 ——
+  旧写法是调用点上的三元表达式 `status === 429 ? 1h : 24h`，恒真断言抓不到它；
+- `recordsLoomyRateLimit` 改成**类型谓词** `cls is 'quota' | 'rate'`：
+  少了守卫时 `auth` 会静默拿到一个冷却时长（旧三元表达式正是这个形状），
+  现在由 `tsc` 拦（实测：退回 `boolean` ⇒ `TS2345` 编译失败）；
+- 回归用例在 `tests/unit/loomy-adapter.spec.ts` 的「IKL80H：自然日 vs +24h」段，
+  **含反向对照**（拿旧值当变异体，断言同一时刻**必须**判受限）——
+  只断言「修复后不再受限」是可能恒真的（判据整体失效也会通过）。
+
+**实测的变异验证**（登记结果，含一处无牙）：
+
+| 变异 | 结果 |
+|---|---|
+| `quota` 退回 `nowMs + 24h` | **3 红**（自然日终点、端到端标记、0 点后症状） |
+| `quota` / `rate` 两条分支对调 | **5 红** |
+| `recordsLoomyRateLimit` 谓词退回 `boolean` | **`tsc` `TS2345` 编译失败** |
+| ⚠️「恰好 0 点撞墙 ⇒ 终点是再下一个 0 点」 | **无牙**：该输入上两式**同值**，退回旧写法仍绿。如实登记，不为它编恒真断言（它的作用是守边界语义：不得返回「此刻」） |
+
+**代价（如实登记）**：`classifyLoomyFailure` 判 `quota` 时分不清「每日赠送用尽」与
+「连永久积分也空了」（报文只有 `14018 Credits exhausted`）。改用自然日后标记
+**严格变短**（最多差近 24h）⇒ 若某个号永久积分也空，0 点后会被重试一发再重新标记。
+刻意取舍：宁可多发一发失败请求，也不让用户白等一整天。
+
+**未同批修（留给后续）**：`raccoon-adapter.ts` 的 `RACCOON_QUOTA_COOLDOWN_MS`、
+`trae-cooldown-table.ts` 的 `quota-exceeded`（24h）、`minimax-adapter.ts` 的
+`MINIMAX_QUOTA_COOLDOWN_MS` 三处仍是「撞墙 + N」的滑动窗口。本次**只改 loomy**
+（用户报障的那一家）—— 这三家的额度结算周期尚未逐家核对，且 trae 的 24h 是有
+注释依据的「覆盖到下次签到」⇒ 需各自取证后再动，别顺手统一。
 ⚠️ 已做**反向验证**：把 loomy 的顺序与 `insufficient` 判据改回修复前 →
 3 条变红（含对拍那条）；恢复后 44/44 绿。
 
@@ -685,11 +847,422 @@ raccoon 在 `51ded6a` 修了这处，**loomy 当时未同步**（同一次审计
 
 ---
 
-## ⚠️ MiniMax Code（中国版）provider：不能凭直觉改的点
+## ⚠️ MiniMax Code（中国版 + 国际版）provider：不能凭直觉改的点
 
 `minimax` 是**第 10 个、也是首个 `Anthropic Messages` 协议族**的 provider
 （其余九个都是 OpenAI 兼容族或各自的自定义协议）。生产环境
 `https://agent.minimax.cn`。实现是独立一套 `src/minimax*.ts`。
+
+### 0. ⚠️ 双站点：`minimax`（中国版）+ `minimaxintl`（国际版）
+
+2026-10-15 加入国际版。**两个站点是两个 provider id**（不是「一个 provider 加一个
+区域参数」），与 `qoder`/`qodercn` 同型：
+
+| 字段 | `minimax`（中国版） | `minimaxintl`（国际版） |
+|---|---|---|
+| `displayName` | `MiniMax Code (中国版)` | `MiniMax Code (国际版)` |
+| `accountHost` | `account.minimax.cn` | `account.minimax.io` |
+| `apiHost` | `agent.minimax.cn` | `agent.minimax.io` |
+| `region`（目录参数） | `cn` | `en` |
+| `defaultCredentialRef` | `MINIMAX_ACCESS_TOKEN` | `MINIMAXINTL_ACCESS_TOKEN` |
+
+**只有这 6 个字段不同**（OAuth 常量、全部端点路径、兜底模型表逐字段相同）⇒
+**不复制任何** `src/minimax*.ts` 实现文件，差异全在
+`src/minimax-product.ts` 的两个常量里。`tests/unit/minimax-intl.spec.ts` 有一条
+「除这 6 个字段外两站配置逐字段相同」的断言锁住这件事（要分叉必须先加白名单并写明理由）。
+
+**为什么不用「单 id + 站点落凭据」**（zcode / accio 那种）：
+- 那两家的两站**共用同一个推理网关**，站点只决定登录页域名；而 MiniMax 两站的
+  **API 主机也不同**，且**账号不互通**；
+- 更关键的是**模型目录是按 provider 缓存一份的**（`MinimaxAdapter.loadModels` 的
+  `this.remoteModels`）⇒ 单 id 下两台只有一个适配器实例、目录来源是
+  `getAvailableAccount('minimax','')` 取到的**那一个**账号所属的站 ⇒ 另一站的模型
+  根本不进列表；若改成合并两站目录，用户选中仅 A 站有的模型而选号器选了 B 站账号时，
+  请求会发到 B 站主机 —— 而 **MiniMax 对不存在的模型名是 HTTP 200 + `message_start`
+  里静默回退成 `MiniMax-M3`**（见本文件 §8.7 的实测表）⇒ **用户完全看不出打错了模型**。
+  双 id 下这个错误结构上不可能发生。
+
+⚠️ **两站共用同一个 `MinimaxAdapter` / `MinimaxAuth` 类** ⇒ 改动任何一处实现都会
+**同时影响两站**（这是刻意的：同源协议修一遍就够）。但也意味着**接线必须两处都到位**：
+`probeById`、`WRITES_RATE_LIMIT_PROVIDERS`、`SELF_HEAL_REFRESHABLE_PROVIDERS`、
+`jet-hub-store` 的 ref 前缀表、`provider-credits` 的两条表项 —— 漏一处都是
+**静默失效**（症状是「国际站那个面板的某项功能永远不工作」）。
+
+⚠️ **验证状态**（2026-10-16 合并审计修正 —— 原文写「三项未真机取证（本机无国际站
+账号）」，与下文 §「✅ 2026-10-15 真机验证：上面 1、2 两项已确认同形，全部可用」
+**同文件自相矛盾**；本机**确实**用真实国际站账号登录并逐端点实测过）：
+1. **推理路径**（`POST /mavis/api/v1/llm/v1/messages`）—— ✅ **已真机验证**
+   （HTTP 200 + 真实 SSE，认证只需 `Authorization: Bearer`）；
+2. **签到端点形状**（`/minimax-cloud/api/v1/signin/{status,claim}` + `timezone_id`）
+   —— ✅ **已真机验证**（签到状态与积分返回 200）；
+3. **兜底模型表** —— ❌ **仍未按国际站远端采集**（两站共用同一份国内站快照）。
+   ⇒ **只有这一项**不该读成「已实现」；上面两项已经是实测事实，别再重复劳动。
+
+### ⚠️⚠️ 「登录成功但余额/签到全失败」= 跨 origin 307 剥掉了 `Authorization`（issue IKMEVG，2026-10-17 已修）
+
+**用户报障**：「minimax 国际版登录无法查询余额，领取积分失败，**疑似授权不成功**」。
+面板三条症状：积分行「余额查询失败」、「一键领取积分」报
+`失败 —— 签到响应缺少有效的 claim_result`、账号卡片却显示「已启用」。
+
+#### 根因（与「授权」无关，凭据其实是有效的）
+
+`agent.minimax.io` 现对**所有**路径恒返 `307 → https://agent.minimaxi.com/...`
+（两个 Akamai 边缘 IP、连打 15 次全部一致；curl 独立复核同结果；响应头
+`X-From: ak` 表明是 Akamai 边缘规则）。
+
+而按 fetch 规范，**跨 origin 重定向会移除 `Authorization` 头**（本机双端口实验
+实测：`Authorization` 被剥、`x-api-key` 反而保留）。于是：
+
+```
+带 Bearer 发 → 307 → fetch 自动跟到 minimaxi.com（Authorization 已被剥）→ 400
+```
+
+那个 `400 {"error":"invalid signature"}` 与「**完全不发 token**」**同形**
+（对照矩阵印证），所以看起来像凭据无效。
+
+**决定性反证**：手动跟随 307 并在每一跳重附 `Authorization` 后，签到面板 /
+积分明细 / 推理 SSE **全部 200**（修复后用真实活凭据跑插件代码路径实测：
+签到「今日已领=true 额度=400」、余额 `9845.75`）。
+
+⚠️ 补 `x-api-key` **不解决问题**：它虽不被剥，但 MiniMax 业务端点**只认
+`Authorization`**（实测仅 x-api-key → 同样 400 invalid signature）。
+
+#### 两个必须记住的结论
+
+1. **「登录跳转到中国版」是客户端的 region 自动检测，不是插件 bug**：
+   本机国际版客户端（`MiniMax Code` 3.1.1，`app.asar`）的 `.env.local` 写死
+   `NEXT_PUBLIC_LOCALE="zh"`，而 `@mavis/config` 的 `getRuntimeRegion()`
+   按 `locale === 'zh' ⇒ 'cn'` 判定 ⇒ 它打开的就是 `account.minimax.cn`，
+   落库路径也是 `~/.minimax/auth/prod/**cn**/mcode-public/`。
+   ⇒ **装了「国际版」安装包，拿到的仍可能是中国站账号**（两站账号在**数据面
+   互通**：同一 token 打 `agent.minimax.cn` 与 `agent.minimaxi.com` 都 200）。
+2. **`minimaxintl` 的 `apiHost: 'https://agent.minimax.io'` 目前不可用**：它必被
+   307 到 `.com`。保凭据跟随后能通，但那是「借道」—— 若哪天上游不再 307，
+   这里要重新核对（**第 3 项待定，用户正在实测真实国际版能否登录**）。
+
+#### 第二道缺陷：`requestEnvelope` 从不检查 HTTP 状态码
+
+`src/minimax-credits.ts` 原实现只解析 JSON 体、**没有** `if (!response.ok)`
+（全文件唯一的 `response.status` 只出现在「非 JSON」文案里）。于是
+`400 {"error":"invalid signature"}` 这种**没有 `base_resp`** 的体走到
+`statusCode === undefined` ⇒ 被判 **`ok: true`**，然后三个入口各自把真因翻译成
+**与真因无关**的话：
+
+| 入口 | 拿到 `ok:true` 之后 | 面板文案 |
+|---|---|---|
+| `claim` | `claim_result` 缺失 | 「签到响应缺少有效的 claim_result」（**正是报障原文**） |
+| `signin/status` | 形状不认 ⇒ `null` | 签到状态不可用 |
+| `credit/details` | `details`/`total_count` 缺失 ⇒ `null` | 「余额查询失败」 |
+
+⚠️ **这一格此前零覆盖**：反向验证实测，注入 `if (!response.ok) return {ok:false…}`
+后跑 **62 条** minimax 用例**全绿**（既有用例构造的响应全是 200 + 合法业务码，
+结构上抓不到该分支）。
+
+⚠️ **文案必须如实透出错误体原文**：`invalid signature`（网关/重定向）与
+`invalid access token`（凭据）指向**完全不同**的处置动作，压成一句
+「查询失败」会让用户照着错的指引去重新登录。
+
+#### 修法与守卫
+
+- `src/minimax.ts` 的 `minimaxFetch` = **重试（外层）+ 保凭据跟随重定向（内层）**，
+  **四处调用点共用**（推理 `send` / 目录 `fetchRawModels` / 签到积分
+  `requestEnvelope`）。⚠️ 重试必须在**外层**：传输错误在**任何**一跳都可能发生。
+- 跟随有**三条硬边界**：① `redirect: 'manual'` 后**每跳重新构造头**（`buildInit`
+  传函数而非对象，让「漏带头」在结构上做不到）；② 只跟**可信主机**
+  （`minimax.io`/`minimax.cn`/`minimaxi.com`/`xaminim.com`，后缀匹配防
+  `evil-minimax.io` 仿冒）且只跟 `https`；③ abort 不继续跟、跳数上限 3、
+  不可信/超限时**原样返回 3xx**（绝不假装成功）。
+- 守卫：`tests/unit/minimax-redirect-follow.spec.ts`（17 条）+
+  `minimax-credits.spec.ts` 的「HTTP 非 2xx 不得被当成成功」（10 条）。
+  ⚠️ 其中有一条**事实基线**用**真 Node http server** 起两个端口、用**全局真 fetch**
+  走一次自动跟随，断言第二跳**收到的 `Authorization` 为 null** —— 因为本修复的
+  全部价值建立在「fetch 会剥头」之上，若某天 undici 改了这条行为，那些用手写
+  fetcher 的用例**全部仍会绿**（它们根本没走真 fetch）。
+
+**变异验证（7 条，逐条实测有牙）**：只给第一跳带头 ⇒ 1 红；去掉
+`redirect:'manual'` ⇒ 2 红；可信闸门改 fail-open ⇒ 2 红；删 HTTP 状态检查 ⇒
+7 红；跟随丢 method/body ⇒ 1 红；去 abort 守卫 ⇒ 1 红；`MAX_HOPS=0` ⇒ 5 红。
+
+⚠️ **本节是「第一、二缺陷」那轮的 7 条**；加上地理分流（第三缺陷）之后新增的
+5 条共 **12 条**，完整清单见本节末尾「守卫与变异验证」（以那一处为**唯一权威**）。
+
+⚠️ **连带修掉一个既有脆弱用例**：`officeace-inflight-guard.spec.ts` 的 ③ 号
+用例在 `DSH_OFFICEACE_PENDING_TTL_MS='0'` 下依赖「`createdAt` 与稍后的 `now()`
+**跨毫秒**」（收口判据是闭区间 `<=`，同毫秒时 `0 <= 0` 为真 ⇒ 跳过收口 ⇒ 假红）。
+实测同一份代码连跑 8 次 **5 红 3 绿**，且它曾因一次**无关**改动的导入图变化而
+开始大面积变红，极易被误判成该改动的回归。修法是插入 `setTimeout(2)` 让时钟
+**确定性**前进（不能用微任务），连跑 10 次 10/10 绿；并做过反向验证（把收口
+判据改成 `if (true) continue` ⇒ 该用例仍变红，判别力未丢）。
+
+### ⚠️⚠️⚠️ 决定性根因：Akamai 按**出口 IP** 把大陆流量分流到中国站（同一 issue 的第三层）
+
+上两节修掉「丢凭据」与「谎报成功」后，用户实测**仍然余额查询失败**（这次凭据是
+新登录的、有效期 60 分钟）。继续深挖得到决定性结论 —— **40 个变体穷举实测**：
+
+| 随请求附带的 `X-Forwarded-For` | `agent.minimax.io` 的结果 |
+|---|---|
+| 美国 `8.8.8.8` / `1.1.1.1`、日本 `133.130.0.1`、新加坡、香港 | **留在国际站（200，真实数据）** |
+| 中国 `114.114.114.114` / `223.5.5.5` / `180.76.76.76` | **307 → 中国站** |
+| 内网 `127.0.0.1` / `10.0.0.1` / `::1`、空值、非法串 | 视为无此头 ⇒ **307** |
+| `Accept-Language` / `x-mavis-region` / `X-Region` / `region` / `?lang=` / `?region=` / UA / Origin / Referer / Cookie | **全部 307（完全无效）** |
+
+⚠️ **不是 lang/region 头的问题**：`minimaxHeaders()` 本来就只发
+`Authorization` + `Accept`，**从没带过任何中文标识**。是**出口 IP 的地理位置**。
+
+⚠️ **跟到中国站后无法事后区分**：「国际站账号被导到中国站」与「凭据真失效」
+返回的 `401 {"error":"invalid access token"}` **逐字同形**（本机实测）⇒
+拿它判会把「换个网络就能用」误报成「请重新登录」。故判别**必须卡在 307 那一跳**
+（`minimaxFetch` 的 `onGeoRoute` 回调）。错误码刻意用 `SERVER` 而非 `AUTH`
+（本仓库 IKLBSH 记过「`AUTH` 码会连 message 一起吞」）。
+
+#### 解法：面板可设 `X-Forwarded-For`（默认关闭）
+
+`state.json` 新增 `minimaxXff` → 面板按钮「国际站分流设置」（**只对
+`minimaxintl` 渲染**）→ RPC `minimax.getXff` / `minimax.setXff`。
+
+三条纪律：
+
+1. **只对 `minimaxintl` 生效**（`minimaxHeadersFor` 按 `product.id` 分流）；
+   给中国站附这个头纯属伪造来源、无收益。
+2. **未设置 ⇒ 一个头都不加**（老用户行为逐字节不变）。
+3. **非法值绝不进请求头**：`sanitizeMinimaxXff` 只放行 IP 字面量，且
+   **CR/LF 判定必须在 `trim()` 之前** —— 初版栽在这里：`'1.2.3.4\r'` 被 `trim()`
+   去掉 `\r` 后变成合法 IPv4 并**通过**校验，那个 `\r` 就看不出来了（头注入）。
+   请求侧 `withMinimaxXff` 独立再挡一次（纵深防御）。
+
+⚠️ **该键必须进 `queueStoreSave` 的整体写入 + 两处 load**（`SettingsStore` /
+`FileStore`）：漏一处 = 任何一次改账号都静默清掉它 ⇒「设好了，过一阵又开始 307」。
+
+⚠️ **读池设置必须 `typeof` 判**：`pool?.minimaxXff()` 在**只实现部分方法的池替身**
+上会抛 `TypeError`（`?.` 只挡 `null`/`undefined`，挡不住「对象上没有这个方法」）
+—— 实测让 `minimax-adapter.spec.ts` 的**轮换组 16 条全红**。adapter 与 auth 两处
+都已改成 `typeof pool?.minimaxXff === 'function'`。
+
+#### 端到端实测（真实国际站 token，不是中国站 token）
+
+```
+不传 XFF：签到 → null、余额 → null          （面板「余额查询失败」）
+传 XFF  ：签到 → ✅ 额度 400、余额 → ✅ 0   （该账号余额确实是 0）
+```
+
+#### ⚠️⚠️ 一条假阳性教训（值得单独记）
+
+我曾用 `~/.minimax/auth/prod/**cn**/mcode-public/auth.json` 里的凭据去打 `.io`，
+读到 200 与「9845.75」，并据此宣布「两站都通了」。真相是：那是**中国站 token**，
+被 307 到中国站后读到的是**中国站数据**；打 `.cn` 读到的也是同一份 ⇒
+**两边同值恰恰证明是同一个账号读了两遍**。用户一句
+「国际版和国内版不可能是同一个积分，是哪里走错了」直接戳破了它。
+
+⇒ 两条硬纪律：
+1. **验证国际站必须用国际站自己签发的 token**（`account.minimax.io` 的 device code）；
+2. **「两站结果相同」不是成功证据，而是「可能读了两遍同一个站」的信号**。
+
+#### 顺带查清：为什么「国际版客户端登录后跳转中国版」
+
+解包本机 `MiniMax Code` 3.1.1（`app.asar`）：`.env.local` 写死
+`NEXT_PUBLIC_LOCALE="zh"`，而 `@mavis/config` 的 `getRuntimeRegion()` 按
+`locale === 'zh' ⇒ 'cn'` 判定 ⇒ 它打开 `account.minimax.cn`，落库到
+`~/.minimax/auth/prod/**cn**/`。**装「国际版」安装包也可能拿到中国站账号。**
+
+数据面归属实测（同一台主机、同一个 URL）：
+```
+agent.minimaxi.com/minimax-cloud/api/v1/signin/status
+  国内站 token → 200       真国际站 token → 401
+```
+⇒ `.minimaxi.com` 与 `.minimax.cn` 都是**中国站数据面**，它不认识国际站 token。
+
+#### 为什么不默认开启 XFF
+
+附 `X-Forwarded-For` 本质是**声明一个并非本机的来源 IP**。Akamai 那条规则是上游的
+区域路由策略（账单/合规都基于它），默认伪造来源不该是产品的默认行为。故缺省为空，
+且 UI 文案**先给「用代理改出口 IP」这条更正当的路**。
+⚠️ 它还可能**随时失效**（很多 CDN 已默认不信任客户端提供的 XFF）——届时必须
+**如实报错**，不能假装成功。
+
+#### 守卫与变异验证
+
+`tests/unit/minimax-redirect-follow.spec.ts`（17 条，含一条用**真 Node http server**
++ **全局真 fetch** 锁住「fetch 确实会跨 origin 剥 Authorization」的事实基线 ——
+本修复的全部价值建立在这条行为上，若 undici 改了它，只用手写 fetcher 的用例会
+**全绿但修法已失效**）+ `tests/unit/minimax-xff-geo.spec.ts`（31 条）+
+`minimax-credits.spec.ts` 的「HTTP 非 2xx 不得被当成成功」（10 条）。
+
+**12 条变异逐条有牙**：只给第一跳带头 ⇒ 1 红；去 `redirect:'manual'` ⇒ 2 红；
+可信闸门 fail-open ⇒ 2 红；删 HTTP 状态检查 ⇒ **7 红**；跟随丢 method/body ⇒ 1 红；
+去 abort 守卫 ⇒ 1 红；`MAX_HOPS=0` ⇒ 5 红；去 CRLF 原始串检查 ⇒ 1 红；
+XFF 对中国站也生效 ⇒ 2 红；地理路由判据只判后缀（`account.*` 也算）⇒ 1 红；
+**credits 不传业务错误原文 ⇒ 2 红**；**adapter 去掉 402 特判 ⇒ 1 红**。
+
+#### ⚠️⚠️ 提交后自查发现的两个真缺陷（都已修）
+
+1. **`geoRouted` 吞掉 402 的余额语义**（P0）。`geoRouted` 只表示「这次请求
+   **经历过** 307」，**不表示失败原因就是它**。实测反例 `307 → 402
+   insufficient_balance_error`：初版把文案整段换成地理路由说明、并把错误码
+   无条件改成 `SERVER` ⇒ **「去充值」这个唯一有效动作彻底消失**，用户会一直
+   折腾网络。修法：`describeMinimaxGeoRoute(detail)` 接收业务错误原文并放在
+   文案**最前面**；adapter 里 402 仍保 `QUOTA_EXCEEDED`，只有会落到
+   `SERVER`/`AUTH` 的档位才让地理路由接管错误码。
+2. **UI「清空输入」只改草稿、不落盘**（P1）。用户点完看到输入框空了，会以为
+   已关掉绕过分流，实际请求**仍带 XFF**。改为「清除设置」并真正调
+   `minimax.setXff({xff:''})`（`save(override)` 显式传值，绕开 React 状态异步）。
+
+⚠️ **一条方法论教训**：这两个缺陷都是我用**纯函数用例**测不出来的 ——
+`describeMinimaxGeoRoute` 的纯函数用例在「credits 不传原文」这个变异下**全绿**，
+因为判据没打在**业务入口**上。补了 `★★★ 接线` 组（4 条）后该变异才 2 红。
+这正是本仓库反复记录的「函数对 ≠ 被用上」。
+
+#### ⚠️⚠️ 子代理审计又打穿三处（2026-10-17，全部已修）
+
+用户要求「提交 + 脱敏审计 + 一轮 subagent 审计 + 对抗性审计」。审计子代理打穿了
+三处**我自己没发现的真问题**，我逐条复核后确认全部属实：
+
+**① `SERVER` 错误码会被 DSH 自动重试 5 次（P0，影响两处）**
+
+`@deepseek-ai/dsh-llm` 的 `retry-policy.js`：
+```js
+DEFAULT_RETRYABLE_CODES = [EMPTY_RESPONSE, RATE_LIMIT, 'SERVER', TIMEOUT, TRANSPORT]
+DEFAULT_MAX_RETRIES = 5
+```
+而 minimax 适配器**没有覆写** `providerRetryPolicy`（`src/` 全仓零命中）⇒ 走默认。
+两处都中招：
+- **地理路由**（本次新增）—— 确定性失败，重试毫无意义，且每次重试会重跑
+  `MINIMAX_MAX_ROTATE=8` 的换号循环 + 重定向跟随 ⇒ 最坏 5×8 次无谓请求；
+- **`200` 非 SSE**（`isDefinitelyNotSse` 分支，**既有代码**）—— 实测最终
+  `error.code === 'SERVER'`（该对象被原样当 `streamError`，**不经过**
+  `httpErrorCode()` 重新归类）。
+
+修法：两处都改用**不在默认可重试集合、且不会被 harness 替换文案**的码 ——
+地理路由用 `INVALID_CREDENTIAL`（官方注释恰好同理由："a malformed credential
+fails identically on every attempt"），非 SSE 用 `INVALID_REQUEST`。
+守卫：`★★★ 地理路由的错误码不可重试` + 更新既有非 SSE 用例为
+「`code` 不在可重试集合里」（把它从「顺带记录实现」变成有意义的守卫）。
+
+⚠️ 本仓库已记过同型事故（`providers-trae.md`：4006 落 `SERVER` ⇒ 巨型请求体
+被原样重发 5 次），这是**同一个坑的第二次**。
+
+**② 文案写死「中国大陆」，与同函数注释自相矛盾（P1）**
+
+`describeMinimaxGeoRoute` 上方注释明写「文案里**不写死"中国大陆"**…写死会误导
+走 VPN 但出口仍被判中国的用户」，而实现里就写着「判为中国大陆来源」。
+且实测**内网 IP 同样 307** ⇒ 对公司内网出口的用户，这是**事实错误**。
+修法：改「被判成中国区（内网或无法解析的地址也会被判成中国区）」，
+并**增加第三条指引**「先确认本机出口 IP（如打开 ifconfig.me）」——
+否则用户会先怀疑插件坏了。
+
+**③ 两条用例无牙（P1/P2，已实测证实）**
+
+- 「`307 → 402` 不静默当成 0」只断言 `balance === null`，而 402 体无
+  `details`/`total_count` ⇒ **删掉 `!response.ok` 整块也照样 null**（两条路都
+  返回 null，不可区分）。
+- 「超长值被拒绝（>128）」用的输入 `'8.8.8.8'.repeat(30)` 会先被「IPv4 必须四段」
+  拒掉 ⇒ 删掉长度判据仍通过。实测改用 `'fe80::1%' + 'a'.repeat(130)` 后才变红
+  （该串含 `%` ⇒ 字符集放宽、IPv6 形状也合法 ⇒ **只有**长度判据能拦）。
+
+顺带补了 `sanitizeMinimaxXff` 的 **IPv6 段数校验**（初版只做形状校验不数段数，
+`1:2:3:4:5:6:7:8:9:10` 被放行，与「只接受 IP 字面量」的契约名不副实）。
+
+**审计未打穿的**：`isMinimaxTrustedHost` 以**真实入参**（`new URL().hostname`）
+计 18 条攻击形态全部安全（零宽/全角/CGJ 会被 URL 规范化成真域、西里尔 o →
+punycode、userinfo → `evil.com`、尾部点/表意句号/NUL → 拒）；
+UI↔RPC 契约正确（`unwrapRpcResult` 对 `ok:false` 是**抛** `Error(message)`，
+故 `catch` 能接住）；持久化覆盖完整（接口/schema/两处 load/save/queueStoreSave/
+getter/setter 全在）。
+
+
+### ⚠️⚠️ 传输级重试：`fetch failed` 的真实缺陷（2026-10-15，已修）
+
+**用户报障**：「模型连接测试失败，显示 `fetch failed`」「积分查询及领取失败」。
+
+**本机取证**（同一凭据、同一端点、连打 10 次）：
+```
+签到 (signin/status): 成功 5/10 —— 失败全是
+  fetch failed ← self-signed certificate in certificate chain [SELF_SIGNED_CERT_IN_CHAIN]
+目录 (models)       : 成功 10/10
+```
+
+⇒ 环境里的 **HTTPS 检查代理**（企业 / 杀软 / **Clash 的 MITM 证书**）约 **50%**
+概率打断到本家的请求。**这是环境问题，但症状落在插件上**：一次偶发中断 = 整轮请求
+失败，用户看到 `fetch failed`。
+
+**修法**：`src/minimax.ts` 新增 `minimaxFetchWithRetry` + `isMinimaxTransportError`，
+**三处共用同一份**（不各写一份 —— 同义判据分两处必然漂移）：
+- 推理（`src/minimax-adapter.ts` 的 `send()`）
+- 目录（`src/minimax-auth.ts` 的 `fetchRawModels`）
+- 签到 / 积分（`src/minimax-credits.ts` 的 `requestEnvelope`）
+
+**效果实测**：裸 `fetch` **5/10** → 走本函数（插件真实代码路径）**10/10**。
+
+**四条边界**（`tests/unit/minimax-transport-retry.spec.ts` 逐条锁住，且都做过变异验证）：
+1. **只重试传输错误，绝不重试 HTTP 状态错误** —— 4xx/5xx 是服务端的**明确答复**
+   （401 要续期、402 要充值、429 要冷却），重发只会原样失败且掩盖真因；
+2. **abort 绝不重试** —— 用户点了停止还继续发是**不可接受**的行为；
+3. **真因在 `cause` 里** —— undici 把底层错误包成一句 `TypeError: fetch failed`，
+   判据必须**沿 `cause` 链**找（本仓库 `providers-opencode.md` 记过这一点）；
+   只读 `message` 会漏掉 `SELF_SIGNED_CERT_IN_CHAIN` / `UND_ERR_*` / `ECONNRESET`
+   （变异验证：改成只读 message ⇒ **4 条用例变红**）；
+4. **重试耗尽时抛最后一次的原错误对象** —— 保住 `cause` 链，真因仍可见
+   （换成自定义文案会让用户再也看不到「自签证书」这类唯一出路）。
+
+⚠️ 另一条**环境侧**线索（本次未改动，留作排查指引）：用户环境是 **Clash TUN +
+fake-IP**（`agent.minimax.io` 被判给 `198.18.0.14`），而 `fetch failed` 的真因正是
+Clash 的 MITM 证书。**若重试仍不够**，可把该域名加进 Clash 的 `fake-ip-filter`
+或关掉 TUN —— 但插件侧不应依赖它（重试才是正解）。
+
+### ✅ 2026-10-15 真机验证：上面 1、2 两项**已确认同形，全部可用**
+
+用真实国际站账号（经本插件登录）逐端点实测，并与官方开源实现
+`MiniMax-AI/minimax-code`（v0.6.11 打包产物 + 源码）逐字对拍：
+
+| 端点 | 实测结果 |
+|---|---|
+| `POST /mavis/api/v1/llm/v1/messages` | ✅ 200 + 真实 SSE（**`Bearer` 即可**，与国内站一致） |
+| `GET /minimax-cloud/api/v1/signin/status` | ✅ 200（真实签到面板） |
+| `GET /minimax-cloud/api/v1/credit/details` | ✅ 200（真实余额） |
+| `GET /mavis/api/v1/models?region=en&buildEnv=prod` | ✅ 200（4 个模型） |
+
+**主机与常量也全部核对正确**（官方源码逐字确认）：`account.minimax.io`
+（`oauth-core/src/endpoint-config.ts` 的 `ACCOUNT_ORIGINS.en.prod`；且官方
+`mcode login --region global` 打开的**就是**该主机）、推理基址
+`agent.minimax.io/mavis/api/v1/llm/v1`（`config/src/config.ts` 的
+`PRESET_BASE_URLS['en-prod']`）、OAuth 三常量（`contracts.ts` 的
+`mcode-public` / `agent.default` / `agent-backend`）。
+
+⇒ **两站协议同形**，「两站只差 6 个字段、共用全部实现」成立。
+
+### ⚠️⚠️ 一段**已被证伪**的中间结论（2026-10-15，留作教训，勿再采信）
+
+同一天中途，我曾据一次**上游故障窗口**内的探测写下如下结论并写进代码/文档：
+
+> ❌ 「国际站要求**阿里云 ALB 网关签名**；`/minimax-cloud/*` 回
+> `400 {"error":"invalid signature"}`、推理 `Bearer` 回 `401 token is required`；
+> 已穷举认证位置与主机均不通；推理与签到/积分**当前不可用**。」
+
+**该结论是错的。** 故障恢复后同样的请求全部 200。当时的三个错因：
+
+1. **把瞬时故障当成设计**：`invalid signature` / `token is required` 是上游网关在
+   故障期返回的**通用错误**，恢复后即消失 —— 我当时还拿
+   「不存在路径回 404、真实路径回 400」去论证「端点存在、只是要签名」，
+   那个推理本身成立，但**它无法区分「要签名」与「网关故障」**；
+2. **对照组选错**：我用「国内站通、国际站不通」推断「两站协议不同形」，却**没有
+   先让官方客户端复现**。后来跑 `mcode` 才发现**官方自己也连不上**（截图
+   `Code: 50112` = 官方枚举 `LLM_AUTH_ERROR`）—— 那才是决定性证据；
+   官方 mcode 探针抓到的推理请求头**也只有 `Authorization: Bearer`**
+   （另有 `x-api-key: sk-xxx` 占位与 `x-mavis-*`，缺之亦通），与我实现逐字相同；
+3. **烧掉了用户凭据**：为判断凭据归属，我对两个真实账号调了 `refresh_token`
+   却**没有写回**，服务端轮换后旧 token 作废，用户被迫重登。
+   ⇒ **诊断脚本绝不该对真实凭据发起 refresh，无论是否写回。**
+
+**可推广的教训**：区分「客户端 bug」与「服务端故障」时，**第一步就让官方/参考
+实现复现** —— 成本最低、结论最硬；不要拿一个失败面的组合去反推协议差异。
+
+**⚠️ 另有一条仍然成立的判据**：国际站的**目录端点当前是公开的**（无 token、垃圾
+token 都返回 200，与国内站不同）⇒ **「模型目录能读到」不构成凭据有效的证据**。
+凭据证据看推理 / 签到 / 积分三处。
+
+核验入口：`pnpm test:e2e:minimaxintl`（只读，实测 4/4 通过）/
+`pnpm test:e2e:minimaxintl-claim`（真实领取）。探针**刻意不硬断言**「恰好 4 个
+模型」—— 国际站远端模型集与国内站不同（实测 4 条），硬断言会在上游调整时假红；
+探针只断言「请求发出去了、拿到了可解读的响应」，实际内容打印给人核对。
 
 ### 1. ⚠️ `pending` 是 **HTTP 200**，不是 OAuth 标准的 400
 
@@ -814,7 +1387,7 @@ POST /minimax-cloud/api/v1/signin/claim?timezone_id=<IANA>   # body {}
 | 模型 | mode | effort_options | 实测行为 | 我方声明 |
 |---|---|---|---|---|
 | M3.1-Flash-Preview | `forced_on` | ✅ `default/low/medium/high/xhigh/max` | 传 disabled ⇒ **硬 400** | 6 档（默认 `default`） |
-| **M3** | **`switchable`** | ❌ 无 | **不发 ⇒ 不思考**；adaptive ⇒ 2785+ 字符 | `on` + `none` |
+| **M3** | **`switchable`** | ❌ 无 | **不发 ⇒ 不思考**；adaptive ⇒ 2785+ 字符 | `none` + `on`（强度序） |
 | M2.7 / M2.7-highspeed | `forced_on` | ❌ 无 | 传 disabled ⇒ **静默忽略** | 不声明 |
 
 **M3.1 必须 adaptive**（服务端原话，实测 HTTP 400）：
@@ -832,8 +1405,11 @@ POST /minimax-cloud/api/v1/signin/claim?timezone_id=<IANA>   # body {}
 我第二版只加 `none` ⇒ **只能关、无法开**（把模型强项藏起来了）。
 
 ⇒ 取客户端**权威词汇**（`thinking.js` 的 `isMiniMaxM3ThinkingMode`：
-`value === 'on' || value === 'off'`）声明 **`['on','none']`**
-（`on`→`adaptive`、`none`→`disabled`；`off` 在 DSH 侧的惯用名是 `none`）。
+`value === 'on' || value === 'off'`）声明 **`['none','on']`**（**强度序**，Issue IKLIDV；
+`on`→`adaptive`、`none`→`disabled`；`off` 在 DSH 侧的惯用名是 `none`）。
+⚠️ 原写法是 `['on','none']`（把默认档排首位）—— 那在**横向档位轴**上会变成
+「左强右弱」（「开启」贴最左）。规整理由见下方「展示名」那段。
+
 ⚠️ **不设 `defaultEffort`**（M3 无 `default_effort`）⇒ 保持服务端默认（=不思考），
 **不擅自**设成 `on`（那会改变用户既有行为）。
 
@@ -842,6 +1418,11 @@ POST /minimax-cloud/api/v1/signin/claim?timezone_id=<IANA>   # body {}
 
 ⚠️ **展示名**：远端档位用原文（官方 IDE 就是 `default`/`low`/…），
 但 `on`/`none` 是**我们追加**的，给中文「开启思考」/「关闭思考」。
+⚠️ **追加顺序是 `none` 在前、`on` 在后**（强度序，Issue IKLIDV）：DSH 把
+`reasoning.efforts` 当**展示顺序**且客户端**不排序**，原先的 `['on','none']`
+会让「开启」落在横向档位轴的最左（左强右弱）。⚠️ 远端 `effort_options` 那段
+**保持原序**（如实镜像上游），故两段拼接后的数组**不一定全局单调** ——
+只有「我们自己追加的那一对」按强度序排。
 
 ⚠️ **档位真的生效**（实测同一难题）：M3.1 `low`=572 / `medium`=1181 /
 `max`=1297 字符 ⇒ **不是空转**。故断言必须比较**不同档位的思考量**，
@@ -932,6 +1513,141 @@ M3 答过「绿色」/「红色」—— 那是**模型自身识图质量**，�
 ⚠️ 同时**空行要重置 `eventName`**（它是 SSE 的事件终止符；提到循环外后
 不重置会让上一条事件的 `event:` 名残留到下一条 `data:` 上）。
 回归用例 4 条，反向验证过（去掉收尾冲刷 ⇒ 4 条变红）。
+
+#### 8.7 ⚠️ 请求级账号轮换 + 冷却（issue IKJW32，2026-10-11 接上）
+
+修复前：本适配器**全文件零命中** `updateModelRateLimit` / `getAvailableAccount`
+—— 14 家里**唯一**没有换号 / 冷却的一家；首号额度耗尽就把硬失败抛给用户，
+而池的取值顺序不因失败而变 ⇒ 下次请求仍是同一个号（「卡死在一个号上」）。
+
+⚠️ 取证口径（**别把它说成「本机复现」**）：issue 报障环境是「池里 **4 个账号
+3 个余额为 0**」；本次复核的那台机器只有 **1 个 minimax 账号且余额充足**
+（`credit/details` 13 条记录），故本条是靠**代码取证 + 单测**成立的，
+不是靠本机复现的。
+
+**类别→动作表**（照 `loomy-adapter.ts` / `raccoon-adapter.ts` 逐格搬）：
+
+| 类别 | 判据 | 换号 | 写冷却 |
+|---|---|---|---|
+| `quota` | 402 / `insufficient_balance_error` / 额度文案 | ✅ | ✅ 24h |
+| `rate` | 429 / `rate_limit_error` / `overloaded_error` | ✅ | ✅ 1h |
+| `auth` | 401 / 403 / `authentication_error` | ✅ | ❌ **绝不写** |
+| `other` | 其余 4xx（400 参数错） | ❌ | ❌ |
+
+⚠️ `auth` 只换号、绝不写标记，是 2026-10-06「全池被封 24h」事故换来的不变式
+（见 `loomy-adapter.ts` 的 `LoomyFailureClass` 记录），本家照搬。
+⚠️ `quota` 的 24h 是**保守兜底**（本家没有可靠的额度重置字段）：用户真去充值后
+不必等满 24h —— 账号卡片上的「重置」按钮会清掉该标记（这也是它**必须**进
+`probeById` 的另一个理由，见本节末尾）。
+
+**真机实测的错误报文形状**（2026-10-11，`POST /mavis/api/v1/llm/v1/messages`
+＋本机凭据；三发都不产生推理、不消耗额度）：
+
+| 构造 | HTTP | 体 |
+|---|---|---|
+| 坏 token | 401 | `{"code":401,"message":"auth failed"}` —— **自家信封，不是 Anthropic 形状** |
+| `MiniMax-M3.1-Flash-Preview` + `thinking:{type:'disabled'}` | 400 | `{"type":"error","error":{"type":"invalid_request_error","message":"… (2013)"},"request_id":…}` |
+| 不存在的模型名 | **200** | `message_start` 里 model **静默回退**成 `MiniMax-M3`（既有事实，别当错误） |
+
+⚠️ **402 + `insufficient_balance_error` 是额度形态，但本次没有真机复现**
+（本机那个账号余额充足：`credit/details` 有 13 条记录）。该形状来自既有单测与
+§8.4 的记录，实现按它判 ⇒ **别把「判据有测试」误读成「真机见过」**。
+
+⚠️⚠️ **`consumeMinimaxSse` 的错误帧必须带 `error.type`**（本次一并加）：
+MiniMax 系有「HTTP 200 + 业务码」的既有习惯（签到、`timezone_id` 放错位置都是
+200），故流内 `event: error` 帧也要能换号；而服务端的 `message` 完全可能是
+`balance not enough` 这类**不含任何钱义词**的句子 —— 那时只有 `error.type`
+能把它判成 `quota`，只带 message 会让轮换静默失效。回归用例刻意让 message
+不含 `insufficient`（去掉 type 拼接即变红）。
+
+**三处共享语义（缺一会复发）**：
+
+1. `tried` 必须透传给 `getAvailableAccount`（不排除会拿回同一个号，换号形同虚设）；
+2. **每次**失败后**立刻**记账（挪到循环开头会让末号漏记 —— loomy 实测 8 号只记 7 个）；
+3. 401 续期后**必须重新反查账号 id**：本家的 `refresh`（`src/index.ts`）续的是
+   **池内第一个可用账号**，续期后取回的凭据可能属于**另一个号**（同 loomy / raccoon
+   的 `51ded6a` 缺陷）⇒ 不反查就把 24h 冷却记在「只是 401」的无辜账号上。
+
+⚠️ **换号只发生在「尚未产出任何 chunk」时**：流内错误若已 yield 过内容，一律
+原样抛出（重发会让用户看到重复内容）。`drain()` 的 `yieldedAny` 守卫锁这一条。
+
+**⚠️ 连锁（第 7 次同型）：写标记 ⇒ 必须进 `probeById`**
+
+minimax 此前**不必**登记在 `src/index.ts` 的 `probeById`（不写标记 ⇒ 没有可清的
+标记）；接上换号后它会写标记 ⇒ 不登记就「标记写进去却永远清不掉」（用户点「重测」
+报「没有探测适配器」）。`tests/unit/provider-runtime-wiring.spec.ts` 的
+「登记为『不写标记』的 adapter 确实没有写点」**当场点名变红**，本次正是靠它发现的。
+⇒ 判据是「**现在**写不写标记」，别照抄「minimax 不写标记」这条旧结论
+（它已随本 issue 失效，同 `opencode` 的第 6 次形态）。
+
+**反向验证**（9 条独立变异，各自锁死一处，逐条实测）：
+`recordsMinimaxRateLimit` 恒 true ⇒ 3 红；删轮换内的记账 ⇒ 2 红；
+删 401 后的账号反查 ⇒ 1 红；删 401/403 判据 ⇒ 4 红；删 `yieldedAny` 守卫 ⇒ 1 红；
+删 `error.type` 拼接 ⇒ 1 红；quota/rate 冷却时长对调 ⇒ 1 红；不传 `tried` ⇒ 6 红；
+`probeById.minimax` 的 `product` 接错（`MINIMAX` → `RACCOON`）⇒
+`account-probe-adapter.spec.ts` 的 minimax 用例 1 红。
+
+⚠️ **订正上一条里的第 4 项**：那次「4 红」是**同时删掉状态码腿与 `auth failed`
+文案腿**的结果；只删状态码腿时，adapter 级的 401 用例仍由文案腿判 `auth`
+⇒ 按 it 粒度只有分类器那条变红。该判据现在是**两条腿**，别把哪一条当成冗余删掉。
+
+#### 8.7.1 同日三路审计（语义一致性 / 对抗性红队 / 接线连锁）后的修订
+
+三个只读 subagent 的结论合并后有 **3 个真实代码缺陷 + 1 个掩盖型覆盖缺口**，
+逐条修完并补了守卫（全部只读审计，未注入变异）：
+
+| 缺陷 | 形态 | 修法 |
+|---|---|---|
+| **200 + 流内错误的分类保真度不足** | 本家**混用两种信封**：Anthropic 形状 `{"type":"error","error":{…}}` 与**自家信封** `{"code":401,"message":"auth failed"}`（401 实测就是这个）。只认 `frame.error.message` 时自家信封退化成「未知错误」⇒ 额度信息整段丢失 ⇒ 判 `other` ⇒ **不换号**（issue 在 200 路径上原样残留） | `consumeMinimaxSse` 的 error 分支回退读顶层 `message` / `code`；`!sawAnyChunk` 时带**响应原文样本**；适配器加**自家信封码通道**（`code=401/402/403/429`） |
+| **200 + 非 SSE 体** | 网关 HTML / 裸 JSON 信封（`application/json`）一个 SSE 帧都没有 ⇒ 只得到「模型未返回任何内容块」 | 适配器加 `isDefinitelyNotSse`（**只认** `application/json` / `text/html`，其余仍按 SSE —— `new Response(string)` 的默认类型是 `text/plain`，当错误体会让**正常回答整轮失败**） |
+| **坏凭据掐断整池** | 池凭据是裸 `JSON.parse`（不校验形状），`{}` 这类损坏条目会撞 `nextCredential.access_token.length` ⇒ `TypeError`（非 `LlmError`）+ `break` ⇒ **一个坏号废掉整轮**（loomy/raccoon 无此断点，是本家新引入的） | 判空后 `continue` |
+| **`insufficient` × `token` 误封** | `max_tokens` / `input_tokens` / `budget_tokens` 是 Anthropic 的**一等字段名** ⇒ `insufficient max_tokens for the requested thinking budget`（400 参数错）被判 `quota` ⇒ 每个轮换到的号各写 **24h** | 钱义词 `token` 改**词边界**匹配；另：裸 `rate limit` 不再判 rate；**5xx 只信确定性通道**（自报类别 / 自家信封码） |
+
+同时补齐的守卫（都是「此前零覆盖」的格）：`rate` 档 **429 → 1h** 的行为用例
+（此前只跑过 402，把 rate 常量换成 quota 的不会有任何用例变红）、
+`probeById.minimax` 的**真实工厂**用例（凭据接通 + 不持有 `accountPool`，
+`vi.mock` 的桩适配器读不出这两样 ⇒ 原来删掉 `resolveCredential` 也全绿）、
+「已产出内容后失败**仍要记账**」（否则该号永不被冷却）、
+「401 报文不含 auth 文案仍判 auth」（锁状态码腿）、
+「仅 `content_block_start` 后报错不重发」（锁 `yieldedAny` 的宽度）。
+
+⚠️ **三处行为变更登记**（供后续对照，都是审计发现的「非轮换路径也变了」）：
+
+1. **401/403 先续期一次再重发**（新增，对齐 loomy/raccoon）⇒ 探测路径同样会
+   多打一发请求（`refresh` 在 `probeById` 里是 no-op，第二次仍是 401 后走原路径）；
+   若续期后取不到凭据，错误文案变成 `credential expired and refresh failed`。
+2. **生产里 `accountPool` 恒传** ⇒ 单凭据 / 单号池的 402 / 429 / 401 文案从
+   `HTTP <code> — …` 变成「所有账号均不可用（…）」（错误码不变）；
+   单号池余额耗尽会**写 24h 冷却** ⇒ 充值后要点「重置 / 重测」才立刻恢复
+   （这正是必须进 `probeById` 的另一个理由）。
+3. **`error.type` 进入错误文案** ⇒ `account-probe.ts` 的 `isRateLimited` 会命中
+   `rate_limit_error`，探测文案从「无法确认」变「仍受限」（**标记保留行为不变**）。
+
+**同一日第二轮的对抗性发现（机制层面，未真机复现，如实标注）**：
+`MINIMAX_QUOTA_ERROR_TYPES` 等三张 type 表里，除 `insufficient_balance_error` /
+`rate_limit_error` / `invalid_request_error` 之外**没有真机取证**；
+402 的形态仍来自既有单测（本次未复现，本机账号余额充足）。
+
+**变异验证（第二轮，26 + 7 条注入实测）**：26 条里 **19 条与期望一致**
+（`#11` 不传 `tried` 实测 10 红，比预期更多）；**7 条暴露守卫缺失**，已逐条补齐并复验：
+
+| 缺口（改坏了也没人红） | 补的守卫 | 复验：变异 ⇒ 实测红 |
+|---|---|---|
+| `consumeMinimaxSse` 的 `kind`（`error.type`）生产端无人管（消费端那些断言喂的是**测试自己拼的字符串**） | messages 断言文案含 `insufficient_balance_error`；适配器的 200 流内帧用例改用**不含任何额度措辞**的 message | `kind` 置空 ⇒ **2 红** |
+| 同上 `code`（自家信封码） | messages 断言文案含 `code=402`；新增「SSE 自家信封**只有码**也换号」 | `code` 置空 ⇒ **2 红** |
+| `auth failed` 是**纯文案腿**、此前零覆盖 | 判据用例补 `{"error":{"message":"auth failed"}}`（status 0：无码、无 type） | 只删该腿 ⇒ **1 红** |
+| 用例「401 不含 auth 文案仍判 auth」**名不副实**（fixture 是 `{"code":401}`，被**码腿**兜住） | fixture 改成 `{}`（无文案、无码） | 删状态码腿 ⇒ **2 红** |
+| `isDefinitelyNotSse` 的**正腿**没锁（换号结果碰巧相同，但错误形状/错误码变了） | 新增「200 + json 且不可换号 ⇒ 错误含『非 SSE 响应』」 | 该函数恒 `false` ⇒ **1 红** |
+| `reader.cancel()` 零守卫 | messages 用 stub reader 断言 `cancel` 被调用 | 删该行 ⇒ **1 红** |
+| `rawSample`（响应原文）零守卫 | messages 断言「未返回任何内容块」带响应原文 | 置空 ⇒ **1 红** |
+
+⚠️ 两条普遍教训（写下来比记住强）：
+1. **「注释里写了理由」≠「有守卫」** —— `cancel()` 与响应原文样本两条都写了详尽的
+   理由与后果，实测都是**零覆盖**；`{"code":401}` 那条用例甚至**自称**锁住状态码腿，
+   实际被码腿兜住（`{}` 才是真正的判据）。
+2. **加一条「并联通道」会让既有用例失去判别力** —— 补上英文短语通道后，
+   原来靠 `error.type` 判额度的用例不再红（message 里的 `balance not enough`
+   自己就能判）；⇒ 用例的 message 必须**只留一条通道**才锁得住该通道。
 
 ### 9. 能力矩阵与 e2e
 

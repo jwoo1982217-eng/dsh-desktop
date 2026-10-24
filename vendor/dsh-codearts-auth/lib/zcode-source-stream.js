@@ -34,3 +34,4 @@ export async function* streamZcodeOrganization(options, credential, images, fetc
     }
     yield* consumeOpenAiSse(response, { signal: options.signal }, { label: 'zcode', firstTokenTimeoutMs: 120_000, chunkTimeoutMs: 120_000 });
 }
+//# sourceMappingURL=zcode-source-stream.js.map

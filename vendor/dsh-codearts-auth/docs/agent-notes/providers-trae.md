@@ -595,6 +595,57 @@ CN 项目实测：SOLO CN 的 agent-remote 模型单次响应上限 **64000 toke
 > 请求里通常**不会生效**（32K 已低于阈值）—— 它保留为「上游没声明时」的最后一道
 > 保险。若某模型远端声明偏大，调大 `DSH_TRAE_MAX_COMPLETION_TOKENS` 即可。
 
+### ⚠️ 流内 `code=4006`（体积超限）**不得**归 `SERVER`（Issue IKKX0T）
+
+**真实缺陷**（Gitee issue IKKX0T 的独立实测）：上游对流内错误用
+`event:error` 下发 `code=4006 We're sorry, the content is too large for AI to understand.`
+（实测边界 `(21,24]` 张 2560×1600 原图，即请求体 ≈100 MiB 量级）。
+
+归类点原先是行内三元：
+
+```ts
+ev.errorCode === 1005 || ev.errorCode === 4008 ? 'QUOTA_EXCEEDED' : 'SERVER'
+```
+
+4006 **既不是 1005 也不是 4008** ⇒ 落到 **`SERVER`**，而 `SERVER` **在** harness 的
+`DEFAULT_RETRYABLE_CODES`（`[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]`，
+已在 `dsh-llm` 实测确认）里 ⇒ **同一个巨型请求体被原样重发 5 次**
+（退避 500/1000/2000/4000/8000ms，约 15.5 秒），而体积超限是**确定性**失败。
+
+**修法**：抽出 `streamErrorCode(code)` 一张**逐格可测**的表（与
+`classifyTraeError` 同思路），4006 → `CONTEXT_WINDOW_EXCEEDED_CODE`：
+
+| 流内码 | 归类 | 理由 |
+|---|---|---|
+| `4006` | `CONTEXT_WINDOW_EXCEEDED` | 载荷过大：不重试 **且**能触发 `dsh-compaction-basic` 的溢出压缩 |
+| `1005` / `4008` | `QUOTA_EXCEEDED` | 额度类终态，用户需签到/换号 |
+| 其余（含 `4001`） | `SERVER` | 多属上游真 5xx/瞬时故障，**必须保留重试机会** |
+
+⚠️ **为什么归 `CONTEXT_WINDOW_EXCEEDED` 而不只是「换个不可重试的码」**：
+`dsh-compaction-basic` 的 request-error listener 第一行就是
+`if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()` ——
+只有这个码能换来「试一次压缩」。而**图片撑大的请求体正是压缩能真正缓解的那一类**。
+（同款取舍见 `buddy-adapter.ts` 的 `GATEWAY_PROMPT_TOO_LONG`。）
+
+⚠️ **三条边界，改这张表时逐条核对**：
+1. **4001 与 4006 不可合并**：4001 是「模型不可调用」（换号/压缩都无益），
+   4006 是「**这一次的载荷**太大」（压缩/少发图能救）—— 合并必牺牲一方；
+2. **`502 + HTML` 形态刻意不动**：issue 同时记了 trae 的
+   `502 ... invalid character '<' (code=3003)`，那与「上游真崩了」**无法区分**，
+   归成溢出会让真正的 5xx 故障失去重试机会（同 `upstreamStatusOrFallback` 的方向）；
+3. **只认 `4006` 这个码，不做措辞匹配** —— 措辞匹配在 5xx 与体积之间没有可靠判据。
+
+⚠️ **文案**：4006 的上游原文不提「图片」也不提「体积」，容易被读成模型能力问题，
+故 `traeStreamErrorMessage` 对它补一句可操作提示（与 4001 同款处理）。
+
+回归：`tests/unit/trae-adapter.spec.ts` 三条（★ 4006 不归可重试码且能触发压缩 /
+4006 与 4001 不可合并 / 未知码仍归 SERVER）。
+⚠️ **已做反向验证**（逐条独立变异）：还原成修复前的三元 → **2 条**变红；
+把整张表改成「所有码都归溢出」→ **另 2 条**变红（含那条「未知码仍归 SERVER」守卫）。
+
+⚠️ **仍未定值**：4006 的**归类**已修，但 trae 的 `imageMaxBytes` **仍未接** ——
+issue 是第三方实测，按本仓库规矩须用**自己的账号与 fixture** 复测后再定
+（入口 `pnpm test:e2e:image-bisect`，见 `protocol-wire.md` 的说明）。
 ### 机器指纹轮换默认**关闭**（`DSH_TRAE_ROTATE_MACHINE_ID`）
 
 CN 项目每 3~5 次请求主动换 `machine_id` 以「降低 IDE 端点风控」

@@ -235,3 +235,4 @@ export function captchaPoolConfigFromEnv(env = process.env) {
     const ttlMs = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_CAPTCHA_POOL_TTL_MS;
     return { enabled, ttlMs };
 }
+//# sourceMappingURL=captcha-pool.js.map

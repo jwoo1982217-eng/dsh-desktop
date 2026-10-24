@@ -810,3 +810,4 @@ function parseModelMeta(record) {
     }
     return meta;
 }
+//# sourceMappingURL=buddy.js.map

@@ -224,3 +224,4 @@ export function raccoonHeaders(credential, opts = {}) {
     }
     return headers;
 }
+//# sourceMappingURL=raccoon.js.map

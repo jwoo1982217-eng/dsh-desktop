@@ -49,3 +49,4 @@ export async function signRequestHuawei(ak, sk, securityToken, method, urlStr, b
     headers.set('Authorization', `SDK-HMAC-SHA256 Access=${ak},SignedHeaders=${signedHeaders.join(';')},Signature=${signature}`);
     return headers;
 }
+//# sourceMappingURL=sign.js.map

@@ -18,9 +18,9 @@
  * 目录取两边并集；本地服务没起来时，快通道模型仍可见可用。
  */
 import { LlmAdapter } from '@deepseek-ai/dsh-llm';
-import { OpencodeAdapter as ZenAdapter } from './opencode-adapter.js';
+import { OpencodeAdapter as ZenAdapter } from './opencode-inference-adapter.js';
 import { deriveProjectId } from './opencode.js';
-import { OPENCODE, OPENCODE_INFERENCE_MODELS, usesInferenceLane } from './opencode-product.js';
+import { OPENCODE, OPENCODE_INFERENCE_MODELS, usesInferenceLane } from './opencode-inference-product.js';
 /** 快通道的匿名槽（`Bearer public`，直连出口 IP 记账）。 */
 export function opencodeInferenceSlot() {
     return {
@@ -93,3 +93,4 @@ export class OpencodeHybridAdapter extends LlmAdapter {
         yield* this.local.stream(options);
     }
 }
+//# sourceMappingURL=opencode-hybrid-adapter.js.map

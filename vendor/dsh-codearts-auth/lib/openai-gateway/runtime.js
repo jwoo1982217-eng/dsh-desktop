@@ -101,3 +101,4 @@ export async function disposeGatewayRuntime() {
     // 密钥一并清掉：热重载后的新实例会重新解析，避免旧密钥被新配置继续使用。
     lastApiKey = null;
 }
+//# sourceMappingURL=runtime.js.map

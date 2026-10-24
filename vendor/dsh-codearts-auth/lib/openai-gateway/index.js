@@ -83,3 +83,4 @@ export function mountOpenAiGateway(ctx, pool) {
         void disposeGatewayRuntime();
     }, 'openai-gateway');
 }
+//# sourceMappingURL=index.js.map

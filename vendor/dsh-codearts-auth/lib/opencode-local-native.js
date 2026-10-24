@@ -274,3 +274,4 @@ export class OpencodeLocalService {
         await this.dispatcher.destroy();
     }
 }
+//# sourceMappingURL=opencode-local-native.js.map

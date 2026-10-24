@@ -92,3 +92,4 @@ export function suppressAutoSettingsPage(ctx) {
         // 已配置过（同一实例重复调用）不是错误。
     }
 }
+//# sourceMappingURL=settings-compat.js.map

@@ -67,3 +67,387 @@ allowBuilds 判定，不换 commit 会得到假的"成功"）：
 2. **README「方式一」的放行键必须按 pnpm 大版本分别给出**，不能把某一代的写法写成通用解。
    唯一跨版本可用的是 `dangerouslyAllowAllBuilds: true`（代价：放行该 profile 里所有依赖的
    构建脚本）。改完请照上表重跑一遍验证 —— 尤其**要换新 commit**，否则缓存会骗你。
+
+## ⚠️ 额度类业务码**不是一个值，是一条链** —— 只认 `110` 会让换号静默失效（Issue IKKJFH）
+
+**用户报障**（2026-10-10，Gitee issue IKKJFH，provider `qoder` 国内版）：
+
+```
+本轮运行失败  qoder: {"pricingUrl":"https://qoder.com.cn/pricing?client=qoder"} (112/model_error)
+模型请求重试已取消 (2/5)
+```
+
+观感是**「轮换没生效」**：白退避、重试计数走到 2/5，期间**既没换号也没换 provider**。
+
+**根因**：`src/model-queue.ts` 的额度判据原先**只认单码值 `110`**，
+`isBillingBusinessCode('112')` 为 false，文案兜底 `looksLikeBillingError` 也不含
+`pricingUrl` ⇒ 三个判据全 false ⇒ 落 `SERVER` ⇒
+
+1. `SERVER` **在** harness 的 `DEFAULT_RETRYABLE_CODES` 里 ⇒ **白退避 5 次**；
+2. `qoder-adapter.isQuotaExceededError(SERVER) = false` ⇒ `switchAccountOnQuota`
+   **永不被调用** ⇒ **既不换号、也不换 provider**。
+
+⚠️ 这与 2026-09-27 那次 `110` 缺陷**完全同型，只是换了码值**。
+
+### 两条判据腿**必须同时在**，缺一条下次换码值就复发
+
+- **码值腿**：`BILLING_BUSINESS_CODES = ['110', '112']`
+  （`BILLING_BUSINESS_CODE` 保留为单值再导出，仅为对外 API 兼容，**判据别用它**）；
+- **文案腿**：`looksLikeBillingError` 增认结构字段 `"pricingUrl"\s*:`。
+
+⚠️ **`pricingUrl` 是窄词**：它是该错误报文的**结构字段名**，不是自然语言。
+判据是**认结构字段，不认主题词** —— 实测 `balance` / `quota` / 正常讨论 pricing 的正文
+都不含这个键名，故不会误伤（单测有反向断言锁住）。
+
+### ⚠️ 证据强度（如实标注，别当成客户端产物实证）
+
+`110` 当年的取证是**读客户端 obf 产物原文**（`billing_error → permission`）。
+`112` **没有**那份证据：本机未装 Qoder 客户端 ⇒ 无产物可读；上游全历史搜
+`pricingUrl` **零命中**。现有依据是**报文语义**（定价页链接 = 付费才能用）＋
+**兄弟码同类**。若哪天能拿到客户端产物，欢迎修正 `112` 的语义。
+
+### 反向验证（四条各自独立，别当同义反复删掉）
+
+| 变异 | 变红用例 |
+|---|---|
+| 集合改回 `['110']` | 纯函数「110 与 112 都算额度」 |
+| 正则撤掉 `"pricingUrl"` | 「pricingUrl 报文算额度」＋「无业务码只有 pricingUrl 文案」 |
+| **源码整体回退到修复前** | **6 条**（含行为用例「112 同样触发换号」） |
+
+⚠️ 「归 `QUOTA_EXCEEDED`」与「真的切了号」是**两件事** ——
+`switchAccountOnQuota` 在无池/无候选时会返回 `undefined` 而码仍然正确。
+故 `112` 必须有一条**走完整行为链**的用例（标记 → 取号传 tried → 换号重发 → 拿到内容），
+只断言错误码会漏掉 issue 现象的另一半。
+
+### 顺带记录：`qoder-adapter.ts` 的 `isBillingBusinessCode(response.status)` **恒 false**
+
+HTTP 分支那条判据（`src/qoder-adapter.ts:809` 附近）把 **HTTP 状态码**传给了判**业务码**的
+函数 —— 两者是不同命名空间（业务码是 `110`/`112`，状态码是 `2xx/4xx/5xx`），
+实测 `200/400/401/403/429/500/502` 逐个喂进去**全部 false**（`110`→true）。
+该分支实际只靠右边的 `looksLikeBillingError(errorText)` 兜住。
+**本次未改**（不在 IKKJFH 范围内）：注释里写明是「为服务端将来改用 HTTP 状态码下发而预留」，
+是否要补「从 body 里解析业务码」那条腿属独立决策，交维护者判断。
+
+## ⚠️ 渠道原生搜索（2026-10-14 接入）
+
+Qoder 客户端**自带** WebSearch 能力，与聊天同源同账号。本插件把它接到官方
+`web_search` 工具上（`QoderAdapter.searchOnce`，见
+`src/native-search-contract.ts` 的契约说明）。
+
+### 端点与请求形状（全部来自官方客户端源码 + 真机实测）
+
+| 项 | 值 |
+|---|---|
+| host | 本产品的 `encryptedInferBase`（CN = `gateway.qoder.com.cn`；国际实测 `center.qoder.sh` / `api2.qoder.sh` / `gateway.qoder.com.cn` **都能通**） |
+| path | `/api/v1/webSearch/oneSearch` |
+| method | `POST` |
+| 鉴权 | **WASM 签名**（`prepareRequest(host, path, 'POST', 'auth', body)`，本插件已实现于 `src/qoder-wasm.ts`） |
+| 请求头 | `Authorization: Bearer COSY.<载荷>.<签名>` + 18 个 `Cosy-*` 头（全由 WASM 生成）+ `X-Session-ID` |
+
+**明文 payload**（信封内层）：
+```json
+{ "query": "…", "timeRange": "NoLimit",
+  "contents": { "mainText": false, "markdownText": false, "summary": false } }
+```
+
+**明文 body**（信封外层）：
+```json
+{ "payload": "<上面那个 JSON 的字符串>", "encodeVersion": "1" }
+```
+
+**响应**：`{ requestId, pageItems: [{title, link, snippet, publishedTime, hostname, hostLogo}], searchInformation: {searchTime} }`
+
+### 源码依据（`qoder-worker-runtime.obf.mjs`，asar.unpacked 里）
+
+```js
+p0d = "/algo/api/v1/webSearch/oneSearch"
+$bt = class { async search(A) {
+  let e = { query: A.query, …, timeRange: "NoLimit",
+            contents: { mainText: false, markdownText: false, summary: false } }
+  return (await this.sender.send(mi.builder().operation("webSearch.search")
+    .endpoint("webSearch").post(p0d).withSignature("auth")
+    .json({ payload: JSON.stringify(e), encodeVersion: "1" }).build())).json(m0d)
+}}
+// path 另有 `/api/v1/webSearch/unifiedSearch`（通义灵码环境走它）
+function APl() { return ePl() ? "/api/v1/webSearch/unifiedSearch" : "/api/v1/webSearch/oneSearch" }
+// endpoint host：webSearch 与 center **同一个 host**
+poe = { prod: { center: `https://${Mme}`, webSearch: `https://${Mme}`, … } }
+```
+
+### ⚠️ 四个不能改错的点
+
+1. **`hostname` / `hostLogo` 必须丢弃**：官方 output schema 是
+   `additionalProperties: false`，多传字段会让 `createSuccessResult` 抛
+   `ToolOutputError`，**整条调用失败**（不是少一条结果）。
+   ⚠️⚠️ **但 `publishedTime` 属于另一格**（2026-10-14 PR95 审计修正）：官方
+   `dsh-tool-web` 的 output schema 与 seam 的 `WebSearchSource` **都**声明了
+   可选的 `publishedAt?: string`（「provider 给的发布时间戳」）—— 原注释把三个
+   字段一锅端说成「schema 不允许」，对 `publishedTime` **不成立**。
+   **当前刻意仍丢弃**：接它要先真机确认 Qoder 下发的是 ISO-8601 字符串，
+   接错的代价是整条调用失败，收益（多一列时间）不抵风险。**待办**。
+2. **url 字段叫 `link`**（腾讯叫 `url`）—— 投影时必须改名。
+3. **WASM 实例必须 `dispose`**：`QoderContext` 是 wasm 堆上的 Rust 对象，
+   `gluePromise` 是进程级单例，不释放会让堆只增不减 → 长上下文会话最终以裸
+   `RuntimeError: unreachable` 暴毙（真实事故史见 `qoder-wasm.ts` 文件头）。
+4. **两处 path 别混**：`oneSearch` 是默认；`unifiedSearch` 只在通义灵码环境下用。
+
+### 与腾讯（buddy 系）的差异对照
+
+| | 腾讯 | Qoder |
+|---|---|---|
+| 端点 | `/agenttool/v1/search` | `/api/v1/webSearch/oneSearch` |
+| 参数 | `{query, type:'text2text', max_results}` | `{query, timeRange, contents}` |
+| 鉴权 | `Bearer <access_token>` | **COSY 签名（WASM）** |
+| 信封 | 明文 JSON | `{payload, encodeVersion}` + 加密 body |
+| 结果字段 | `results[].{title,url,snippet}` | `pageItems[].{title,link,snippet,…}` |
+| 上限 | 8（上游实测封顶） | 实测返回 10 条（本插件仍按官方 `MAX_RESULTS=8` 截断） |
+
+### 实测记录（2026-10-14）
+
+- CN 免费账号（`qfmodel` 所在的号）：`POST https://gateway.qoder.com.cn/algo/api/v1/webSearch/oneSearch?Encode=1` → **HTTP 200**，
+  返回 10 条 `pageItems`。
+- **与客户端真实调用逐条对比**（客户端侧证据取自本机
+  `~/.qoder-cn/projects/…/d6bb315c-….jsonl` 的真实会话记录）：
+  **URL 10/10 一致、标题 10/10 一致、顺序完全一致**。
+- `searchInformation: { searchTime: 371 }` 是搜索耗时，客户端**未使用**该字段。
+
+### ⚠️ 未验证
+
+- 官方还有第二个后端：`tools.webSearch.provider = bailian`（阿里百炼 MCP，
+  `https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/mcp`，需 Bailian API Key）。
+  本插件**未接入**它 —— 默认走 `qoder` 后端（用户机器上也是默认）。
+- 国际版（`qoder` 非 CN）的搜索 host 官方源码写的是 `center.qoder.sh`，
+  实测三个 host 都能通；本插件用 `product.encryptedInferBase`（`api2.qoder.sh`）。
+
+## ⚠️⚠️ 远端模型目录：静态兜底表**必然腐坏**，已改走 `/api/v2/model/list?Encode=1`（2026-10-20）
+
+### 用户报障与根因
+
+「Qoder（含中国版）里 DeepSeek-Flash 上游已经 **0×（免费）** 了，插件列表还显示 **0.1**」。
+
+根因是**结构性的**：本家此前**恒用编译期兜底表**（`QoderProduct.fallbackModels`，
+国际版快照 2026-09-21 / 中国版 2026-09-27），一次远端请求都不发
+（`catalogEntries()` 直接 `product.fallbackModels.map(...)`，`loadCatalog` 与
+`syncCatalog` 是同一份）。上游改价/改免费额度/上下架模型都不会通知任何人。
+
+**真机对账（2026-10-20，两站各自最新的 `catalog-v6`）**：
+
+| 现象 | 兜底表 | 上游实际 |
+|---|---|---|
+| `dfmodel`（DeepSeek-Flash） | `price_factor = 0.1` | **`0` + `is_free` + 原价 0.1**（IDE 显示 `0.1×`划掉`0×`） |
+| `mmodel` | 国际 `MiniMax-M3`/0.2、CN `MiniMax-M2.7`/0.2 | **`MiniMax-M3.1-Flash` / 0.1**（CN 的 `is_vl` 还是 false→true） |
+| `fast` | 无此条 | 有（`price_factor 0.8`，见下面的版本闸门） |
+| `qmodel_38max` / `qmodel_latest` / `qmodel` | 存的是**采集时刻的折后价** | 现在下发**窗口外原价**，且 `qmodel_latest` 的 `promotion` **整块被删**（我们会显示一个不存在的折扣） |
+| 国际 `ultimate` / `efficient` | 无 promotion / 窗口 1M | 新增 promotion(0.2/2) / 最大档 **200K** |
+
+### 协议（取自 IDE 产物 + 真机实测）
+
+客户端 `qoder-worker-runtime` 的 `listModelsFromRemote`：
+
+```js
+let s = "/api/v2/model/list?Encode=1"           // 可再拼 &outerProviders=…
+let A = JqA(g, s, this.authManager)             // ← WASM 签名（prepareRequest）
+await this.fetchWithTrace({ operation:"listModels", endpointType:"infer",
+  method:"GET", path:s, url:A.url, init:{ method:"GET", headers:A.headers } })
+let E = rb(await B.text())                      // ← rb = decrypt_server_response（失败即明文）
+let u = JSON.parse(E)                           // { 场景: [模型…] }
+```
+
+四条**实测边界**（`src/qoder-catalog.ts` 的模块头有完整版）：
+
+1. **host = `encryptedInferBase`**，WASM 自己补 `/algo` 前缀
+   ⇒ 实发 `…/algo/api/v2/model/list?Encode=1`（手写 `/algo` 会 404）。
+2. **只发 GET、无 body**，鉴权是 WASM 生成的 `Bearer COSY.<载荷>.<签名>`（18 个头）。
+3. **`Encode=1` 不保证响应加密** —— 两站实测都回**明文 JSON**
+   （`decrypt_server_response` 失败即明文，与官方 `rb()` 逐字同形）。
+4. **响应是 `{场景: [模型]}`**：`chat / developer / assistant / inline / quest /
+   qwork / experts / qwake / app / byok_teams / byok_enterprise`；本插件取 `chat`。
+
+### ⚠️⚠️ 版本闸门：`fast` 拿不到是**设计如此**，不是缺陷
+
+条目可带 `minimal_version: {app, cli, qoder_wake, vsc}`，服务端按**请求方自称的
+客户端类型**选命名空间比较。同一账号、只改身份与版本的实测：
+
+| 身份 + 声明版本 | `chat` 条数 | `fast` |
+|---|---|---|
+| `client_type=5`（cli，本插件）+ `1.1.49`（= `COSY_VERSION`） | 14 | ✗ |
+| `client_type=5` + `1.1.69` | 14 | ✗ |
+| `client_type=5` + `1.1.70` | 15 | ✓ |
+| `client_type=10`（app，IDE 用它）+ `0.4.8` | 14 | ✗ |
+| `client_type=10` + `1.1.66` | 15 | ✓ |
+| `client_type=10` + `1.1.69`（= IDE 的 SDK 版本常量 `NH`） | 15 | ✓ |
+
+⇒ 闸门是 `{app: 1.1.66, cli: 1.1.70}`，IDE 是 **app 身份 + 1.1.69** 才刚好过。
+本插件用 **cli 身份 + 1.1.49** ⇒ 需要 1.1.70 才够，故**天然拿不到 `fast`**
+（用户 2026-10-20 明确「不需要这种 IDE 融合档位」）⇒ **刻意不动 `COSY_VERSION`**：
+它同时被**推理**签名使用，为一个融合档位抬高声明版本属未经实测的改动。
+**其余 14 个模型不受影响**（1.1.49 下 `dfmodel` 的 `price_factor/is_free/
+original_price_factor` 与 `mmodel` 的改名都已是最新值）。
+
+### ⚠️⚠️ `is_reasoning=false` 不是「不支持思考」—— 两条信号相互独立（2026-10-20 用户追问）
+
+用户追问：「实测 CN 的 DeepSeek-Flash 支持思考、也有档位，为什么列表里
+`is_reasoning=false`？」
+
+**因为上游这两个信号本来就分开，且可以反向**：
+
+| 信号 | 来源 | 决定什么 |
+|---|---|---|
+| 思考档位清单 | 目录 `thinking_config.enabled.efforts` 的键 + `disabled` 分支 | **UI 的档位下拉**（`qoderEffortsFor`；CN `dfmodel` = 高/最大/低 + 关闭思考） |
+| 是否真的思考 | 请求体 `parameters.reasoning_effort` + `enable_thinking` | 服务端行为 |
+| `is_reasoning` | 目录字段 | **只是**写进 `model_config.is_reasoning` / `chat_context.extra.modelConfig.is_reasoning` |
+
+**真机实测**（本插件自己的链路，CN `dfmodel`，其 `is_reasoning` = false，
+免费模型零成本）：`reasoning_effort=max` → **238 字符**思考、`low` → **199**、
+`none` → **0**（关得掉）⇒ 支持思考、档位真实生效、`false` 完全不影响。
+
+**客户端源码同款**（`qoder-worker-runtime` 的 `fal()`）：
+
+```js
+s = r?.is_reasoning ?? false            // 目录值原样取
+u = { key, …, is_reasoning: s, … }      // → modelConfig.is_reasoning
+…
+(0 === o?.thinkingBudget || 'none' === h.reasoning_effort || false === h.enable_thinking)
+  && (l.is_reasoning = false)           // ⚠️ 只会强制成 false，**从不置 true**
+```
+
+⇒ IDE 对同一模型发出去的**也是 `false`**，我们与它逐字一致（`supportsThinking`
+在适配器里**只有一处**用途：`isReasoning: fallback?.supportsThinking ?? false`）。
+⇒ **不要**据此把 `efforts` 丢掉，也**不要**为了「看起来对」把它改成 true
+（那会与 IDE 的请求体分叉，且 `is_reasoning` 的服务端语义**未验证**）。
+
+⚠️ 关联记录：`performance` / `qmodel_latest` / `qmodel` / `kimi` 系等条目
+同样是 `is_reasoning=false` 却有档位（INTL 的 `performance` 早在静态表年代
+就登记过这一格）。
+
+### ⚠️ 目录是**按账号**下发的，且 upsert 语义是「整体替换」
+
+- 实测同一 provider 下不同账号拿到的条数**不同**：国际版 9 个凭据里有一个
+  免费额度号，上游只给它 **2 条**（`qfmodel` + `dfmodel`），其余 17 条。
+- 适配器缓存是「**上一次成功那一个账号的目录**」（20 分钟 TTL）。
+  ⚠️ 导入的后果已如实登记：多账号池下，谁被选中决定菜单宽窄；
+  **不要**把多个账号的目录并集起来（那会宣告当前账号用不了的模型，
+  报错面比菜单短更难排查）。
+
+### 接线三点（缺一即静默失效，与其余 12 家同形）
+
+1. **取数在 auth 服务**：`QoderAuth.fetchModels(pool)` 只做池的**只读**读取
+   （`getAvailableAccount`，不写任何账），池空时回退默认 ref。
+   ⚠️ **不得**改成适配器里的 `resolveCredential` —— 它选中账号时会
+   `reportAccount`（写「本次实际使用的账号」），而目录请求是周期性的
+   （20 分钟刷新器），会把额度标记**改写到目录用的账号**上
+   （`index.ts` 的 `activeQoderAccountId` 注释逐字警告过这个后果）。
+   守卫：`qoder-auth.spec.ts` 的「池必须只读」（`updateAccount` 不得被调用）
+   + `qoder-adapter.spec.ts` 的「目录取数不得走 `resolveCredential`」。
+2. **`refresh()` 必须转发** `catalog.refresh`（否则后台刷新器对本家空转且零日志，
+   `be42b25` 的形态）；已被 `model-catalog-parity.spec.ts` 的逐家点名表覆盖
+   （12 → **14** 家）。
+3. **`onCatalogLoaded` 必须接广播**（`registerQoderLlm` 已注入
+   `broadcastCatalogChanged(ctx)`）：DSH 客户端把目录缓存在 `ready` 即短路的
+   store 里，远端目录异步落地后不广播 ⇒ 选择器**永久**停在冷启动那份兜底表。
+
+### 单测/探针的两个实测教训
+
+- ⚠️⚠️ **该端点对「伪造凭据」也回 200**（返回**真实目录**）。中途一版实现把
+  取数放在适配器内 + 走全局 `fetch` ⇒ **每个单测都真发 HTTPS 并拿到上游真表**，
+  「自定义 product + 单条兜底表」的 4 条用例以 `Auto · x0.5`（而非 `Unknown`）
+  失败。⇒ 适配器**不再自己发请求**（注入式），单测默认不接线即恒走兜底表。
+- ⚠️ 既有的 `qodercn-probe.e2e.spec.ts` **「续期」用例是写操作**
+  （`/device_token/refresh` 会轮换 `refresh_token` 且探针**不落盘**）——
+  文件头原写「全部只读」。已加二次确认闸门
+  （`DSH_QODERCN_E2E_REFRESH_CONFIRM=yes`）。⚠️ 本轮跑过一次，已把轮换后的
+  凭据手工回写该 CN 账号（并同步池的 `expiresAt`），
+  `userinfo` 复验 200。
+
+### ⚠️ 不在这条链路上的东西
+
+- **「1017」这类版本串不在模型列表里**：它是 IDE 的**遥控文案**
+  （`GET {base}/ide-text/latest?namespace=…` → OSS，缓存名 `dynamic-texts.json`，
+  键 `modelSelector.item.dfmodel.markdownDescription`）。模型列表只给
+  `display_name = "DeepSeek-Flash"` ⇒ 我们的列表能反映「已免费」，
+  但**显示不出 `-1017` 这个版本后缀**（不接 `ide-text` 就没有）。
+- 本机 `~/.qoder{,-cn}/.models/{uid}/catalog-v6` 能离线解出同一份数据
+  （只需 uid，`model_cache_decrypt`），但**只对该账号在本机 IDE 打开过时存在**
+  ⇒ 纯插件用户恒为空；线上路径不用它，只用于排查对账。
+
+## ⚠️⚠️ 审计补记：一轮 subagent 审计 + 对抗审计（2026-10-20，接入远端目录之后）
+
+用户要求「对这个提交的修改用 subagent 驱动的方式启动一轮审计和对抗性审计」。
+派了**两个独立沙箱**（`git worktree add --detach … 8b41403`，`node_modules` 用目录联接，
+`pnpm build` 在 worktree 里会因联接失败 ⇒ 改用 `npx tsc -p tsconfig.json` +
+`copy-assets` + 客户端 `build.mjs` 补 `lib/`）。主工作区**三次指纹比对零改动**。
+
+### 真缺陷 1 ★★：能力/元数据判据的**取值域**从「编译期超集」变成「按账号变化的子集」
+
+`inputModalitiesFor()` 与 `stream()` 的模型元数据改查「当前目录」后，而 Qoder 的目录是
+**按账号**下发的（实测：一个免费额度号上游只给 2 条）⇒ 目录里没有的模型被当成「未知」：
+
+| 场景 | 只查远端（缺陷态） | 取并集（现行） |
+|---|---|---|
+| `dmodel` + 远端大目录 | ✅ | ✅ 远端优先 |
+| `dmodel` + 远端只剩 2 条 | ❌ **硬拒图片** `UNSUPPORTED_CONTENT`；`name` 退化成裸 id、`context`/`reasoning` 消失、请求体 `display_name`/`max_input_tokens`/`is_reasoning` 一并退化 | ✅ 回退静态表 |
+| `fast`（只在远端有） | ✅ | ✅ 远端命中 |
+
+**修法**：`catalogModel()` = 远端 ∪ 静态表（**能力/元数据**判据取并集）；
+**菜单（`listModels`）仍远端独占**（不能把账号用不了的模型摆出来）。
+`resolveModel` 与 `listModels` 共用 `loadCatalog()`，故用「静态表专用的第二个
+`ModelCatalog` 实例」做回退，复用骨架自己的装配逻辑（原来想在适配器里重写，
+那会是同一语义的第二套判据）。
+
+⚠️ 我复现时的读数（`resolveModel('dmodel')`）：无远端 → `name="DeepSeek-V4-Pro"
+modalities=["text","image"] context={"contextWindow":1000000}`；远端只有 `fast` →
+`name="dmodel" modalities=["text"] context=null reasoning=null` + `stream()` 硬拒。
+
+### 真缺陷 2：`isFree` 端到端未通（Jet Hub「免费额度」分组拿不到）
+
+`plugin-src/client/model-groups.js` 的免费桶**只认** `model.isFree === true`，
+`src/cline-adapter.ts` 的成文约定也是「`isFree` 必须透出」；解析层已产出它，
+但 `toCatalogEntry()` **从不写**这个键（改造前也如此 ⇒ 不是本提交引入的回归，
+但提交信息「免费标记跟随上游」说过了头）。已补一行透出 + 用例。
+
+### 对抗审计：六条**假绿**（我逐条独立复现）
+
+| 变异 | 变异后读数 | 缺口 |
+|---|---|---|
+| `refresh()` 空转（成员在、什么都不做） | `model-catalog-parity` **49 passed** | 该守则只判 `typeof === 'function'` ⇒ 抓不到「转发但空转」，而它引用的 `be42b25` 缺陷恰是空转。**已如实收窄其声明范围**（行为面由各家自己的 refresh 用例承担；该文件多数 CASE 不注入 `fetchRemoteModels`，通用化会真发网络） |
+| `supportsDisable = true` 恒真 | 4 spec **175 passed** | 无用例喂「无 `disabled`」的远端条目 ⇒ 已补（会给所有模型臆造「关闭思考」档位） |
+| `parseEfforts` 末尾 `sort()` | **175 passed** | 「不要排序」铁律无守卫；唯一可观察序的期望值恰是字典序 ⇒ 已补非字典序输入 |
+| `readString` 去掉非空 | **175 passed** | 空串 `key`/`display_name` 零覆盖（放过 ⇒ DSH `INVALID_CATALOG` ⇒ provider 整个消失）⇒ 已补 |
+| 删池读 `.catch(() => null)` | auth+adapter **111 passed** | 「池读 reject 不炸」零守卫；且 `await` 原在 `try` **之外**，reject 会抛穿 ⇒ 已把整段收进 `try` + 补用例 |
+| `fallbackModels` 置空 | 9 条 describe **9 passed** | 断言写成 `toBe(QODER.fallbackModels.length)` 是**同义反复**（`0 === 0`）⇒ 已改成 `>0` + **内容锚定**（`dmodel` 必须存在）。⚠️ 真正抓住「菜单变空」的是 parity 的 (j)（实测 `1 failed`），但那 3 条自己不承重 |
+
+### 解析口径对齐官方客户端（审计发现 + 我的独立发现）
+
+| 项 | 官方（本机产物取证） | 我们（修前 → 修后） |
+|---|---|---|
+| 档位白名单 | `k3 = ["none","low","medium","high","xhigh","max"]`（**6 个，无 `minimal`**） | 7 个（多 `minimal`）→ 对齐 6 个；中文名表保留 `minimal` 但注明「不在线上白名单」 |
+| `efforts` 形态 | `sgi()`：**数组 / 逗号或空格字符串 / 对象** 都认（并去重、过白名单） | 只认对象 → 三形态都认 |
+| `available_reasoning_effort` | `R3({thinking_config: 该字段})` ⇒ 它是**一个 thinking_config 对象** | 直接当档位表解析（恒空）→ 包一层；并按官方短路语义，**只在条目自身既无档位也无 `disabled` 时**才读它 |
+| 顶层 `default_effort` | `c = ci(e.default_effort ?? e.defaultEffort)`，作默认档兜底 | 未读 → 已读 |
+| `is_default` | `vhc()`：**蛇形与驼峰都认** | 只认蛇形 → 都认 |
+| `supports_disabled` | `l = a?.supportsDisabled \|\| e.supports_disabled \|\| e.supportsDisabled` | 只看 `thinking_config.disabled` → 补顶层两条腿 |
+
+### 本轮**未修**（已登记，等真机/用户决策）
+
+- **R4 折扣展示口径**：官方 `yo0()` 是「当前价恒取 `price_factor`；划线原价 =
+  `promotion.active ? beforePromotionPriceFactor ?? originalPriceFactor : originalPriceFactor`」，
+  **从不做 `before×discount` 乘法**。我们的 `qoderDisplayName()` 用**本地时钟推窗口 + 乘法**
+  （既有代码，非本提交引入）。改动会改用户可见文案 ⇒ 待拍板。
+- **R5**：`refresh()` 先清 `catalogAt=0` 再拉，失败后停在 0 ⇒ 冷却（30 s）一过就重打上游
+  （同形态 accio/trae 也有）。
+- **R6**：`decrypt_server_response` 的**真加密**分支零覆盖（两站实测都回明文）；
+  上游真加密时会 `JSON.parse(密文)` 抛错 ⇒ 静默回退兜底表（只留一条 warn）。
+- **R7**：黑名单按 id 写、不随目录收缩而收缩 ⇒ 大目录下点过「关闭全部」后切到
+  2 条目录的免费号，`listModels` = 2 − 黑名单 = `[]` ⇒ **DSH 隐藏整个 provider**
+  （设置页走 `listAllModels()` 仍可逐条恢复）。端到端复现需真实多账号池，**未实测**。
+
+### 三条过程教训（比结论更值钱）
+
+1. **「守卫有牙」与「取值域正确」是两件事**：提交前我做过 4 处变异验证（都变红），
+   但**没有一处**问「我把谁的取值域换掉了」⇒ 缺陷 1 就是从这个缝里漏出去的。
+2. **新写的守卫自己可能是假绿**：我给缺陷 1 写的图片回归用例**直接 `stream()`**，
+   没有先把远端目录读进缓存 ⇒ `catalogSource()` 还是静态表 ⇒ 变异打不中它
+   （变异验证实测：`92 passed`）。**先加载再断言**才是真判据。
+3. **变异脚本的锚点必须先自证**：CRLF 上 `replace` 会静默不生效；本轮另有两条锚点
+   因「把 `await` 移进 `try` 后缩进变了」而失配 ⇒ 必须报 `PATCH-NOT-APPLIED`
+   而不是当成「无牙」。

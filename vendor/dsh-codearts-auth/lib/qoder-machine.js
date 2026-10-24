@@ -496,3 +496,4 @@ export async function withQoderMachineHeadersAsync(headers, forceExecutable) {
         'Cosy-MachineType': identity.type,
     };
 }
+//# sourceMappingURL=qoder-machine.js.map

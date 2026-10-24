@@ -213,3 +213,4 @@ export function resolveOrcaTermCredential(options = {}) {
     catch { /* 读不到就当没有 */ }
     return null;
 }
+//# sourceMappingURL=orcaterm-credential.js.map

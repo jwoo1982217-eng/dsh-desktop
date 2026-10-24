@@ -79,3 +79,4 @@ export function buildVirtualModels(catalogs) {
         : a.key.localeCompare(b.key)));
     return models;
 }
+//# sourceMappingURL=aggregate-catalog.js.map
