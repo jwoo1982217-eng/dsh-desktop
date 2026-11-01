@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import {
   DEFAULT_IMAGE_LIMITS,
@@ -80,7 +80,14 @@ export function gatewayToolResultBlock(
   return { type: 'tool-result', toolCallId, content } as unknown as ContentBlock
 }
 
+/** 工具结果由当前宿主工厂构造，兼容旧包裹块和新 role:tool。 */
+export function createGatewayToolMessage(toolCallId: string, content: Message['content'], isError?: boolean): Message {
+  return createToolResultMessage({ callId: toolCallId as never, content, isError: isError === true })
+}
+
 export interface OpenAiChatMessage {
+  reasoning_content?: unknown
+  reasoning?: unknown
   role?: unknown
   content?: unknown
   tool_calls?: unknown
@@ -498,7 +505,11 @@ async function convertMessage(
     // `arguments` 实测不拦，故原样传递（改它会破坏「工具调用参数是要回读的证据」）。
     const text = rewriteTencentContentFingerprints(textFromContent(value.content), provider)
     // ⚠️ 先累积再构造（0.2.0 的 content 是 readonly，不能事后 push）。
-    const content: ContentBlock[] = text.length > 0 ? [{ type: 'text', text }] : []
+    const reasoning = typeof value.reasoning_content === 'string' ? value.reasoning_content : typeof value.reasoning === 'string' ? value.reasoning : ''
+    const content: ContentBlock[] = [
+      ...(reasoning.length ? [{ type: 'reasoning' as const, text: reasoning }] : []),
+      ...(text.length ? [{ type: 'text' as const, text }] : []),
+    ]
     if (value.tool_calls !== undefined) {
       const calls = convertToolCalls(value.tool_calls)
       content.push(...calls)
@@ -517,7 +528,7 @@ async function convertMessage(
       // ⚠️ 边界如实标注：**无** `tool_calls` 的空 assistant（`content:''`）在改前
       // 也产出同形，故这**不是本次引入的回归**；但本次修法把它从「罕见」变成
       // 「坏块会话的必经路径」（坏块会话一定会走到这里），故一并堵上。
-      if (calls.length === 0 && text.length === 0) return undefined
+      if (content.length === 0) return undefined
     }
     return createGatewayMessage('assistant', content, { kind: 'model', provider, model })
   }
@@ -526,8 +537,7 @@ async function convertMessage(
       throw new OpenAiGatewayError('tool messages require tool_call_id')
     }
     if (callIds.dropped.has(value.tool_call_id) && !callIds.kept.has(value.tool_call_id)) return undefined
-    return { ...createGatewayMessage('tool', await partsFromContent(value.content, bridge, limits),
-      { kind: 'tool', callId: value.tool_call_id as never }), toolCallId: value.tool_call_id } as Message
+    return createGatewayToolMessage(value.tool_call_id, await partsFromContent(value.content, bridge, limits))
   }
   throw new OpenAiGatewayError(`unsupported message role: ${String(role)}`)
 }

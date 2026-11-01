@@ -16,8 +16,18 @@ const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
 
 describe('buddy 补偿积分面板：渲染门控', () => {
-  it('卡片只在 provider === buddy 且已查询到状态时渲染', () => {
-    expect(source).toContain("provider === 'buddy' && compensation !== null")
+  it('卡片只在 provider === buddy 且 shouldShowCompensation 为真时渲染', () => {
+    expect(source).toContain("provider === 'buddy' && shouldShowCompensation(compensation)")
+  })
+
+  it('★★ 渲染门控不得退回 `compensation !== null`（用户 2026-10-26：领取后隐藏）', () => {
+    // 旧条件只要状态非空就常驻 ⇒ 全部领完之后面板顶部仍挂一条
+    // 「补偿积分已领取 / 限时活动…」的死文案（用户报障）。
+    expect(source.includes("provider === 'buddy' && compensation !== null"), '渲染条件退回旧形态了').toBe(false)
+  })
+
+  it('★★ 副文案为空时不挂空 div（否则 .dim-jh-hint 的 margin 会凭空多出一截）', () => {
+    expect(source).toMatch(/compensationHint\(compensation\)\.length > 0\s*\n?\s*\? React\.createElement\('div'/)
   })
 
   it('卡片挂在 ProviderPanel 内（抽成 compensationCard 变量）', () => {

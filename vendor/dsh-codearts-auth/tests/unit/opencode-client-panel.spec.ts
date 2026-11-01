@@ -115,12 +115,14 @@ describe('面板文案', () => {
   })
   it('⚠️ opencode 的新建是粘贴 key，不是浏览器登录（空态与创建流程都要改）', () => {
     expect(hub).toMatch(/opencode\.addAccount/)
-    expect(hub).toMatch(/opencode\.ai\/auth 生成，形如 sk-…/)
+    // ⚠️ 文案两种前缀都要提（IKPLRU：2026-10-22 起新 key 是 `oc_sk_…`，
+    // 旧号仍是 `sk-…`）；生成地址是控制台账号页，旧的 `/auth` 已 302 到登录页。
+    expect(hub).toMatch(/opencode\.ai\/console\/account 生成（旧 key 形如 sk-…，新 key 形如 oc_sk_…）/)
   })
   it('⚠️ 添加 key 走自绘弹窗：password 输入 + Enter 提交 + 错误留在弹窗内', () => {
     // 输入框在 modal 文件里（纯展示层），提交逻辑在 jet-hub.js（宿主交互）。
     expect(modal).toMatch(/type: 'password'/)
-    expect(modal).toMatch(/placeholder: 'sk-…'/)
+    expect(modal).toMatch(/placeholder: 'sk-… \/ oc_sk_…'/)
     expect(modal).toMatch(/e\.key === 'Enter'/)
     expect(hub).toMatch(/const \[keyModal, setKeyModal\] = React\.useState/)
     expect(hub).toMatch(/keyInputRef/)
@@ -186,14 +188,60 @@ describe('弹窗必须是 React 组件（hooks 规则，真实事故 2026-10-02�
     // ⚠️ 2026-10-18：代理弹窗改成按 provider 三元选择
     // （`proxyModal.provider === 'gemini' ? GeminiProxyModal : OpencodeProxyModal`），
     // 逐字串 `React.createElement(OpencodeProxyModal, {` 因此消失。
-    // ⇒ 断言改为「**createElement 的第一个实参是三元选择**，且两个弹窗都在其中」
+    // ⇒ 断言改为「**createElement 的第一个实参是选择器**，且各家弹窗都在其中」
     // —— 这比逐字串更强：它同时锁住「用了 createElement」与「没漏掉任一弹窗」。
+    //
+    // ⚠️ 2026-10-24（MiniMax 国际站账号代理）：选择器抽成了 `proxyModalComponent(provider)`
+    // 辅助函数（第三家弹窗加入后，内联三元在两处出现会漂移）。断言同步为
+    // 「createElement 的第一个实参是该函数」，「各家弹窗都被该函数覆盖」
+    // 的判据移到下面的 `proxyModalComponent` 用例（逐家点名配对）。
     expect(hub).toMatch(
-      /React\.createElement\(\s*proxyModal\.provider\s*===\s*'gemini'\s*\?\s*GeminiProxyModal\s*:\s*OpencodeProxyModal,\s*\{/,
+      /React\.createElement\(\s*proxyModalComponent\(proxyModal\.provider\),\s*\{/,
     )
     // 直接调用形态必须消失
     expect(hub).not.toMatch(/\?\s*renderOpencode/)
-    expect(hub).not.toMatch(/\?\s*(?:Opencode|Gemini)(?:Proxy|Key)Modal\(\{/)
+    expect(hub).not.toMatch(/\?\s*(?:Opencode|Gemini|MinimaxIntl|Qoder)(?:Proxy|Key)Modal\(\{/)
+  })
+
+  it('⚠️ proxyModalComponent 必须四家齐全，且**每个 provider 映射到正确的弹窗**', () => {
+    /**
+     * ⚠️⚠️ **必须判「配对」而不是「各自出现过」**（PR !145 审计修法）。
+     *
+     * 初版三条 `toContain` 只要求「`provider === 'gemini'` 与
+     * `provider === 'minimaxintl'` 都出现在函数体里」+「有 `return OpencodeProxyModal`」——
+     * **完全不判哪个分支返回哪个组件**。实测两个变异全绿：
+     *
+     * ① `if (provider === 'minimaxintl') return OpencodeProxyModal;`
+     *    （= 本用例标题说的「渲染错弹窗」，minimaxintl 的「代理」按钮会打开
+     *     opencode 的弹窗并保存到 `opencode.setProxy` 端点）；
+     * ② gemini 与 minimaxintl 的返回值互换（两家互相串端点）。
+     *
+     * ⇒ 改成**逐分支配对断言**：把每个 `if (provider === 'X') return Y;` 抽出来，
+     * 判 `X → Y` 的映射，而不是判「两个字符串都在」。
+     *
+     * ⚠️ 2026-10-25（本 fork 的 Qoder 代理合入）：分支从 2 条变 4 条 ——
+     * `qoder` 与 `qodercn` **各占一条 `if`**（都返回 `QoderProxyModal`）。
+     * 两站分开写在 `proxyModalComponent` 里是刻意的：合并成 `||` 后，
+     * 本用例的正则只能匹配到前一站，第二站从此**不设防**（把 `qodercn`
+     * 那个分支改成返回别家，用例仍绿）—— 那正是上面 ② 号变异的老毛病。
+     */
+    const selector = hub.match(/function proxyModalComponent\([\s\S]*?\n\}/)?.[0]
+    expect(selector, '找不到 proxyModalComponent 函数体').toBeDefined()
+    // 逐分支抽取 `provider === 'X'` → `return Y` 的配对。
+    const pairs = [...selector!.matchAll(
+      /provider === '([a-z]+)'\)\s*return\s+(\w+);/g,
+    )].map((m) => [m[1]!, m[2]!] as const)
+    expect(pairs.length, 'proxyModalComponent 的分支数不是 4 —— 判据会退化成同义反复')
+      .toBe(4)
+    // ⚠️ 映射必须**逐格正确**：错一格就是「该家按钮打开别家弹窗、保存到别家端点」。
+    expect(pairs, 'provider → 弹窗 的映射错了（串端点）').toEqual([
+      ['gemini', 'GeminiProxyModal'],
+      ['minimaxintl', 'MinimaxIntlProxyModal'],
+      ['qoder', 'QoderProxyModal'],
+      ['qodercn', 'QoderProxyModal'],
+    ])
+    // 缺省回落 OpencodeProxyModal（未知 provider 的既有行为不可变更）。
+    expect(selector!).toContain('return OpencodeProxyModal')
   })
 
   it('⚠️ Gemini 弹窗的宿主 facade 也由 props 传入（不得退回位置参数）', () => {

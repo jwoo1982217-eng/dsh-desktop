@@ -77,6 +77,26 @@ export declare function buildAstudioBalance(data: Record<string, unknown>): Cred
  * 只靠服务端中文文案正则兜底、每轮白撞一次的可重试。
  */
 export declare function fetchAstudioBalanceDetailed(credential: AstudioCredential, options?: AstudioCreditsOptions): Promise<ProviderBalanceDetail>;
+/**
+ * 供 `BuddyBalanceSelector` 用的 `fetchBalance`（**丢失原因**的薄封装）。
+ *
+ * ## 为什么需要它
+ *
+ * `BuddyBalanceSelector` 的 `deps.fetchBalance` 契约是
+ * `(credential, product) => Promise<CreditBalance | null>` —— 只回余额、不回原因
+ * （分档逻辑对「为什么查不到」不感兴趣，一律归入最后一档）。
+ * 而本文件的权威入口 {@link fetchAstudioBalanceDetailed} 回的是
+ * `{ balance, error? }`，故这里把它**压平成 null**。
+ *
+ * ⚠️ **失败原因不要在这里丢掉就完事**：`fetchAstudioBalanceDetailed` 的三条失败
+ * 路径（会话失效 / 服务不可用 / 形状不认识）对用户动作完全不同。选号器这条路上
+ * 确实只需要 null（它会把该号归入「查不到」档，其他号继续用）；但面板上
+ * 直接展示余额时走的仍是 `fetchAstudioBalanceDetailed`，原因在那里保留。
+ *
+ * ⚠️ **不要在本函数里再写一份失败分类**：那是 `fetchAstudioBalanceDetailed` 的职责，
+ * 两处各写一遍必然漂移（本仓库红线）。
+ */
+export declare function fetchAstudioCreditBalance(credential: AstudioCredential, product?: AstudioProduct): Promise<CreditBalance | null>;
 /** 待处理弹窗查询端点（每日奖励等）。 */
 export declare const ASTUDIO_CLIENT_POPUPS_PENDING_PATH = "/client-popups/pending";
 /** 弹窗完成/领取端点。 */

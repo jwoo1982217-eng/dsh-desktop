@@ -17,10 +17,75 @@ function safePath(value) {
 }
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const comboPath = path => path.startsWith('/plugins/??') && /&rev=[a-f0-9]{12}$/.test(path) && path.length <= 8192;
+const WS_MESSAGE_LIMIT = 1024 * 1024, WS_CHUNK_BYTES = 65536;
 const requestLimit = (service,method,url) => service === 'ui' && method === 'POST' && url.split('?')[0] === '/phone-chat-files/upload' ? 64*1024*1024 : MAX_BODY;
+const recoveryClient = `(function(){
+  var stopped=false,running=false,timer=null,checks=0;
+  function schedule(){if(!stopped&&!document.hidden)timer=setTimeout(check,checks<10?1200:5000)}
+  function canNavigate(){
+    try{var now=Date.now(),key='dsh-peer-page-recoveries',times=JSON.parse(sessionStorage.getItem(key)||'[]').filter(function(t){return typeof t==='number'&&now-t<60000});if(times.length>=3)return false;times.push(now);sessionStorage.setItem(key,JSON.stringify(times));return true}catch(e){return false}
+  }
+  function check(){
+    if(stopped||running||document.hidden)return;running=true;checks++;
+    var controller=typeof AbortController==='function'?new AbortController():null;
+    var deadline=controller?setTimeout(function(){controller.abort()},3000):null;
+    fetch('/__dsh_peer_status',{cache:'no-store',credentials:'omit',signal:controller?controller.signal:undefined}).then(function(r){if(!r.ok)throw Error('unavailable');return r.json()}).then(function(s){
+      if(!stopped&&!document.hidden&&s.online===true&&canNavigate()){stopped=true;location.replace('/'+location.hash)}
+    }).catch(function(){}).finally(function(){if(deadline!==null)clearTimeout(deadline);running=false;schedule()});
+  }
+  document.addEventListener('visibilitychange',function(){if(timer!==null)clearTimeout(timer);if(!document.hidden)check()});
+  window.addEventListener('pagehide',function(){stopped=true;if(timer!==null)clearTimeout(timer)});
+  check();
+})();`;
+const recoveryHtml = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>正在恢复电脑连接</title><style>body{font:16px/1.7 system-ui,sans-serif;padding:24px;color:#24324a;background:#f5f7fb}main{max-width:540px;margin:12vh auto}a{display:inline-block;margin:12px 20px 0 0;color:#245dc1}</style></head><body><main><h2>正在恢复电脑连接…</h2><p>请保持电脑和 DSH 运行，连接恢复后会自动打开。已提交的消息不会重复发送。</p><a href="/">立即重试</a><a href="http://127.0.0.1:3080/">返回手机本机</a></main><script id="dsh-peer-recovery">${recoveryClient}</script></body></html>`;
+const bootstrapRecovery = `<script id="dsh-peer-bootstrap-recovery">(function(){
+  if(window.__dshPeerPageRecovery)return;window.__dshPeerPageRecovery=true;
+  window.addEventListener('error',function(event){
+    var node=event.target;if(document.readyState==='complete'||!node||!node.tagName)return;
+    var url=node.src||node.href||'';
+    if(!/^(SCRIPT|LINK)$/.test(node.tagName)||!/(?:\\/assets\\/|\\/plugins\\/\\?\\?)/.test(url))return;
+    try{if(new URL(url,location.href).origin!==location.origin)return}catch(e){return}
+    location.replace('/__dsh_peer_recover'+location.hash);
+  },true);
+})();</script>`;
 export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, uiHeaders = async () => ({}), gatewayPort = 8326, gatewayKey = async () => undefined, allowGateway = () => true, transformHtml = html => html, assets = new Map(), reusableScripts = [] } = {}) {
   const reusable = new Map(reusableScripts.filter(bytes => Buffer.isBuffer(bytes) && bytes.length > 0 && bytes.length <= MAX_BODY / 2).slice(0, 1).map(bytes => [digest(bytes), bytes]));
   const outgoing = new Map(), incoming = new Map(), localWs = new Map(), remoteWs = new Map();
+  const partialWs = new WeakMap();
+  const sendWs = (type, id, ws, data, binary) => {
+    if (data.length > WS_MESSAGE_LIMIT) throw Error('Socket message too large');
+    if (!ws.peerChunks || data.length <= WS_CHUNK_BYTES) {
+      tunnel.send({ type, id, binary, data: data.toString('base64') }); return;
+    }
+    // Keep each encrypted envelope below MAX_FRAME; the browser still gets
+    // one original WebSocket message, including its binary/text flag.
+    for (let offset=0,index=0;offset<data.length;offset+=WS_CHUNK_BYTES,index++) {
+      tunnel.send({type:type+'.chunk',id,binary,index,final:offset+WS_CHUNK_BYTES>=data.length,data:data.subarray(offset,offset+WS_CHUNK_BYTES).toString('base64')});
+    }
+  };
+  const receiveWs = (ws, m, chunked) => {
+    try {
+      if (typeof m.data !== 'string' || m.data.length > Math.ceil((chunked?WS_CHUNK_BYTES:WS_MESSAGE_LIMIT)/3)*4) throw Error('Socket message too large');
+      const bytes=Buffer.from(m.data,'base64');
+      if (bytes.toString('base64')!==m.data) throw Error('Invalid socket data');
+      if (chunked) {
+        if (!ws.peerChunks || !Number.isInteger(m.index) || m.index<0 || typeof m.final!=='boolean' || typeof m.binary!=='boolean' || bytes.length>WS_CHUNK_BYTES) throw Error('Invalid socket chunk');
+        const partial=partialWs.get(ws);
+        if (m.index!==(partial?.next??0) || (partial&&m.binary!==partial.binary)) throw Error('Socket chunk order changed');
+        const state=partial??{next:0,size:0,binary:m.binary,parts:[]};
+        state.next++;state.size+=bytes.length;
+        if (state.size>WS_MESSAGE_LIMIT || state.next>Math.ceil(WS_MESSAGE_LIMIT/WS_CHUNK_BYTES)) throw Error('Socket message too large');
+        state.parts.push(bytes);
+        if (!m.final) { partialWs.set(ws,state);return; }
+        partialWs.delete(ws);
+        if (ws.bufferedAmount>4*1024*1024) throw Error('Socket congested');
+        ws.send(Buffer.concat(state.parts,state.size),{binary:state.binary});
+      } else {
+        if (partialWs.has(ws) || bytes.length>WS_MESSAGE_LIMIT || ws.bufferedAmount>4*1024*1024) throw Error('Socket message interrupted');
+        ws.send(bytes,{binary:m.binary===true});
+      }
+    } catch { partialWs.delete(ws);ws.terminate(); }
+  };
   // Bound all response chunks together, including concurrent asset downloads.
   // A small window avoids paying a full WAN round trip for every 48 KiB.
   let chunkCalls = 0;
@@ -177,7 +242,7 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
       await stream.head;
       if (action === 'http.done') {
         outgoing.delete(id);
-        if (value.error) stream.res.destroy(Error('Remote stream interrupted')); else stream.res.end();
+        if (value.error) { if (stream.recover) stream.recover(); else stream.res.destroy(Error('Remote stream interrupted')); } else stream.res.end();
       } else {
         const bytes = Buffer.from(value.data, 'base64');
         if (bytes.length > 65536) throw Error('Chunk too large');
@@ -190,7 +255,11 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
     if (action === 'http.upload') {
       const bytes = Buffer.from(value.data, 'base64'); stream.size += bytes.length;
       if (bytes.length > 65536 || stream.size > stream.maxBody) { incoming.delete(id); stream.req.destroy(); throw Error('Request body too large'); }
-      if (!stream.req.write(bytes)) await Promise.race([once(stream.req, 'drain'), once(stream.req, 'close')]);
+      if (stream.req.destroyed || stream.req.writableEnded) { incoming.delete(id); throw Error('Request upload closed'); }
+      // The close event may already have fired after an early upstream error.
+      // The write callback settles on both drain and destruction without
+      // retaining a peer RPC slot waiting for a past close event.
+      await new Promise((resolve, reject) => stream.req.write(bytes, error => error ? reject(error) : resolve()));
       return {};
     }
     if (action !== 'http.end') throw Error('Invalid HTTP operation');
@@ -206,8 +275,9 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
       const ws = new WebSocket(`ws://127.0.0.1:${port}${url}`, { origin: `http://127.0.0.1:${port}`, headers: await uiHeaders(), maxPayload: 1024 * 1024, perMessageDeflate: false });
       ws.allowUplink = url === '/api/remote.mux';
       remoteWs.set(id, ws); ws.on('error', () => {});
+      ws.peerChunks = value.chunks === true;
       let ready = false, queuedSize = 0; const queued = [];
-      const forward = (data, binary) => { try { tunnel.send({ type: 'ws.data', id, binary, data: data.toString('base64') }); } catch { ws.terminate(); } };
+      const forward = (data, binary) => { try { sendWs('ws.data',id,ws,data,binary); } catch { ws.terminate(); } };
       // DSH sends an initial state snapshot immediately on upgrade. Retain
       // it until the mobile browser has completed its own local upgrade.
       ws.on('message', (data, binary) => {
@@ -215,39 +285,36 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
         else { queuedSize += data.length; if (queuedSize > 4 * 1024 * 1024) ws.terminate(); else queued.push([data, binary]); }
       });
       ws.activate = () => { ready = true; for (const frame of queued) forward(...frame); queued.length = 0; };
-      ws.on('close', () => { remoteWs.delete(id); try { tunnel.send({ type: 'ws.close', id }); } catch {} });
+      ws.on('close', () => { partialWs.delete(ws);remoteWs.delete(id); try { tunnel.send({ type: 'ws.close', id }); } catch {} });
       let timer;
       try { await new Promise((resolve, reject) => {
         ws.once('open', resolve); ws.once('error', reject); ws.once('close', () => reject(Error('Upstream socket closed')));
         timer = setTimeout(() => { ws.terminate(); reject(Error('Upstream socket timed out')); }, 15000); timer.unref();
       }); } catch (e) { remoteWs.delete(id); ws.terminate(); throw e; } finally { clearTimeout(timer); }
-      return {};
+      return {chunks:ws.peerChunks};
     }
     if (action === 'ws.ready') { const ws = remoteWs.get(id); if (!ws || ws.readyState !== WebSocket.OPEN) throw Error('Socket disconnected'); ws.activate(); return {}; }
     if (action === 'ws.close') { remoteWs.get(id)?.terminate(); remoteWs.delete(id); return {}; }
     throw Error('Invalid socket operation');
   };
   const packet = m => {
-    if (m.type === 'ws.uplink') {
+    if (m.type === 'ws.uplink' || m.type === 'ws.uplink.chunk') {
       const upstream = remoteWs.get(m.id);
       if (!upstream?.allowUplink || upstream.readyState !== WebSocket.OPEN) return;
-      if (typeof m.data !== 'string' || m.data.length > Math.ceil(1024 * 1024 / 3) * 4 || upstream.bufferedAmount > 4 * 1024 * 1024) { upstream.terminate(); return; }
-      const bytes = Buffer.from(m.data, 'base64');
-      if (bytes.length > 1024 * 1024) { upstream.terminate(); return; }
-      upstream.send(bytes, { binary: m.binary === true });
+      receiveWs(upstream,m,m.type==='ws.uplink.chunk');
       return;
     }
     const ws = localWs.get(m.id);
-    if (m.type === 'ws.close') { ws?.close(); localWs.delete(m.id); }
-    if (m.type === 'ws.data' && ws?.readyState === WebSocket.OPEN) {
-      if (ws.bufferedAmount > 4 * 1024 * 1024) ws.terminate(); else ws.send(Buffer.from(m.data, 'base64'), { binary: m.binary === true });
+    if (m.type === 'ws.close') { if(ws)partialWs.delete(ws);ws?.close(); localWs.delete(m.id); }
+    if ((m.type === 'ws.data'||m.type==='ws.data.chunk') && ws?.readyState === WebSocket.OPEN) {
+      receiveWs(ws,m,m.type==='ws.data.chunk');
     }
   };
   tunnel.on('packet', packet);
   const disconnected = () => {
-    for (const stream of outgoing.values()) { stream.resolveHead(); stream.res.destroy(); }
+    for (const stream of outgoing.values()) { stream.resolveHead(); if (stream.recover) stream.recover(); else stream.res.destroy(); }
     outgoing.clear(); for (const stream of incoming.values()) { stream.req.destroy(); stream.response?.destroy(); } incoming.clear();
-    for (const ws of [...localWs.values(), ...remoteWs.values()]) ws.terminate(); localWs.clear(); remoteWs.clear();
+    for (const ws of [...localWs.values(), ...remoteWs.values()]) { partialWs.delete(ws);ws.terminate(); } localWs.clear(); remoteWs.clear();
   };
   tunnel.on('offline', disconnected);
   const browserTrust = req => {
@@ -262,8 +329,26 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
       let id, stream;
       try {
         if (!browserTrust(req)) { res.writeHead(403).end(); return; }
+        const recoverable = service === 'ui' && req.method === 'GET' && req.url.split('?')[0] === '/';
+        const recover = recoverable ? (() => {
+          const end = res.end.bind(res);
+          return () => {
+            if (res.destroyed || res.writableEnded) return;
+            if (!res.headersSent) res.writeHead(503, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+            end(recoveryHtml);
+          };
+        })() : undefined;
+        if (service === 'ui' && req.url === '/__dsh_peer_status') {
+          if (req.method !== 'GET') { res.writeHead(405).end(); return; }
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+          res.end(JSON.stringify({ online: tunnel.online === true, route: tunnel.route ?? (tunnel.online ? 'relay' : 'offline') })); return;
+        }
+        if (service === 'ui' && req.url === '/__dsh_peer_recover' && req.method === 'GET') {
+          res.writeHead(503, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); res.end(recoveryHtml); return;
+        }
         if (service === 'ui' && assets.has(req.url)) { res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' }); res.end(assets.get(req.url)); return; }
         if (!tunnel.online) {
+          if (recover) { recover(); return; }
           if (service === 'gateway') {
             res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ error: { code: 'PEER_OFFLINE', type: 'server_error', message: '手机模型网关离线，请保持手机 DSH 运行并检查两端连接；请求没有自动重发。' } }));
@@ -274,7 +359,7 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
         }
         if (service === 'ui' && await localAsset(req, res)) return;
         id = randomUUID();
-        stream = { res, resolveHead: null, head: null }; stream.head = new Promise(resolve => { stream.resolveHead = resolve; }); outgoing.set(id, stream);
+        stream = { res, recover, resolveHead: null, head: null }; stream.head = new Promise(resolve => { stream.resolveHead = resolve; }); outgoing.set(id, stream);
         res.on('close', () => { if (outgoing.delete(id)) { stream.resolveHead(); void tunnel.call('http.cancel', { id }).catch(() => {}); } });
         const fast = ['GET', 'HEAD'].includes(req.method) && !req.headers['transfer-encoding'] && (!req.headers['content-length'] || req.headers['content-length'] === '0');
         const offer = service === 'ui' && fast && req.method === 'GET' && comboPath(req.url) ? [...reusable].map(([hash, bytes]) => ({ hash, size: bytes.length }))[0] : undefined;
@@ -321,7 +406,12 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
           // retain their original transport and completion semantics.
           const originalWrite = res.write.bind(res), originalEnd = res.end.bind(res);
           res.write = bytes => { size += bytes.length; if (size > MAX_BODY) throw Error('Document too large'); parts.push(Buffer.from(bytes)); return true; };
-          res.end = () => { res.write = originalWrite; res.end = originalEnd; originalEnd(transformHtml(Buffer.concat(parts).toString())); };
+          res.end = () => {
+            res.write = originalWrite; res.end = originalEnd;
+            let body = transformHtml(Buffer.concat(parts).toString());
+            if (stream.recover) body = body.replace(/<head(?:\s[^>]*)?>/i, head => head + bootstrapRecovery);
+            originalEnd(body);
+          };
           delete head.headers['content-security-policy'];
         }
         res.writeHead(head.status, head.headers); stream.resolveHead();
@@ -333,7 +423,9 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
         }
       } catch (e) {
         stream?.resolveHead(); if (id) { outgoing.delete(id); void tunnel.call('http.cancel', { id }).catch(() => {}); }
-        if (res.headersSent) res.destroy();
+        if (res.writableEnded || res.destroyed) return;
+        if (stream?.recover) stream.recover();
+        else if (res.headersSent) res.destroy();
         else if (service === 'gateway') {
           res.writeHead(e.status ?? 502, { 'content-type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ error: { code: 'PEER_UNAVAILABLE', type: 'server_error', message: '手机模型网关连接未完成，请检查两端服务和网络；请求没有自动重发。' } }));
@@ -345,17 +437,18 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
       server.on('upgrade', async (req, socket, head) => {
         try {
           if (!browserTrust(req) || !tunnel.online) throw Error();
-          const id = randomUUID(); await tunnel.call('ws.open', { id, url: req.url });
+          const id = randomUUID(), negotiated=await tunnel.call('ws.open', { id, url: req.url, chunks:true });
           if (socket.destroyed) { void tunnel.call('ws.close', { id }).catch(() => {}); return; }
           acceptor.handleUpgrade(req, socket, head, ws => {
             localWs.set(id, ws); ws.on('error', () => {});
+            ws.peerChunks=negotiated?.chunks===true;
             ws.on('message', (data, binary) => {
               if (req.url !== '/api/remote.mux') { ws.close(1008, 'downlink only'); return; }
               if (data.length > 1024 * 1024) { ws.close(1009, 'frame too large'); return; }
-              try { tunnel.send({ type: 'ws.uplink', id, binary, data: data.toString('base64') }); }
+              try { sendWs('ws.uplink',id,ws,data,binary); }
               catch { ws.terminate(); }
             });
-            ws.on('close', () => { localWs.delete(id); void tunnel.call('ws.close', { id }).catch(() => {}); });
+            ws.on('close', () => { partialWs.delete(ws);localWs.delete(id); void tunnel.call('ws.close', { id }).catch(() => {}); });
             void tunnel.call('ws.ready', { id }).catch(() => ws.terminate());
           });
         } catch { socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n'); }

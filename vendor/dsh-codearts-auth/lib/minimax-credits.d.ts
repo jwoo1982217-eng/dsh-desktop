@@ -160,9 +160,31 @@ export declare function claimMinimaxDailyCheckin(credential: MinimaxCredential, 
  *   **不是**「查询失败」。两者必须区分（`null` 才是失败）。
  * - ⚠️ `base_resp.status_code` 非 0 ⇒ `null`（真失败）。
  *
- * ⚠️ **`expiredTotal` 仍为 0**：`details[]` 里没有区分「本周期有效」的标志
- *（`credit_type` 的语义未实测），故**不凭猜测分类**。`packages` 同理留空 ——
- * 需要时再按实测补充，**不得**用 locale 文案反推字段名。
+ * ## `packages` 的产出（2026-10-20 用户报障后补）
+ *
+ * 用户报障原文：「MiniMax Code 积分也有到期时间，也应当有相同功能」（附 AStudio
+ * 面板截图作参照）。此前本函数把 `packages` **硬编码成 `[]`**，理由是
+ * 「`credit_type` 的语义未实测，不凭猜测分类」—— 但那个理由说的是**分类**
+ * （哪些算过期），与**到期时刻**是两件事：每个 `details[]` 条目都带
+ * `expire_at_ms`（毫秒时间戳，实测 2026-10-20 真实账号 20 条全部有值），
+ * 直接可用，无需猜 `credit_type` 语义。
+ *
+ * 实测形状（两站各取真实账号，`GET /minimax-cloud/api/v1/credit/details`）：
+ *
+ * | 发放 `granted_at_ms` | 剩余 `remaining_amount` | 到期 `expire_at_ms` |
+ * |---|---|---|
+ * | 2026-10-20 01:41:32 | 1000.00 | 2026-11-19 00:00:00 |
+ * | 2026-10-19 00:40:51 | 1000.00 | 2026-11-18 00:00:00 |
+ * | 2026-10-18 02:24:45 | 400.00 | 2026-11-17 00:00:00 |
+ *
+ * ⇒ 每条明细就是一个独立的「积分包」，到期时刻 = `granted_at_ms` 的 30 天后零点。
+ * 这正是「临期优先」要的信息：先烧最快作废的那一笔。
+ *
+ * ⚠️ **`expiredTotal` 仍为 0**：它要与 `total` 相加构成「已过期」口径，
+ *   而本响应**不下发已过期条目**（服务端只回有效包）⇒ 无从计算，不编造。
+ *   `packages[].active` 恒为 `true` 是基于「服务端只回有效包」的实测；
+ *   若将来它开始回过期条目，**必须**改用 `expire_at_ms > Date.now()` 判定
+ *   （已在该处留注释）。
  */
 export declare function fetchMinimaxCreditBalance(credential: MinimaxCredential, fetcher?: typeof fetch, product?: MinimaxProduct, xff?: string): Promise<CreditBalance | null>;
 /**

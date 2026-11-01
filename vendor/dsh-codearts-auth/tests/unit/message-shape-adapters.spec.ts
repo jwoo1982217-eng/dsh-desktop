@@ -6,10 +6,24 @@
  *
  * 这条不变式比"逐个断言字段"更强 —— 它直接锁住"0.1.7 不会让工具调用丢失"
  * 这一修复目标，且对实现方式保持中立。
+ *
+ * ## ⚠️ 2026-10-21：`codearts` 不再有自己的 `serializeMessages`
+ *
+ * 接图片时发现 `llm-adapter.ts` 有一份**只处理文本**的私有 `serializeMessages`
+ *（注释还写着「其余非文本块（图片）被丢弃」）。若在它上面再加一条图片腿，就会
+ * 变成「同一语义两套实现」—— 而共享实现已经把 12 家的坑（工具结果内嵌图片
+ * 提升为独立 user 消息、空 Map 不降级、`[image unavailable]` 占位符、递归深度
+ * 与 `collectImages` 对齐）全部踩过。故**删除私有那份，改用 `openai-compat.ts`**。
+ *
+ * ⚠️⚠️ 于是本文件原来那条「CodeArts 与 OpenAI-compat 互相对拍」的断言**失效**了：
+ * 两者现在是**同一个函数**，`f(x) === f(x)` 恒真 ⇒ 变成同义反复（本仓纪律：
+ * 恒真断言必须删掉或改判据，不能留着充数）。
+ * ⇒ 改法是：**不再假装有两份实现**，直接断言 CodeArts 的 wire 产物结构
+ *   （工具调用与结果都在、文本没丢）。这比原来更强 —— 原断言在「两边同时为空」
+ *   时会假通过，现在的断言逐个点名必须存在的东西。
  */
 import { describe, expect, it } from 'vitest'
 import { serializeMessages as serializeCodeArts } from '../../src/llm-adapter.js'
-import { serializeMessages as serializeOpenAiCompat } from '../../src/openai-compat.js'
 import { resolveToolPairing } from '../../src/sse.js'
 
 /**
@@ -83,15 +97,16 @@ describe('resolveToolPairing 跨形状等价', () => {
   })
 })
 
-describe('serializeMessages 跨形状等价', () => {
+describe('serializeMessages 跨形状等价（CodeArts 走共享实现）', () => {
   it('produces identical CodeArts wire bodies', () => {
     expect(serializeCodeArts(history('tool-role'))).toEqual(serializeCodeArts(history('legacy')))
   })
 
-  it('produces identical OpenAI-compatible wire bodies', () => {
-    expect(serializeOpenAiCompat(history('tool-role'))).toEqual(serializeOpenAiCompat(history('legacy')))
-  })
-
+  /**
+   * ⚠️ 原来这里还有一条「OpenAI-compat 也等价」的断言 —— 合并实现后它与上一条
+   * **完全同义**（同一个函数、同一份输入），删掉。
+   * 判据的判别力由下面两条「逐个点名」的断言承担。
+   */
   it('emits both tool calls and both tool results under 0.1.7', () => {
     // 直接断言"没丢东西"，避免等价性测试因两边同时为空而假通过。
     const wire = serializeCodeArts(history('tool-role'))

@@ -294,8 +294,13 @@ describe('buddy / workbuddy：标题请求发裸请求（deepseek 系）', () =>
   })
 })
 
-describe('codearts：标题请求发 thinking.type=disabled', () => {
-  it('⚠️ 真实适配器：标题请求带 disabled（本网关唯一生效的关闭手段）', async () => {
+describe('codearts：标题请求发 enable_thinking=false', () => {
+  /**
+   * ⚠️ 2026-10-30 与 IDE 抓包对齐后改：关闭手段从顶层 `thinking:{type:'disabled'}`
+   * 换成 IDE 的 `enable_thinking:false`。两者真机实测**等价**（都让
+   * `reasoning_tokens` 归零），但只留 IDE 那一份方言（同一语义不发两个字段）。
+   */
+  it('⚠️ 真实适配器：标题请求带 enable_thinking=false（关闭思考）', async () => {
     const { CodeArtsAdapter } = await import('../../src/llm-adapter.js')
     const body = await captureVia(
       (fetchImpl) => new CodeArtsAdapter({
@@ -311,11 +316,13 @@ describe('codearts：标题请求发 thinking.type=disabled', () => {
       'deepseek-v4.1-flash',
       {},
     )
-    expect(body.thinking).toEqual({ type: 'disabled' })
+    expect(body.enable_thinking).toBe(false)
+    // ⚠️ 旧方言不得再发（同一语义两个字段 = 迟早分叉）。
+    expect(body).not.toHaveProperty('thinking')
     expect(body.max_tokens).toBe(64)
   })
 
-  it('⚠️ 真实适配器：普通请求不发 thinking（该网关「开启」= 不发字段）', async () => {
+  it('⚠️ 真实适配器：普通请求发 enable_thinking=true（IDE 的开启形态）', async () => {
     const { CodeArtsAdapter } = await import('../../src/llm-adapter.js')
     const body = await captureVia(
       (fetchImpl) => new CodeArtsAdapter({
@@ -331,6 +338,8 @@ describe('codearts：标题请求发 thinking.type=disabled', () => {
       'deepseek-v4.1-flash',
       { purpose: undefined, maxTokens: 8192 },
     )
+    // IDE 4/4 请求都是 enable_thinking:true（显式开）——不再「开启即不发」。
+    expect(body.enable_thinking).toBe(true)
     expect(body).not.toHaveProperty('thinking')
   })
 })

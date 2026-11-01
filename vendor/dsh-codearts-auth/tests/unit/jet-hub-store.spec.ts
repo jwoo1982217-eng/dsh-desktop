@@ -23,6 +23,9 @@ import {
   sanitizePermanentLocks,
   sanitizeProviderClosed,
   sanitizeProviderOrder,
+  jetHubSchema as storeSchema,
+  providerOfAccountRef,
+  sanitizePanelEntry,
   withAllowed,
   withoutAllowed,
 } from '../../src/jet-hub-store.js'
@@ -77,6 +80,32 @@ describe('sanitizeNativeWebSearchEnabled', () => {
   })
 })
 
+describe('sanitizePanelEntry', () => {
+  it('两个合法字面量原样返回', () => {
+    expect(sanitizePanelEntry('sidebar')).toBe('sidebar')
+    expect(sanitizePanelEntry('settings')).toBe('settings')
+  })
+
+  it('缺键 / null / 脏值一律回默认「仅侧栏」', () => {
+    // ⚠️ 方向不能反：丢键 / 脏值都必须回到**默认仅侧栏**。反过来会让任何一次
+    // 读取失败都变成「侧栏入口被静默藏起来」，而用户从来没改过它。
+    expect(sanitizePanelEntry(undefined)).toBe('sidebar')
+    expect(sanitizePanelEntry(null)).toBe('sidebar')
+    expect(sanitizePanelEntry('off')).toBe('sidebar')
+    expect(sanitizePanelEntry(0)).toBe('sidebar')
+    expect(sanitizePanelEntry({})).toBe('sidebar')
+  })
+
+  it('⚠️ 老布尔迁移：只有明确 false 才是「仅设置页」', () => {
+    expect(sanitizePanelEntry(undefined, false)).toBe('settings')
+    expect(sanitizePanelEntry(undefined, true)).toBe('sidebar')
+    // 脏值不当 false 用：字符串 'false' 是脏数据，不是用户意图。
+    expect(sanitizePanelEntry(undefined, 'false')).toBe('sidebar')
+    // 新键优先：两个都在时以新枚举为准。
+    expect(sanitizePanelEntry('settings', true)).toBe('settings')
+  })
+})
+
 let dir: string
 let previousDir: string | undefined
 
@@ -106,6 +135,49 @@ describe('后端选路', () => {
 
   it('settings 服务缺失时仍走文件后端（headless 也可持久化）', () => {
     expect(createJetHubStore(makeCtx(undefined)).kind).toBe('file')
+  })
+
+  /**
+   * ⚠️⚠️ **真实缺陷守卫（2026-10-24 复核 C1）**：老布尔迁移必须在
+   * **过 schema 的** SettingsStore 路径上也成立。
+   *
+   * 上面那些 `scope.get()` 都是**裸替身**（直接返回对象、不经过 schemastery），
+   * 于是它们绕开了「schema 给缺键填默认值」这一步 —— 而真实 SettingsStore 的
+   * `scope.get()` 会过一遍 schema。
+   *
+   * 当时的写法 `Schema.string().default(DEFAULT_PANEL_ENTRY)` 正是在这里出问题：
+   * schema 把 `panelEntry` 填成 `'sidebar'`，`sanitizePanelEntry` 第一层（新键
+   * 合法即返回）随即命中，第二层的老布尔迁移**永远不执行** ⇒ 老用户明确关掉的
+   * 侧栏入口升级后静默变回「仅侧栏」，且此后每次 save 都写死 `'sidebar'`。
+   *
+   * 本用例用**真实的 store schema** 编解码，因此 `schema.default` 的回归会立刻变红。
+   */
+  it('⚠️ 老契约后端：老布尔 false 经 schema 后仍迁移成「仅设置页」', () => {
+    const written: Record<string, unknown>[] = []
+    let raw: unknown = { accounts: [], disabledModels: {}, sidebarEntryEnabled: false }
+    const store = createJetHubStore(makeCtx({
+      register: () => ({
+        // ⚠️ 关键：`get()` 走真实 schema，复刻 SettingsStore 的行为。
+        get: () => storeSchema(raw),
+        replace: async (value: object) => {
+          written.push(value as Record<string, unknown>)
+          raw = value
+        },
+      }),
+      describe: () => [],
+    }))
+
+    expect(store.load()?.panelEntry).toBe('settings')
+  })
+
+  it('⚠️ 老契约后端：没有新键也没有旧键时经 schema 回默认「仅侧栏」', () => {
+    const raw: unknown = { accounts: [], disabledModels: {} }
+    const store = createJetHubStore(makeCtx({
+      register: () => ({ get: () => storeSchema(raw), replace: async () => {} }),
+      describe: () => [],
+    }))
+
+    expect(store.load()?.panelEntry).toBe('sidebar')
   })
 })
 
@@ -137,8 +209,14 @@ describe('老契约后端（SettingsStore）', () => {
       aggregateOrderMode: 'expiry',
       loomyPermanentLocked: false,
       gatewayEnabled: true,
+      // save 未携带局域网开关 → 写出关闭（缺省），读回同值。
+      gatewayAllowLan: false,
       // save 未携带原生搜索开关 → 写出启用（缺省），读回同值。
       nativeWebSearchEnabled: true,
+      // save 未携带会话负载均衡开关 → 写出启用（缺省），读回同值。
+      sessionBalanceEnabled: true,
+      // save 未携带面板入口 → 写出「仅侧栏」（缺省），读回同值。
+      panelEntry: 'sidebar',
       // save 未携带顺序 → 写出空数组（未自定义），读回同值。
       providerOrder: [],
       // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。
@@ -299,8 +377,14 @@ describe('文件后端（FileStore）', () => {
       loomyPermanentLocked: false,
       // 网关开关缺省启用 —— 与升级前行为一致
       gatewayEnabled: true,
+      // 局域网开关缺省关闭 —— 暴露面变大必须是显式选择
+      gatewayAllowLan: false,
       // 原生搜索开关缺省启用 —— 与升级前行为一致
       nativeWebSearchEnabled: true,
+      // 会话负载均衡开关缺省启用 —— 与 2026-10-30 要求的方向一致
+      sessionBalanceEnabled: true,
+      // 面板入口缺省「仅侧栏」—— 与升级前行为一致
+      panelEntry: 'sidebar',
       // 顺序缺省空数组（未自定义）—— 与升级前行为一致
       providerOrder: [],
       // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。
@@ -387,6 +471,106 @@ describe('文件后端（FileStore）', () => {
       'utf-8',
     )
     expect(createJetHubStore(makeCtx(undefined)).load()?.nativeWebSearchEnabled).toBe(true)
+  })
+
+  // ── 「ZCode 会话负载均衡」开关（与原生搜索那组逐条同构）──
+  it('⚠️ 会话负载均衡开关 false 可跨实例读回（关了就是关了，含老契约后端）', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, sessionBalanceEnabled: false })
+
+    const reader = createJetHubStore(makeCtx(undefined))
+    expect(reader.load()?.sessionBalanceEnabled).toBe(false)
+  })
+
+  it('老文档没有会话负载均衡开关时缺省为启用（= 2026-10-30 要求的默认方向）', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {} }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.sessionBalanceEnabled).toBe(true)
+  })
+
+  it('会话负载均衡开关落盘时脏值被归一化为启用', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {}, sessionBalanceEnabled: 'off' }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.sessionBalanceEnabled).toBe(true)
+  })
+
+  /**
+   * 「面板入口」偏好的**持久化**守卫（与上面原生搜索那组同构）。
+   *
+   * 判据必须是**跨实例读回**：断言 `sanitizePanelEntry` 的返回值是同义反复 ——
+   * 真正的缺陷形态是「有 sanitize、没生产调用者」，用户改了入口、重启后又变回去。
+   * 所以这里走**真实的** `save()` / `load()`。
+   */
+  it('⚠️ 面板入口改「仅设置页」可跨实例读回（改了就是改了）', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, panelEntry: 'settings' })
+
+    const reader = createJetHubStore(makeCtx(undefined))
+    expect(reader.load()?.panelEntry).toBe('settings')
+  })
+
+  it('老文档没有面板入口键时缺省为「仅侧栏」', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {} }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.panelEntry).toBe('sidebar')
+  })
+
+  it('面板入口落盘时脏值被归一化为「仅侧栏」', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {}, panelEntry: 'off' }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.panelEntry).toBe('sidebar')
+  })
+
+  it('⚠️ 老文档只有布尔键时跨实例读回映射成枚举', () => {
+    mkdirSync(join(dir, 'jet-hub'), { recursive: true })
+    writeFileSync(
+      join(dir, 'jet-hub', 'state.json'),
+      JSON.stringify({ accounts: [], disabledModels: {}, sidebarEntryEnabled: false }),
+      'utf-8',
+    )
+    expect(createJetHubStore(makeCtx(undefined)).load()?.panelEntry).toBe('settings')
+  })
+
+  it('⚠️ 写入后文档里不得再出现 sidebarEntryEnabled 键', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, panelEntry: 'settings' })
+    const raw = JSON.parse(readFileSync(join(dir, 'jet-hub', 'state.json'), 'utf-8')) as Record<string, unknown>
+    expect(raw.panelEntry).toBe('settings')
+    expect(raw).not.toHaveProperty('sidebarEntryEnabled')
+  })
+
+  /**
+   * ⚠️⚠️ **落盘前必须过 sanitize**（2026-10-24 审计 M7）。
+   *
+   * 两个后端的 `save` 写的是同一份文档形状，但此前只有 `SettingsStore.save`
+   * 归一化入参，`FileStore.save` **原样落盘** ⇒ 脏值被写进文档、下次启动再被
+   * 读侧 sanitize 纠正。写侧没判据时，「脏值只可能来自读路径」这个假设全靠
+   * 调用方约定维持（本仓库红线 PR !62 的幼苗形态）。
+   *
+   * ⚠️ 判据必须**真的写一次脏值再读文件**，不能只查源码里有没有
+   *    `sanitizePanelEntry` —— 那种写法对「只加在注释里」完全失明。
+   */
+  it('⚠️⚠️ FileStore 落盘前归一化 panelEntry（脏值不得写进文档）', async () => {
+    const writer = createJetHubStore(makeCtx(undefined))
+    await writer.save({ accounts: [], disabledModels: {}, panelEntry: 'GARBAGE' as never })
+    const raw = JSON.parse(readFileSync(join(dir, 'jet-hub', 'state.json'), 'utf-8')) as Record<string, unknown>
+    expect(raw.panelEntry, '脏值被原样写进了 state.json ⇒ 写侧缺 sanitize').toBe('sidebar')
   })
 
   /**
@@ -503,6 +687,43 @@ describe('文件后端（FileStore）', () => {
   })
 
   /**
+   * ★★ P2（2026-10-25 审计 A1-F4 / B1）：**归一化的 opencode ref 也必须能恢复**。
+   *
+   * ## 缺陷
+   *
+   * `ACCOUNT_REF_RE` 的尾段判据是 `[0-9A-Fa-f]{6,}`（**纯 hex**），而
+   * `opencode-rpc.ts` 在尾段含 `-`/`.` 时会生成
+   * `OPENCODE_ACCOUNT_<剥完非法字符>_<8 位 hex>` —— 尾段含 `_` ⇒ **永远不是纯 hex**
+   * ⇒ `providerOfAccountRef` 返回 `undefined`。后果有两层：
+   *
+   * 1. `state.json` 缺失（重装/迁移/profile 重建）时该账号**静默消失**
+   *    （凭据还在，索引建不出来，用户只能重新登录）；
+   * 2. ⚠️ **更严重**：`backup.ts` 的跨 provider 校验拿 `undefined` 时**放行**
+   *    （fail-open）⇒ 一份 `provider:'buddy'` 却引用 `OPENCODE_ACCOUNT_*` 的
+   *    备份会被**采纳**，而合法 hex 尾 ref 的同类误用会被拒。审计实测：
+   *    前者 `imported=1`、后者 `imported=0`。
+   *
+   * ## 修法
+   *
+   * 尾段放宽为「字母数字 + 可选的 `_<8 位 hex>` 后缀」。⚠️ **不能只放宽成
+   * `[0-9A-Za-z]{6,}` 就完事** —— 那仍然匹配不到 `…_<8HEX>` 这种**带下划线**的形态。
+   * 同时保留原有 hex 行为（存量 ref 的识别面**只增不减**）。
+   */
+  it('★★ P2：归一化 opencode ref（`…_<8HEX>`）必须被识别为 opencode 账号', () => {
+    const cases: Array<[string, string]> = [
+      ['OPENCODE_ACCOUNT_AAAABCD_6480DB97', 'opencode'],
+      ['OPENCODE_ACCOUNT__9ABB433E', 'opencode'],
+      ['OPENCODE_ACCOUNT_AAAAB_CD', 'opencode'],
+      // 存量合法形态必须继续可用（识别面只增不减）
+      ['OPENCODE_ACCOUNT_AAAAAA', 'opencode'],
+      ['CODEARTS_ACCOUNT_AAAAAA', 'codearts'],
+    ]
+    for (const [ref, provider] of cases) {
+      expect(providerOfAccountRef(ref), ref).toBe(provider)
+    }
+  })
+
+  /**
    * 回归（**根因级保险**）：恢复表必须覆盖客户端 `PROVIDERS` 的每一个 provider。
    *
    * 上一条用例的清单是**人手维护**的，所以「上游新增 provider 而本表没跟上」
@@ -600,8 +821,14 @@ describe('文件后端（FileStore）', () => {
       loomyPermanentLocked: false,
       // 写盘时缺省即启用：读回应如实带回这个默认值。
       gatewayEnabled: true,
+      // 局域网开关缺省关闭：读回同值。
+      gatewayAllowLan: false,
       // 原生搜索开关同理：写盘时缺省即启用，读回同值。
       nativeWebSearchEnabled: true,
+      // 会话负载均衡开关同理：写盘时缺省即启用，读回同值。
+      sessionBalanceEnabled: true,
+      // 面板入口同理：写盘时缺省即「仅侧栏」，读回同值。
+      panelEntry: 'sidebar',
       // 顺序缺省空数组（未自定义）：读回同值。
       providerOrder: [],
       // 关闭意图缺省空表（没有任何供应商被关闭）：读回同值（Gitee IKP8OF）。
@@ -966,5 +1193,81 @@ describe('★ 三个新键必须在两个后端都能跨实例读回（不是只
     expect(state?.aggregateAllowed).toEqual({})
     expect(state?.aggregateOrder).toEqual({})
     expect(state?.aggregateOrderMode).toBe('expiry')
+  })
+})
+
+/**
+ * ★★ P2（2026-10-25 审计 B2-1）：备份文件里的**非法代理字符串**必须在
+ * `sanitizeAccounts` 处就被挡下。
+ *
+ * ## 缺陷链（真跑端点实测）
+ *
+ * `sanitizeAccounts` 用 `{ ...candidate }` **原样透传**代理字段，只限「是不是
+ * 字符串」、不限「是不是合法代理」。于是：
+ *
+ * ```
+ * backup.import（载荷 accounts[0].qoderProxy = "ftp://host:21"）
+ *   → RPC 返回 ok:true、账号落池
+ *   → 此后该账号每次取 fetcher 都抛「代理地址无效 — 不支持的协议 ftp」
+ *   → 该账号**永久不可用**
+ * ```
+ *
+ * ⚠️ 而客户端**有**导入按钮（`jet-hub.js` 的 `backup.import`）⇒ 这条路径
+ * **UI 可达**（A2 只找到 `account.create` 那条「零客户端写入点」的腿，B2-1 找到了真正可达的入口）。
+ * 池自己的注释也早已把备份文件当**不可信输入**（`qoderProxyFor` 明写「池里可能
+ * 存在 `"qoderProxy": 12345`」），却只防了非字符串。
+ *
+ * ## 为什么修在 `sanitizeAccounts`（而不是各 provider 的读取侧）
+ *
+ * 四个 provider（opencode / gemini / minimaxintl / qoder）的解析器**同形**地
+ * 在读取侧 `throw`。改读取侧要四处同改、且会让三家分叉；而 `sanitizeAccounts`
+ * 是「外部数据 → 池」的**唯一闸门**（`state.json` 读取与 `backup.import` 都过它）
+ * ⇒ 一处修复，四个字段同时受益，四个 provider 的读取侧永远遇不到脏值。
+ *
+ * ## 处置：清掉该字段（降级直连），**不是**丢弃整条账号
+ *
+ * 丢账号会让用户「导入后少了几个号」且不知道为什么；清字段只是让该账号回到
+ * 「直连」，面板上「当前：直连」一眼可见、可重填。**删一个字段比删一条账号可逆得多。**
+ */
+describe('★ sanitizeAccounts：非法代理字符串必须被挡下（不是原样透传）', () => {
+  const proxies = ['opencodeProxy', 'geminiProxy', 'minimaxIntlProxy', 'qoderProxy'] as const
+
+  it('★★ 非法 scheme（ftp://…）⇒ 清掉该字段，但保留账号', () => {
+    for (const field of proxies) {
+      const accounts = sanitizeAccounts([
+        { id: 'a', provider: 'qoder', credentialRef: 'QODER_ACCOUNT_A', [field]: 'ftp://host:21' },
+      ])
+      // ⚠️ 账号必须还在（丢账号比丢字段糟得多）
+      expect(accounts, field).toHaveLength(1)
+      // ⚠️ 枢轴：脏值不得进池（否则该账号每次取 fetcher 都抛 ⇒ 永久不可用）
+      expect((accounts[0] as Record<string, unknown>)[field], field).toBeUndefined()
+    }
+  })
+
+  it('★★ 合法代理必须逐字保留（不能把好值一起清掉）', () => {
+    const good = [
+      'http://127.0.0.1:7897',
+      'https://user:pass@proxy.example:8443',
+      'socks5://127.0.0.1:1080',
+    ]
+    for (const field of proxies) {
+      for (const url of good) {
+        const accounts = sanitizeAccounts([
+          { id: 'a', provider: 'qoder', credentialRef: 'QODER_ACCOUNT_A', [field]: url },
+        ])
+        expect((accounts[0] as Record<string, unknown>)[field], `${field} ${url}`).toBe(url)
+      }
+    }
+  })
+
+  it('⚠️ 非字符串脏值仍然照旧降级（既有行为不变）', () => {
+    for (const dirty of [12345, {}, [], true, null]) {
+      const accounts = sanitizeAccounts([
+        { id: 'a', provider: 'qoder', credentialRef: 'QODER_ACCOUNT_A', qoderProxy: dirty },
+      ])
+      // 非字符串：既有行为是原样透传后由读取侧 `asProxyText` 降级 —— 这里只要求
+      // 「不崩、账号在」。取值形态不收紧（避免与既有断言冲突）。
+      expect(accounts, JSON.stringify(dirty)).toHaveLength(1)
+    }
   })
 })

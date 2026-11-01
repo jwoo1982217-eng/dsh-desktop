@@ -46,6 +46,9 @@ import { join } from 'node:path'
 const stateDir = mkdtempSync(join(tmpdir(), 'dsh-jet-hub-'))
 
 process.env.DSH_JET_HUB_STATE_DIR = stateDir
+// 共享 models.dev 与匿名通道缓存也必须离开真实用户home。
+process.env.DSH_HOME = stateDir
+process.env.DSH_OPENAI_GATEWAY_ENABLED = '0'
 
 /**
  * ⚠️⚠️ **OfficeAce 的用户级目录必须隔离**（2026-10-14，IKLPTZ 修复时实测到的
@@ -118,3 +121,35 @@ if (process.env.QODER_RUNTIME_INFO === undefined) {
 if (process.env.DSH_AUTOCLAW_APPDATA === undefined) {
   process.env.DSH_AUTOCLAW_APPDATA = mkdtempSync(join(tmpdir(), 'dsh-autoclaw-'))
 }
+
+/**
+ * ⚠️⚠️ **CodeArts 的模型缓存目录必须隔离**（2026-10-27 实测污染）。
+ *
+ * `src/models.ts` 的 `cacheDir()` 在 `DSH_CODEARTS_CACHE_DIR` 缺失时回退到
+ * `~/.cache/deveco`，而那里存着**用户真实的两份文件**：
+ *
+ * | 文件 | 内容 | 被测试写坏后的后果 |
+ * |---|---|---|
+ * | `codearts_models.json` | 远端模型目录的落盘副本 | 下次启动用测试造的空目录 ⇒ 模型列表缺失 |
+ * | `codearts_benefit_models.json` | benefit 集合（决定是否带 `maas_type`） | 陈旧/错值 ⇒ 每轮请求带错头或白付一轮往返 |
+ *
+ * 实测：跑完 `pnpm test` 后这两个文件的 mtime 都变成当天 —— 即有 spec 走了
+ * 「真读真写」路径。`tests/unit/models.spec.ts` 自己做了隔离，
+ * 但 `llm-adapter.spec.ts`（及各新加的 spec）**没有** ⇒ 它们读的是开发机的
+ * 真实缓存 ⇒ 换一台机器就可能假红/假绿，且会**污染用户**的下一轮真实运行。
+ *
+ * ⇒ 与 `DSH_JET_HUB_STATE_DIR` / `DSH_OFFICEACE_HOME` / `DSH_AUTOCLAW_APPDATA`
+ *   同型，在这一层**进程级**隔离（每测试文件一个临时目录）。
+ *
+ * ⚠️ 用 `=== undefined` 判断而不是无条件覆盖：某些 spec（`models.spec.ts`）
+ * 会在用例内部自己换目录并在 `afterEach` 复原成「环境里原本的值」，
+ * 无条件覆盖会把它的复原目标打歪。
+ */
+if (process.env.DSH_CODEARTS_CACHE_DIR === undefined) {
+  process.env.DSH_CODEARTS_CACHE_DIR = mkdtempSync(join(tmpdir(), 'dsh-codearts-cache-'))
+}
+
+// 签名传输使用独立 undici；离线单测显式接回测试自己的 fetch stub。
+import { beforeEach, afterEach } from 'vitest'
+beforeEach(async () => { const { directLane } = await import('../src/direct-fetch.js'); directLane.fetch = (input, init) => globalThis.fetch(input, init) })
+afterEach(async () => { const { directLane } = await import('../src/direct-fetch.js'); directLane.fetch = null })

@@ -5,7 +5,7 @@
  *
  * ⚠️ 未知/保留/残缺名字一律**剔除该次调用**（去掉 name 后照原样下发），
  * **不得**整轮报错。三条理由（2026-10-15 真机实测）：
- * 1. 只广告门禁 `read`（＝调用方没传工具，`toolsDisabled`）时，模型**会**去调它
+ * 1. 只广告内置工具集（＝调用方没传工具，`toolsDisabled`）时，模型**会**去调它
  *    —— 同一句「读取 /tmp/a.txt」，`big-pickle` 多次产出 `read{path}` 调用
  *    （3 次独立观测；**非必然**：另有一次它直接作答）。若此处抛错，整轮对话
  *    直接死掉，已流出的正文也一并作废。
@@ -32,14 +32,15 @@
  *   到达 + `name:null` 续帧），但机制可达、代码分不清「模型改口」与「我们猜早了」。
  * - 反之，若歧义直到收尾都没消解（如同时启用 `read` 与 `read_image`，上游只给
  *   `dsh_read` 且**一个参数字节都没有**），这条**本可执行**的无参调用会被剔除。
- * - 同一次请求同时广告客户端 `read`（别名 `dsh_read`）与门禁 `read` 时，同名调用
- *   结局相反：调 `dsh_read` 执行、调裸 `read` 被剔除（门禁名永不还原，见 `restore`）。
+ * - 同一次请求同时广告客户端 `read`（别名 `dsh_read`）与内置 `read` 时，同名调用
+ *   结局相反：调 `dsh_read` 执行、调裸 `read` 被剔除（内置名永不还原，见 `restore`）。
  *   刻意保留：把裸 `read` 当客户端调用执行＝把**门禁调用**猜成客户端意图，而门禁
  *   schema 是 `{path}`、客户端 `read` 要 `{file_path}`，猜错就是执行一个模型没打算
  *   调的工具；剔除的代价只是这一次调用没发生（有 warn 留痕）。
  */
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import { ALIAS_PREFIX, FREE_LANE_GATE_TOOLS, type OpencodeRequestShape } from './opencode-messages.js'
+import { ALIAS_PREFIX, type OpencodeRequestShape } from './opencode-messages.js'
+import { RESERVED_BUILTIN_TOOL_NAMES } from './opencode-official-tools.js'
 
 type RecordValue = Record<string, unknown>
 function record(value: unknown): RecordValue | undefined {
@@ -73,7 +74,7 @@ export function createOpencodeFrameNormalizer(
 } {
   const choices = new Map<number, ChoiceState>()
   const aliases = request.toolAliases
-  const candidates = [...aliases.keys(), ...FREE_LANE_GATE_TOOLS]
+  const candidates = [...aliases.keys(), ...RESERVED_BUILTIN_TOOL_NAMES]
   const fail = (detail: string): never => {
     // 不用 AUTH/QUOTA：客户端会吞掉具体文案；不标记账号、不换槽重发同一坏调用。
     throw new LlmError(`opencode: ${detail}`, 'PERMISSION_DENIED')
@@ -102,7 +103,7 @@ export function createOpencodeFrameNormalizer(
   /** 剔除原因文案：必须指路，且不得把**我们自己**的缺陷记到模型头上。 */
   const dropReason = (name: string): string => {
     if (name.length === 0) return '上游工具调用始终没有名字'
-    if ((FREE_LANE_GATE_TOOLS as readonly string[]).includes(name)) return `上游调用了保留门禁工具 ${name}`
+    if ((RESERVED_BUILTIN_TOOL_NAMES as readonly string[]).includes(name)) return `上游调用了保留的内置工具 ${name}`
     // `dsh_` 是本插件自己的别名前缀：出现它意味着别名表或历史重命名可能有缺陷
     // （模型回叫历史里的裸原名是合理行为），与「模型幻觉出 ghost 这种名字」不同因。
     if (name.startsWith(ALIAS_PREFIX)) return `上游返回了未声明的别名 ${name}（dsh_ 是本插件自己的前缀，请查别名表与历史重命名）`

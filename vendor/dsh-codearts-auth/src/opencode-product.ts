@@ -68,8 +68,9 @@ export const OPENCODE: OpencodeProduct = {
   // ⚠️ 匿名凭证是**字面量** `public`：opencode 官方 CLI 在没有 key 时自己就用它
   // （其 provider.ts 的 opencode 分支：`options: ok ? {} : { apiKey: 'public' }`）。
   anonymousKey: 'public',
-  // V2 UA；旧版 CLI 探测值由 opencodeUserAgent 拦截，不能降级到已失效的协议。
-  defaultUserAgent: 'opencode/latest/2.0.29/cli',
+  // V2 UA，与官方 v2 通道的当前版本对齐（不是门禁项，见 opencode.ts 的说明）；
+  // 旧版 CLI 探测值由 opencodeUserAgent 拦截，不能降级到已失效的协议。
+  defaultUserAgent: 'opencode/latest/2.1.1/cli',
   /**
    * 模型能力元数据源（**远端**，能力的主来源）。
    *

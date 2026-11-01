@@ -24,7 +24,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createCredentialResolver, type ResolverPool } from '../../src/credential-resolver.js'
+import { createCredentialResolver, NO_FREE_MODEL, type ResolverPool } from '../../src/credential-resolver.js'
 import { apply } from '../../src/index.js'
 import {
   peekLedgerAccount,
@@ -268,7 +268,9 @@ describe('createCredentialResolver · 骨架 C（buddy 协议分档）', () => {
           kind: 'buddy',
           selector: overrides.selector as never,
           lockedError: LOCKED_ERROR as never,
-          ...overrides.isFreeModel === undefined ? {} : { isFreeModel: overrides.isFreeModel },
+          // ⚠️ `isFreeModel` 是**必填**字段（原为可选，见 `NO_FREE_MODEL` 的事故
+          //    说明）：本 helper 的默认值即「本家没有免费模型」，要测免费短路再显式传。
+          isFreeModel: overrides.isFreeModel ?? NO_FREE_MODEL,
           ...overrides.reportPickedAccount === undefined
             ? {}
             : { reportPickedAccount: overrides.reportPickedAccount },
@@ -459,6 +461,7 @@ describe('createCredentialResolver · 骨架 C（buddy 协议分档）', () => {
         balance: {
           kind: 'buddy',
           selector: fakeSelector({ pick: PICK_A1 }) as never,
+          isFreeModel: NO_FREE_MODEL,
           // 与 `src/index.ts` 的 `buddyLockedError` 同口径（只取关键判据）。
           lockedError: (reason) => new Error(
             reason.kind === 'no-candidates' ? '没有任何候选账号' : '额度已用尽',

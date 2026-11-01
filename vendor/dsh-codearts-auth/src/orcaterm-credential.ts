@@ -32,6 +32,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
+import { desktopCredentialImportAvailable } from './login-platform.js'
 import type { OrcaTermCredential } from './orcaterm-adapter.js'
 
 /** 钥匙串项候选（实测内置浏览器用第一个）。 */
@@ -111,6 +112,7 @@ function querySqlite(dbPath: string, sql: string): Array<Record<string, unknown>
  * @returns 网页形态凭据；库缺失、无登录、或解不出可打印值时返回 null
  */
 export function harvestBrowserSession(cookieDb = defaultCookieDb()): Extract<OrcaTermCredential, { kind: 'web' }> | null {
+  if (!desktopCredentialImportAvailable()) return null
   if (!fs.existsSync(cookieDb)) return null
   const password = keychainPassword()
   if (password === null) return null

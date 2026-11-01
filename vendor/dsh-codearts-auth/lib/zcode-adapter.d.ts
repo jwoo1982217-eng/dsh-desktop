@@ -83,8 +83,10 @@ export declare function reasoningEffortLabel(id: string): string;
 export interface ZcodeAdapterOptions {
     /** 单凭据回退 ref（无账号池时）。 */
     credentialRef: CredentialRef;
-    /** 解析当前可用凭据。 */
-    resolveCredential: (modelId?: string) => Promise<ZcodeCredential | undefined>;
+    /** 解析当前可用凭据（第二参是 DSH 会话 id；zcode 用它做账号亲和）。 */
+    resolveCredential: (modelId?: string, sessionId?: string, picked?: {
+        accountId?: string;
+    }) => Promise<ZcodeCredential | undefined>;
     /**
      * 凭据失效时的处理。
      *

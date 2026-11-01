@@ -1,3 +1,4 @@
+import { directFetch } from './direct-fetch.js';
 /**
  * 华为云 CodeArts 积分（「每日签到得积分」活动）。
  *
@@ -81,6 +82,14 @@ export const CODEARTS_OPS_DELIVERY_PATH = '/v1/ops/delivery';
 export const CODEARTS_OPS_CLAIM_PATH = '/v1/ops/claim';
 /** 领取确认端点。 */
 export const CODEARTS_OPS_CONFIRM_PATH = '/v1/ops/confirm';
+/**
+ * 限时福利领取的完整 URL（幂等；成功判据 `error_code === '0000'`）。
+ *
+ * ⚠️ 导出供单测匹配「这一次 fetch 是领取、不是聊天」—— 三条既有用例的替身
+ * fetch 是按 URL 分流计数的，不认这个地址就会把领取误计成一次 chat 请求。
+ * 网关配置端点（`/api/v1/gateway/config`）已在 `src/models.ts` 实现，此处不重复。
+ */
+export const CODEARTS_BENEFIT_CLAIM_URL = 'https://opengw.developer.huaweicloud.com/api/v1/benefit/claim';
 /** 渠道标识：声明请求来自 IDE 形态（对齐 IDE 的 `channel=IDE`）。 */
 export const CODEARTS_OPS_CHANNEL = 'IDE';
 /**
@@ -98,6 +107,14 @@ export const CODEARTS_DAILY_LOGIN_TYPE = 'USER_LOGIN';
  * 用于把「今天已领」与「活动未开始/无资格」区分开 —— 两者对用户的含义不同。
  */
 const CLAIMED_STATUSES = ['CLAIMED', 'CONFIRMED', 'CONSUMED'];
+/**
+ * 「今天已领过」的服务端业务码。
+ *
+ * 实测（2026-10-08，永久 AK/SK 首次领取成功后再发一次 `POST /v1/ops/claim`）：
+ * `HTTP 200 {"code":40001,"message":"尚未到达权益刷新时间，暂时无法领取","data":null}`。
+ * 活动列表的 `claimable` 会在一段时间内保持 true，故这是重复点击的主要出口。
+ */
+const CODEARTS_ALREADY_CLAIMED_CODE = 40001;
 /** 请求超时（毫秒）。与 `credits.ts` 的 30s 同口径。 */
 const REQUEST_TIMEOUT_MS = 30_000;
 /**
@@ -136,6 +153,14 @@ const CREDIT_METRIC_LABELS = {
 };
 /** 总额 metric 的名字（其余分类明细不参与总额计算，避免重复累加）。 */
 const TOTAL_CREDIT_METRIC = 'usageTotalPackageCredit';
+/**
+ * 基础积分包的 metric 名。
+ *
+ * 只有这个分类能拿到确切的到期时刻 —— 它随**套餐周期**（响应顶层的
+ * `end_date`）重置。赠送包（签到/活动，逐笔「发放日 +30 天」）与按需包
+ * （实时结算）都没有可用的逐包到期字段，故不套用套餐周期。
+ */
+const BASIC_CREDIT_METRIC = 'usageBasicPackageCredit';
 /** 响应体可解析为对象、但缺少必要字段时的统一失败说明。 */
 const UNPARSABLE_RESPONSE_MESSAGE = '请求失败或响应无法解析';
 /**
@@ -181,6 +206,26 @@ function readNumber(source, key) {
             return parsed;
     }
     return 0;
+}
+/**
+ * 从 JSON 安全读取数字，但**区分「缺失」与「0」**（缺失/非法返回 `undefined`）。
+ *
+ * 与 {@link readNumber} 的分工：那个返回 0 是刻意的（`package_credit_amount`
+ * 缺失时按「额度为 0」处理，让「0 额度分类不列为资源包」的判据成立）；
+ * 但 `package_credit_expiring_amount` 缺失表示**上游没给这个口径**，
+ * 与「给了且为 0」是两件事 —— 前者要显示「无此信息」，后者要显示「无临期额度」。
+ * 混用会让没有该字段的账户凭空多出一句「0 即将到期」。
+ */
+function readOptionalNumber(source, key) {
+    const value = source[key];
+    if (typeof value === 'number' && Number.isFinite(value))
+        return value;
+    if (typeof value === 'string' && value.trim().length > 0) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed))
+            return parsed;
+    }
+    return undefined;
 }
 /** 从 JSON 安全读取字符串。 */
 function readString(source, key) {
@@ -311,12 +356,58 @@ async function signedSnapRequest(method, url, credential, body, fetcher) {
  * 没有任何 credit metric 时返回 `undefined`（= 该账户没有积分口径），
  * 与 `total: 0`（有口径但余额为 0）严格区分。
  */
-function parseCreditBalance(metrics) {
+/**
+ * 把 `YYYY-MM-DD` 形式的日期解析成毫秒时间戳（解析不出返回 `undefined`）。
+ *
+ * ⚠️ 服务端下发的是**纯日期**（`end_date: "2026-10-27"`），不含时刻与时区。
+ * 按 ISO 8601 规范，纯日期形式 `YYYY-MM-DD` **必须**按 UTC 解释
+ * （与 `YYYY-MM-DDTHH:mm:ss` 无时区时按本地时间解释不同）。
+ * 这正好对应服务端的语义：套餐在 `end_date` 当天的 **00:00 UTC**
+ * （= 北京时间 08:00）结束 —— 截图里显示的「2026/10/26 23:59」是
+ * 按另一个时区口径取的前一秒，两者指向同一个时刻边界。
+ *
+ * ⚠️ 解析不出就返回 `undefined`（= 到期时间未知 ⇒ 分档归永久桶），
+ * **绝不**用 `Date.now()` 之类的值兜底。
+ */
+function parseDateMs(value) {
+    const trimmed = value.trim();
+    if (trimmed.length === 0)
+        return undefined;
+    const ms = Date.parse(trimmed);
+    return Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+function parseCreditBalance(metrics, packageEndDate) {
     if (!Array.isArray(metrics))
         return undefined;
     const packages = [];
     let totalRemain;
     let sawAnyCreditMetric = false;
+    /**
+     * 「即将到期」的额度（`package_credit_expiring_amount`）。
+     *
+     * ⚠️ **总额口径**：只在总额 metric 上取一次，不累加各分类 —— 实测
+     * `usageTotalPackageCredit` 与 `usageBonusPackageCredit` **同时**带 2000
+     * （2026-10-20 真实账号），累加会得到 4000，凭空翻倍。
+     *
+     * ⚠️ 实测校验：`总额 expiring - 赠送 expiring = 0` ⇒ 总额那个标量
+     * **就是各分类之和**，故下面逐包读取不会重复计数。
+     *
+     * ⚠️ 缺失该键与值为 0 严格区分：缺失 = 上游没给这个口径（`undefined`），
+     * 0 = 给了且当前没有即将到期的额度。
+     */
+    let expiringTotal;
+    /**
+     * 套餐周期结束时刻（`end_date` 的毫秒值；解析不出为 `undefined`）。
+     *
+     * ⚠️ 这个日期**只适用于「基础积分包」**（套餐自带的那 500 分）：
+     * 官方计费文档写明个人体验版「到期系统会自动免费续期，不会产生任何费用」，
+     * 但**基础积分包**确实随套餐周期重置（截图实测：套餐 2026-09-26 →
+     * 2026-10-27，基础包 500 分同期作废）。
+     *
+     * ⚠️ **不能**套到赠送包/按需包上：签到积分的有效期是「发放日 +30 天」
+     * （逐笔各不相同），按需包按消费实时结算。给它们套套餐周期就是编造。
+     */
+    const packageEndMs = packageEndDate === undefined ? undefined : parseDateMs(packageEndDate);
     for (const item of metrics) {
         if (typeof item !== 'object' || item === null)
             continue;
@@ -329,29 +420,78 @@ function parseCreditBalance(metrics) {
         const amount = readNumber(record, 'package_credit_amount');
         const used = readNumber(record, 'package_credit_used');
         const remain = readNumber(record, 'package_credit_remain');
-        if (name === TOTAL_CREDIT_METRIC)
+        if (name === TOTAL_CREDIT_METRIC) {
             totalRemain = remain;
+            // 只认总额 metric 上的那个标量（见上方注释：分类上也有同名字段）。
+            const expiring = readOptionalNumber(record, 'package_credit_expiring_amount');
+            if (expiring !== undefined && expiring > 0)
+                expiringTotal = expiring;
+            /**
+             * ★ **总包不列为资源包**：它是「基础 + 按需 + 赠送」的**汇总行**，
+             * 与下面三个分类是同一批积分的两种视图。
+             *
+             * 把它和分类一起 push 会让 `packages` 求和**翻倍**（实测 2026-10-20：
+             * 总包 25500 + 基础 500 + 赠送 25000 = 51000，而 `total` 是 25500）。
+             * 那不只是数字难看 —— 三档分档（永久/长期/临期）是按 `packages`
+             * 逐包累加的，重复计数会让「永久桶」凭空多出一倍，锁定永久积分时
+             * 就会误判「还有大量永久额度可用」而继续烧临期额度。
+             *
+             * `totalRemain` 已单独记下总额，`total` 不受影响。
+             */
+            continue;
+        }
         // 额度为 0 的分类不列为资源包：列出来只会让「N 个资源包」虚高。
         if (amount <= 0 && remain <= 0)
             continue;
+        /**
+         * 只有**基础积分包**能拿到确切的到期时刻（= 套餐周期结束）。
+         *
+         * 其余分类（按需 / 赠送）如实留空 —— `undefined` 表示「到期时间未知」，
+         * 分档时归入永久桶（保守方向）。绝不拿套餐周期去套它们：签到积分的
+         * 有效期是逐笔「发放日 +30 天」，套错了会让用户以为明天就作废。
+         */
+        const deductionEndTime = name === BASIC_CREDIT_METRIC ? packageEndMs : undefined;
+        /**
+         * 本分类里「即将到期」的额度。
+         *
+         * ⚠️ 只在**没有确切到期时刻**时才需要它（赠送/按需包）：分档拿不到
+         * `deductionEndTime` 就会把整包算进永久桶，那 25000 分里其实有 2000
+         * 快作废 —— 只说「另有 2000 即将到期」而不调整分档，两个数字会打架
+         * （用户 2026-10-20 报障：「2000+500临期不应该是2500嘛」）。
+         *
+         * ⚠️ 基础包已有真实时刻，**不**读本字段：两者同时生效会重复计入临期。
+         */
+        const expiringRaw = deductionEndTime === undefined
+            ? readOptionalNumber(record, 'package_credit_expiring_amount')
+            : undefined;
+        // 夹在 [0, remain] 内：上游若给超（不该发生），宁可少算临期也不让
+        // 「永久 + 临期」超过本包余额（那会让分档合计与 total 脱钩）。
+        const expiringRemaining = expiringRaw === undefined || expiringRaw <= 0
+            ? undefined
+            : Math.min(expiringRaw, remain);
         packages.push({
             name: label,
             unit: 'credit',
             remaining: remain,
             total: amount,
             used,
-            // `statistics/plugin` 不下发资源包的有效性/周期字段（那是腾讯侧的形态）。
-            // 这里如实置为有效、周期留空，而不是臆造一个到期时间。
             active: true,
             cycleStartTime: '',
             cycleEndTime: '',
-            expiredTime: '',
+            expiredTime: deductionEndTime === undefined ? '' : new Date(deductionEndTime).toISOString(),
+            ...deductionEndTime === undefined ? {} : { deductionEndTime },
+            ...expiringRemaining === undefined ? {} : { expiringRemaining },
         });
     }
     if (!sawAnyCreditMetric)
         return undefined;
     const total = roundCredits(totalRemain ?? packages.reduce((sum, pkg) => sum + pkg.remaining, 0));
-    return { total, packages, expiredTotal: 0 };
+    return {
+        total,
+        packages,
+        expiredTotal: 0,
+        ...expiringTotal === undefined ? {} : { expiringTotal },
+    };
 }
 /**
  * 查询账户/套餐信息 —— 含**积分账户检测**。
@@ -362,7 +502,7 @@ function parseCreditBalance(metrics) {
  *
  * 需要**失败原因**时用 {@link fetchCodeArtsAccountInfoDetailed}。
  */
-export async function fetchCodeArtsAccountInfo(credential, fetcher = fetch) {
+export async function fetchCodeArtsAccountInfo(credential, fetcher = directFetch) {
     const result = await fetchCodeArtsAccountInfoDetailed(credential, fetcher);
     return result.ok ? result.info : null;
 }
@@ -373,11 +513,11 @@ export async function fetchCodeArtsAccountInfo(credential, fetcher = fetch) {
  * 签名错误或凭据过期，把它们统一压成一句笼统文案，会让用户与排查者都拿不到
  * 线索（本仓库在 `credits.ts` / `lobsterai-credits.ts` 都刻意保留原始错误消息）。
  */
-export async function fetchCodeArtsAccountInfoDetailed(credential, fetcher = fetch) {
+export async function fetchCodeArtsAccountInfoDetailed(credential, fetcher = directFetch) {
     const url = `${CODEARTS_SNAP_ENGINE_URL}${CODEARTS_PACKAGE_INFO_PATH}`;
     const result = await signedSnapRequest('GET', url, credential, undefined, fetcher);
     if (!result.ok)
-        return { ok: false, message: result.message };
+        return { ok: false, code: result.code, message: result.message };
     const data = result.data;
     const pkg = readRecord(data, 'package');
     const packageNameCn = readString(pkg, 'package_name_cn');
@@ -390,7 +530,9 @@ export async function fetchCodeArtsAccountInfoDetailed(credential, fetcher = fet
             specCode: readString(pkg, 'spec_code'),
             packageName: packageNameCn.length > 0 ? packageNameCn : packageNameEn,
             packageStatus: readString(pkg, 'status'),
-            credit: parseCreditBalance(data.metrics),
+            // `end_date` 是套餐周期结束日（顶层字段，与 `package` 同级）。
+            // 只有基础积分包跟随它到期，见 `parseCreditBalance` 的注释。
+            credit: parseCreditBalance(data.metrics, readString(data, 'end_date')),
         },
     };
 }
@@ -419,19 +561,19 @@ function parseActivity(item) {
  *
  * 需要**失败原因**时用 {@link fetchCodeArtsOpsActivitiesDetailed}。
  */
-export async function fetchCodeArtsOpsActivities(credential, fetcher = fetch) {
+export async function fetchCodeArtsOpsActivities(credential, fetcher = directFetch) {
     const result = await fetchCodeArtsOpsActivitiesDetailed(credential, fetcher);
     return result.ok ? result.activities : null;
 }
 /** 查询活动列表，失败时保留底层原因。 */
-export async function fetchCodeArtsOpsActivitiesDetailed(credential, fetcher = fetch) {
+export async function fetchCodeArtsOpsActivitiesDetailed(credential, fetcher = directFetch) {
     const url = `${CODEARTS_SNAP_ENGINE_URL}${CODEARTS_OPS_DELIVERY_PATH}?channel=${CODEARTS_OPS_CHANNEL}`;
     const result = await signedSnapRequest('GET', url, credential, undefined, fetcher);
     if (!result.ok)
-        return { ok: false, message: result.message };
+        return { ok: false, code: result.code, message: result.message };
     const items = result.data.items;
     if (!Array.isArray(items))
-        return { ok: false, message: '响应缺少 items 字段' };
+        return { ok: false, code: -1, message: '响应缺少 items 字段' };
     return {
         ok: true,
         activities: items
@@ -448,39 +590,54 @@ export function findDailyCheckinActivity(activities) {
  *
  * 步骤与判定顺序（每一步都对应一个**对用户含义不同**的结果）：
  *
- * 1. 查账户类型 —— 查询失败 → `failed`；非积分账户 → `inactive`
- *    （活动范围明确限定「已升级到积分计费模式的用户」，Token 账户不该被
- *    报成「领取失败」）；
- * 2. 查活动列表 —— 查询失败 → `failed`；无 `USER_LOGIN` 活动 → `inactive`；
- * 3. 活动不可领取且状态属已领取态 → `already-claimed`；其余不可领取 → `inactive`；
- * 4. `POST /v1/ops/claim` —— 失败 → `failed`；
- * 5. 响应 `id !== null` 时补 `POST /v1/ops/confirm`（漏掉会让积分停在待确认）；
- * 6. 成功 → `claimed`。
+ * 1. 查账户类型 —— 查询失败 → `failed`；
+ * 2. 查活动列表 —— 查询失败 → `failed`；
+ * 3. **以活动列表为准**：无 `USER_LOGIN` 活动 / 不可领取时，才用账户类型给出
+ *    `inactive` 的说明文案（非积分账户 → 「不在积分活动范围」，否则 → 「未找到
+ *    每日签到活动」）；活动可领取 → **直接领**（不看 `isCreditPackage`）；
+ * 4. 活动不可领取且状态属已领取态 → `already-claimed`；其余不可领取 → `inactive`；
+ * 5. `POST /v1/ops/claim` —— 失败 → `failed`（业务码 `40001` 例外，见下）；
+ * 6. 响应 `id !== null` 时补 `POST /v1/ops/confirm`（漏掉会让积分停在待确认）；
+ * 7. 成功 → `claimed`。
  *
- * 注意第 3 步是**唯一的幂等保护**：本协议没有幂等键，也没有服务端
- * 「今天已签到」业务码可依赖，因此预检不能省。
+ * ⚠️ **为什么不再用 `isCreditPackage` 当门禁**（2026-10-08 实测，第三重根因）：
+ * 体验版账号（`spec_code=codearts.agent.trial`、`is_credit_package=false`、
+ * `is_token_package=true`）的 `statistics/plugin` 里**没有**任何积分 metric，
+ * 但同一凭据下 `GET /v1/ops/delivery` 明确返回 `USER_LOGIN` 活动且
+ * `claimable:true`，`POST /v1/ops/claim` 实测 **HTTP 200 并真发 1000 积分**
+ * （`status:"CLAIMED"`、`totalAmount:1000`）。旧的 `!isCreditPackage ⇒ inactive`
+ * 提前返回是**假阴性**：凭据修好了也永远显示「Token 计费账户，不在积分活动范围」，
+ * 用户永远看不到「签到成功」。故改为「活动列表说了算」——服务端给了可领取的
+ * 每日签到活动就领，账户类型只用来**修饰不可领取时的文案**。
+ *
+ * 注意第 4 步是主要的幂等保护：本协议没有幂等键，预检不能省。此外服务端在
+ * 重复领取时回业务码 `40001`（「尚未到达权益刷新时间，暂时无法领取」，实测），
+ * 该码必须如实判为 `already-claimed` 而不是 `failed` —— 否则用户重复点击会看到
+ * 一个并不存在的故障。
  */
-export async function claimCodeArtsDailyCheckin(credential, fetcher = fetch) {
+export async function claimCodeArtsDailyCheckin(credential, fetcher = directFetch) {
     const infoResult = await fetchCodeArtsAccountInfoDetailed(credential, fetcher);
     if (!infoResult.ok) {
-        return { kind: 'failed', code: -1, message: `账户信息查询失败：${infoResult.message}` };
+        // 透传底层 code（401/403 ⇒ 凭据过期 ⇒ 上层可自愈重试；-1 ⇒ 网络/解析故障）。
+        return { kind: 'failed', code: infoResult.code, message: `账户信息查询失败：${infoResult.message}` };
     }
     const info = infoResult.info;
-    if (!info.isCreditPackage) {
-        return {
-            kind: 'inactive',
-            message: info.isTokenPackage
-                ? 'Token 计费账户，不在积分活动范围'
-                : '非积分计费账户，不在积分活动范围',
-        };
-    }
     const activitiesResult = await fetchCodeArtsOpsActivitiesDetailed(credential, fetcher);
     if (!activitiesResult.ok) {
-        return { kind: 'failed', code: -1, message: `活动列表查询失败：${activitiesResult.message}` };
+        return { kind: 'failed', code: activitiesResult.code, message: `活动列表查询失败：${activitiesResult.message}` };
     }
     const activity = findDailyCheckinActivity(activitiesResult.activities);
     if (activity === undefined) {
-        return { kind: 'inactive', message: '未找到每日签到活动' };
+        // 活动列表是权威：服务端没给每日签到活动 ⇒ 该账号确实不在活动范围。
+        // 此时才用账户类型修饰文案（`isCreditPackage=false` 的账号给出更具体的原因）。
+        return {
+            kind: 'inactive',
+            message: info.isCreditPackage
+                ? '未找到每日签到活动'
+                : info.isTokenPackage
+                    ? 'Token 计费账户，不在积分活动范围'
+                    : '非积分计费账户，不在积分活动范围',
+        };
     }
     if (!activity.claimable) {
         return CLAIMED_STATUSES.includes(activity.status)
@@ -492,6 +649,12 @@ export async function claimCodeArtsDailyCheckin(credential, fetcher = fetch) {
     }
     const claimResult = await signedSnapRequest('POST', `${CODEARTS_SNAP_ENGINE_URL}${CODEARTS_OPS_CLAIM_PATH}`, credential, JSON.stringify({ campaignId: activity.campaignId, channel: CODEARTS_OPS_CHANNEL }), fetcher);
     if (!claimResult.ok) {
+        // 服务端幂等业务码：活动列表缓存还没刷新时重复领取会回 40001
+        // （实测文案「尚未到达权益刷新时间，暂时无法领取」）。这是**今天已经领过**，
+        // 不是故障；判成 failed 会让用户看到一个并不存在的错误。
+        if (claimResult.code === CODEARTS_ALREADY_CLAIMED_CODE) {
+            return { kind: 'already-claimed', message: '今天已领取' };
+        }
         return { kind: 'failed', code: claimResult.code, message: claimResult.message };
     }
     // 服务端要求确认时才补 confirm：IDE 的判据是 `benefit.id !== null`。
@@ -518,6 +681,76 @@ export async function claimCodeArtsDailyCheckin(credential, fetcher = fetch) {
         streakDays: 0,
         isStreakDay: false,
     };
+}
+/**
+ * 领取限时福利（opengw `POST /api/v1/benefit/claim`，幂等；成功判据 `error_code === '0000'`）。
+ *
+ * ## 为什么需要它（对标实测）
+ *
+ * HITZY2002/codearts2api 的 README（原文核实）：「限时福利模型**必须先领取才能调用**：
+ * 未领取时上游一律返回 `InferHub.4004.200 benefit not found`（实测）。领取是幂等
+ * 操作，官方客户端打开模型菜单时也会调用」。它默认开启 `benefit_auto_claim`，
+ * 其 `ClaimBenefit` 即本函数所复刻的报文。
+ *
+ * ## 与每日签到积分是两条独立协议，别混
+ *
+ * | 领取什么 | host | 路径 | 请求体 | 成功判据 |
+ * |---|---|---|---|---|
+ * | 每日签到积分 | snap-access | `/v1/ops/claim` | `{campaignId, channel}` | 信封 `code`（`40001` = 今天已领） |
+ * | **限时福利额度** | **opengw** | `/api/v1/benefit/claim` | **`{}`** | **`error_code === '0000'`** |
+ *
+ * ⚠️ `X-Language` 必须**签名之后**追加 —— 进 canonical request 会验签失败
+ * （与 {@link SNAP_EXTRA_HEADERS} 注释记录的是同一族坑，实测于 snap 路径）。
+ * ⚠️ 网络/解析/非 2xx 一律归 `failed` 而不抛错：调用方（`llm-adapter.ts` 的
+ * benefit 分支）只关心「领到了没有」，领不到就退回原有的去头降级。
+ */
+export async function claimCodeArtsBenefit(credential, fetcher = fetch, 
+/**
+ * ⚠️ **必须接调用方的 signal**（2026-10-27 审计修）。
+ *
+ * 修前本函数自带一个 30 秒的 `AbortSignal.timeout`，与 `options.signal`
+ * **完全无关** ⇒ 用户按下「停止」后，这条**写请求**仍会继续跑到超时
+ * （最多再等 30 秒），而适配器里其它 await（`delay(…, options.signal)`）都是可中断的。
+ */
+options) {
+    const { access_key_id: ak, secret_access_key: sk, security_token: st } = credential;
+    if (!ak || !sk)
+        return 'failed';
+    const url = CODEARTS_BENEFIT_CLAIM_URL;
+    const body = '{}';
+    try {
+        const signed = await signRequestHuawei(ak, sk, st, 'POST', url, new TextEncoder().encode(body));
+        const headers = new Headers();
+        signed.forEach((value, key) => {
+            if (key !== 'host')
+                headers.set(key, value);
+        });
+        headers.set('X-Language', 'zh-cn');
+        const response = await fetcher(url, {
+            method: 'POST',
+            headers,
+            body,
+            /**
+             * ⚠️ 两个信号**合并**：既保留自身的 30s 兜底超时，又能被调用方的
+             * 「停止」立即打断（`AbortSignal.any` 是 Node 20+ 标准）。
+             * 修前这里恒为 `AbortSignal.timeout(...)` ⇒ 用户按停止后这条**写请求**
+             * 仍会跑到超时（最多再等 30 秒）。
+             */
+            signal: options?.signal === undefined
+                ? AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+                : AbortSignal.any([options.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
+        });
+        if (!response.ok)
+            return 'failed';
+        const parsed = JSON.parse(await response.text());
+        const code = typeof parsed === 'object' && parsed !== null
+            ? parsed.error_code
+            : undefined;
+        return code === '0000' ? 'success' : 'failed';
+    }
+    catch {
+        return 'failed';
+    }
 }
 /**
  * 把额度规整为两位小数。

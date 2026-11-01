@@ -59,14 +59,33 @@ import { accioExpiry, buddyExpiry, codeArtsExpiry, lobsteraiExpiry, loomyExpiry,
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17）
 modelscopeExpiry, 
 // ⚠️ AutoClaw（智谱，2026-10-17 审计 P0 修复新增）
-autoclawExpiry, zcodeExpiry, } from './aggregate-expiry.js';
+autoclawExpiry, 
+// ⚠️ Qoder（国际版 / 中国版共用，2026-10-20 新增）
+qoderExpiry, 
+// ⚠️ AStudio（讯飞 AstronStudio，2026-10-20 新增）
+astudioExpiry, 
+// ⚠️ MiniMax Code（中国版 / 国际版共用，2026-10-20 新增）
+minimaxExpiry, zcodeExpiry, } from './aggregate-expiry.js';
+// ⚠️ Qoder（国际版 / 中国版，2026-10-20 新增）：与 minimax 同款 —— 两站共用
+//    同一套 `src/qoder*.ts` 实现，差异全在 `src/qoder-product.ts` 的
+//    `QODER` / `QODER_CN` 常量（域名 / client_id / 模型表）。
+import { QODER, QODER_CN } from './qoder-product.js';
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17）
 import { MODELSCOPE } from './modelscope-product.js';
 // ⚠️ AutoClaw（智谱，2026-10-17 审计 P0 修复新增）
 import { AUTOCLAW, AUTOCLAW_INTL } from './autoclaw-product.js';
+// ⚠️ AStudio（讯飞 AstronStudio，2026-10-20 新增）
+import { ASTUDIO } from './astudio-product.js';
+// ⚠️ MiniMax Code（中国版 / 国际版，2026-10-20 新增）
+import { MINIMAX, MINIMAX_INTL } from './minimax-product.js';
 import { CODEBUDDY, WORKBUDDY } from './product.js';
 import { LOBSTERAI } from './lobsterai-product.js';
 import { TRAE } from './trae-product.js';
+// ⚠️ Magicrew（超级麦吉，2026-10-29 新增）：折算原语**就在取数模块里**
+//    （`magicrew-credits.ts` 的 `magicrewExpiry`）—— 本表只做「凭据 → 它要的入参」
+//    这一层映射，**绝不重算折算**（本仓库红线：折算映射只许有一份）。
+import { magicrewExpiry } from './magicrew-credits.js';
+import { parseMagicrewCredential } from './magicrew-auth.js';
 /**
  * buddy 系的折算（**两个产品共用同一个原语**，只换 product 配置）。
  *
@@ -90,7 +109,7 @@ function buddyFamilyExpiry(product) {
  * ⚠️ 返回**新对象**（不是模块级单例）：调用方（`index.ts` 与单测）各自持有一份，
  * 互不影响；表本身是**无状态**的（每个值只是一层转发闭包），故无共享状态风险。
  */
-export function createProviderExpiry() {
+export function createProviderExpiry(deps = {}) {
     return {
         // ⚠️ 两个 buddy 系产品：原语相同、product 不同（`CODEBUDDY` / `WORKBUDDY`）。
         buddy: buddyFamilyExpiry(CODEBUDDY),
@@ -160,6 +179,144 @@ export function createProviderExpiry() {
                 ? undefined
                 : () => context.cachedBalance(context.accountId)),
         },
+        // ⚠️ **AStudio**（讯飞 AstronStudio，2026-10-20）：与 **buddy 系同形**
+        //    （三池各带 `*NextExpireTime` ⇒ 逐包真实到期时刻，`astudioExpiry` 走
+        //    `sharedPackageExpiry` 取最早那包）。
+        //    ⚠️ 三处必须同改（本表 + `WIRED_EXPIRY_PROVIDERS` + 折算原语）——
+        //    这是该陷阱的第 **5** 次复发（cline → accio → officeace → autoclaw → astudio），
+        //    漏任何一处的症状都是**静默**的（用户在聚合轮换列表里看不到该渠道，
+        //    零报错零日志）。
+        //    ⚠️ **必须走 `cachedBalance`**：与 buddy / trae / modelscope 同款 ——
+        //    聚合每轮折算会对同一账号反复提问，没有共享读数就白发大量重复请求。
+        astudio: {
+            credentialExpiry: (c, context) => astudioExpiry(c, ASTUDIO, context?.cachedBalance === undefined
+                ? undefined
+                : () => context.cachedBalance(context.accountId)),
+        },
+        // ⚠️ Magicrew（2026-10-29）：折算原语是 `magicrew-credits.ts` 的 `magicrewExpiry`。
+        //    ⚠️ 它是 **async + 自带取数腿**（缓存缺席 / null / undefined 时自己发请求）——
+        //    这正是 `src/provider-runtime.ts:218-231` 要求的契约，别在这里只传值。
+        //    ⚠️ 与 ① ② 必须三处同改（`expiry-runtime-parity.spec.ts` 真跑 apply() 锁一致性）。
+        magicrew: {
+            credentialExpiry: async (c, context) => {
+                /**
+                 * ⚠️ **共用 `parseMagicrewCredential`**，不要在这里手写 `c?.jwt ?? ''`
+                 *（2026-10-29 最终审查 I4）：`MagicrewService.expiry` 走的是共享解析器，
+                 *  两处各写一套「什么算有效凭据」就是同义判据（本仓红线）。
+                 *  统一后两者的差别只剩「service 侧可注入 `now`」，那是有意的。
+                 */
+                const credential = parseMagicrewCredential(c);
+                return await magicrewExpiry({
+                    jwt: credential?.jwt ?? '',
+                    organizationCode: credential?.organizationCode ?? '',
+                    ...context?.cachedBalance === undefined
+                        ? {}
+                        : {
+                            cachedBalance: () => context.cachedBalance(context.accountId),
+                        },
+                });
+            },
+        },
+        /**
+         * ⚠️ **Qoder**（国际版 / 中国版，2026-10-20）：与 **buddy 系同形**
+         *    （`CreditPackage` 都带 `deductionEndTime`）⇒ 原语直接复用
+         *    `sharedPackageExpiry`；两站共用同一个原语（只换 product），
+         *    单独抽 `qoderFamilyExpiry` 是为了让「它们只差一个 product」一眼可见。
+         *
+         *    ⚠️⚠️ **与上面所有条目的关键差别：本家是「接入了，但上游不给逐包时刻」。**
+         *    实测（2026-10-20，两个真实 qodercn 账号）：`userQuota` 的顶层
+         *    `expiresAt = 253402214400000` 是**永久哨兵**（`9999-12-31T00:00:00Z`），
+         *    `addOnQuota` **只给聚合标量、零日期字段**，
+         *    `dedicatedResourcePackages`（唯一带真实逐包到期的字段）本机为 `undefined`
+         *    ⇒ `qoder-credits.ts` 对哨兵**不写** `deductionEndTime`
+         *    ⇒ 折算得 `NEVER`（长期）= 三档里「永久（未知到期）」那一桶。
+         *    ⚠️ **无 `dedicatedResourcePackages` 时临期桶恒为 0**，这是如实限制
+         *    （绝不为了凑出一档而编造日期）。
+         *    ⚠️ 国际版 `openapi.qoder.sh` 本机**网络不可达** ⇒ 取不到时
+         *    `fetchQoderCreditBalance` 返回 `null` ⇒ `UNUSABLE`（剔除），保守。
+         *
+         *    ⚠️ 三处必须同改（本表 + `WIRED_EXPIRY_PROVIDERS` + 折算原语）——
+         *    这是该陷阱的第 **7** 次复发（cline → accio → officeace → autoclaw
+         *    → astudio → minimax → qoder），漏任何一处的症状都是**静默**的
+         *    （用户在聚合轮换列表里看不到该渠道，零报错零日志）。
+         *    ⚠️ **必须走 `cachedBalance`**：与 buddy / trae / modelscope / astudio /
+         *    minimax 同款 —— 聚合每轮折算会对同一账号反复提问，没有共享读数就会
+         *    白发大量重复请求。
+         *    ⚠️ **两站各占一项**：`credentialExpiry` 的分派按 provider id，漏
+         *    `qodercn` 会让中国版单独恒 `UNUSABLE`（与 minimaxintl 同因）。
+         */
+        qoder: qoderFamilyExpiry(QODER, deps),
+        qodercn: qoderFamilyExpiry(QODER_CN, deps),
+        // ⚠️ **MiniMax Code**（中国版 / 国际版，2026-10-20）：两家共用同一个原语
+        //    （只换 product），与 buddy / workbuddy 同款 —— 单独抽 `minimaxFamilyExpiry`
+        //    是为了让「它们只差一个 product」一眼可见（同族各写一份判据 = 分叉的开始）。
+        //    ⚠️ 三处必须同改（本表 + `WIRED_EXPIRY_PROVIDERS` + 折算原语）——
+        //    这是该陷阱的第 **6** 次复发（cline → accio → officeace → autoclaw
+        //    → astudio → minimax），漏任何一处的症状都是**静默**的
+        //    （用户在聚合轮换列表里看不到该渠道，零报错零日志）。
+        //    ⚠️ **必须走 `cachedBalance`**：与 buddy / trae / modelscope / astudio 同款
+        //    —— 聚合每轮折算会对同一账号反复提问，没有共享读数就白发大量重复请求。
+        minimax: minimaxFamilyExpiry(MINIMAX, deps),
+        minimaxintl: minimaxFamilyExpiry(MINIMAX_INTL, deps),
+    };
+}
+/**
+ * Qoder 系的折算（**两个产品共用同一个原语**，只换 product 配置）。
+ *
+ * ⚠️ 与 {@link buddyFamilyExpiry} 逐字同形：本家没有 XFF / 地理分流需求
+ *    （两站各自有独立域名且互不 307），故**不**像 minimax 那样多一个透传参数。
+ *
+ * ⚠️ `context.cachedBalance` **在每次折算时现读**（不是建表时固化）：
+ *    与 `createProviderCredits` 的同名字段同一纪律。
+ */
+function qoderFamilyExpiry(product, deps) {
+    return {
+        credentialExpiry: (c, context) => qoderExpiry(c, product, context?.cachedBalance === undefined
+            ? undefined
+            : () => context.cachedBalance(context.accountId), 
+        // ⚠️ **按 `accountId` 现取**（与 `minimaxIntl` 同款）：账号可能随时改代理。
+        //    `context.accountId` 缺失时传空串 —— 与解析器的契约一致
+        //    （空 id 会去查「登录预置」那条，查不到则直连）。
+        deps.qoderFetchFor === undefined
+            ? undefined
+            : deps.qoderFetchFor(context?.accountId ?? '')),
+    };
+}
+/**
+ * MiniMax 系的折算（**两个产品共用同一个原语**，只换 product 配置）。
+ *
+ * ⚠️ 与 {@link buddyFamilyExpiry} 的关键差别：本家还要透传 `deps.minimaxXff`。
+ *    国际站按出口 IP 做地理分流（`agent.minimax.io` 307 到中国站，而中国站
+ *    不认国际站 token ⇒ `401 invalid access token`，与「凭据真失效」逐字同形，
+ *    issue IKMEVG）⇒ 不带 xff 时国际站账号的折算**恒失败**，该渠道在聚合轮换里
+ *    被静默剔除（面板却还能正常刷新 —— 两条链路各走各的 xff 取值）。
+ *
+ * ⚠️ `deps.minimaxXff` **在每次折算时现读**（不是建表时固化成一个字符串）：
+ *    用户随时可能在设置里改 XFF，固化会让改动不生效（与 `createProviderCredits`
+ *    的同名字段同一纪律）。
+ */
+function minimaxFamilyExpiry(product, deps) {
+    return {
+        credentialExpiry: (c, context) => minimaxExpiry(c, product, context?.cachedBalance === undefined
+            ? undefined
+            : () => context.cachedBalance(context.accountId), deps.minimaxXff?.(), 
+        /**
+         * ⚠️ **按账号取出口**（PR !145 审计 P0 修法）。
+         *
+         * 判据：只有国际站需要（中国站直连才是最优 —— 给它挂代理反而让流量绕境外
+         * 一圈，且可能被引到国际站）；且必须拿到账号 id 才取，否则退回全局 `fetch`
+         *（不知道是谁就不该猜一个账号去用它的出口）。
+         *
+         * ⚠️ 这与 `createProviderCredits` 的 `minimaxIntlFetcher` 是**同一份判据的
+         * 两处消费**（两条链路各自有 deps 类型，无法共享函数体）——
+         * 一致性由 `expiry-runtime-parity.spec.ts` 的真跑 `apply()` 锁住。
+         */
+        product.id === 'minimaxintl'
+            && deps.minimaxIntlFetchFor !== undefined
+            && context?.accountId !== undefined
+            && context.accountId !== ''
+            ? deps.minimaxIntlFetchFor(context.accountId)
+            : undefined),
     };
 }
 //# sourceMappingURL=provider-expiry.js.map

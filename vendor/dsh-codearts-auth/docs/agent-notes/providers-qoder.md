@@ -451,3 +451,300 @@ modalities=["text","image"] context={"contextWindow":1000000}`；远端只有 `f
 3. **变异脚本的锚点必须先自证**：CRLF 上 `replace` 会静默不生效；本轮另有两条锚点
    因「把 `await` 移进 `try` 后缩进变了」而失配 ⇒ 必须报 `PATCH-NOT-APPLIED`
    而不是当成「无牙」。
+
+---
+
+## ⚠️⚠️ 审计补记（2026-10-21，!136 / !137 合并后 5 路 subagent 审计）
+
+完整报告：`docs/audit/pr135-138-merge-audit.md`。这里只留与本家直接相关的。
+
+### ① 真缺陷（**已修**）：`isFreeModel` 只查远端 ⇒ 免费模型被判收费
+
+`QoderAdapter.isFreeModel` 原写成 `this.catalogSource().find(...)`，
+而 `catalogSource()` = `remoteModels ?? fallbackModels` —— **远端一落地就把静态表顶掉**。
+本家目录是**按账号**下发的（免费额度号只给 `qfmodel` + `dfmodel`，见本文件上一节）
+⇒ 静态表里标了 `isFree: true` 的模型被判「未知 ⇒ 非免费」
+⇒ 跳过「免费模型不受锁定约束」的短路 ⇒ 锁定永久积分时被 `allowPermanent=false`
+拦下、报出「额度都属于永久」这类**与事实相反**的错误 ⇒ **本家 2026-10-21 报障原地复发**。
+
+实测（`lib/` 重建后真跑）：
+
+```
+①远端收缩目录（无免费） isFreeModel(qmodel_38max) = false   ★ 应为 true
+②远端只含 qmodel_38max isFreeModel(qfmodel)       = false   ★ 应为 true
+③未接线远端            isFreeModel(qmodel_38max) = true    ✓
+```
+
+⚠️⚠️ **同一文件的 `catalogModel()` 注释逐字记过这个反模式**
+（「第一版把它写成 `catalogSource().find(...)`，被独立审计打穿」）——
+能力判据当时改对了，**免费判据又写回了它**。⇒ 改任何「按 id 查目录」的判据前，
+**先看 `catalogModel()` 的注释**，用它、别用 `catalogSource()`。
+
+⚠️ **判据方向不对称**（为什么必须保守）：判**收费**只是用不上（可恢复）；
+判**免费**会绕过锁定**真烧永久积分**（不可逆）。
+
+### ② 真缺陷（**已修**）：`fetchQoderBalanceDetailed` 会抛 ⇒ 并发批量隔离失效
+
+`creditsHeaders` 原本在 try **之外**（!136 把串行 `for` 改成 `Promise.all` 时漏了它）
+⇒ 凭据形状异常（如解码出 `null`）时它抛 ⇒ `Promise.all` reject
+⇒ **整批** `credits.balances` 变 `ok:false` ⇒ 客户端把同一句 message 盖到
+**每一个**账号卡片上。⇒ 已包进 try，返回 `{balance:null, error:'…（凭据不可用）'}`。
+
+### ③ 文案（**已修**）：`remedy` 不得写死站点、不得断言机制
+
+原写死「Qoder **国际版**端点在本机被阻断（TCP 能连通、TLS 握手被丢）」，
+而该分支被 `isQoderFamily` **两站共用** ⇒ 中国版用户读到与同一句里主机名
+自相矛盾的结论；且对 `ENOTFOUND`（DNS）说「TCP 能连通」是事实性错误。
+⇒ 只留出路（站点由 `subject` 主机名点名）。
+
+### ④ **未修**（已登记，**需真机才能定稿**）：兜底表 `dfmodel` 无 `isFree`
+
+两站 `dfmodel` 都没有 `isFree`（`priceFactor: 0.1`），而本文件记着上游它是
+`price_factor = 0` + `is_free`（0.1 是被划掉的原价）
+⇒ 远端不可用时（兜底路径）`isFreeModel('dfmodel') = false`，而 !137 的 spec
+头注释把 `DeepSeek-Flash` 当免费模型之一。
+
+⚠️ **为什么不直接补 `isFree: true`**：若上游的 `is_free` 是**按账号**下发的，
+把它写进**静态**兜底表会让**付费账号**被判免费 ⇒ **绕过锁定烧永久积分**（不可逆）。
+⇒ 需先真机确认「付费账号下 `dfmodel` 是否仍 `is_free`」。
+
+### ⑤ 前端还差一格收窄（**未修**，前向防御）
+
+后端 `splitBuddyCreditsByExpiry` 已把 `deductionEndTime` 的判据**收窄**为
+「只接受 `number` 或数字字符串」（挡住了 `true → 1` 与 `[ms] → 单元素数组`
+这两格），而**前端 `packageExpiryMs` 仍是裸 `Number()`** ⇒ 同样两格两站分叉。
+可达性低（写入方都同时给 `deductionEndTime`）⇒ 登记为前向防御缺口。
+
+## ⑦ 出口代理与失败分类（2026-10-25 审计：3 域合规 + 2 域对抗，67 次变异）
+
+本节登记 `618a090`（per-账号出口代理）/ `d55a41e`（端口探活分道）/ `551a44b`
+（失败分类拆两张表）/ `c5dbf3f`（锁定报错说清原因）这一批的**审计结论与后续修正**。
+
+### 语义表：类别 → 动作（必须逐格同构于同族）
+
+| 类别 | 判据 | 换号 | 写冷却 |
+|---|---|---|---|
+| `quota` | `QUOTA_EXCEEDED` / `110` / `112` / `pricingUrl` / 余额文案 | ✅ | ✅ 至 UTC+8 当日 24:00 |
+| `rate` | `RATE_LIMIT` / 429 | ✅ | ✅ 1h |
+| `auth` | `AUTH` / 401 / 403 | ✅ | ❌ **绝不** |
+| `upstream` | `SERVER` **且** 上游/网关故障文案 | ✅ | ❌ **绝不** |
+| `other` | 其余（400 参数错、风控页、空响应…） | ❌ | ❌ |
+
+⚠️ `auth` / `upstream` 只换号不写冷却，是 **2026-10-06「一个请求封死整池」事故**
+换来的不变式（同 loomy / raccoon / minimax / accio）。
+
+### ⚠️⚠️ 本轮修正的三条（都是「本 PR 的目标没覆盖到真实主导形态」）
+
+**① 网关 5xx 原先**不换号**，而它才是实测主导形态**（审计 B1-1）
+
+对抗审计扫了本机**全部 1374 个会话 / 163 条真实 qoder 失败**，按形态计数：
+
+| 真实形态 | 次数 | 旧判据归类 |
+|---|---|---|
+| `qoder: <html>…504 Gateway Time-out…</html>` | **74** | `other` ⇒ **不换号** |
+| `First Token Timeout or Upstream Timeout (504/model_error)` | **6** | `other` ⇒ **不换号** |
+| `Error in upstream response (provider_error/model_error)` | 16 | `upstream` ✅ |
+
+⇒ 本 PR 原以为的核心目标（`provider_error`，16 次）**不是主导形态**；而前两种
+（共 80 次）既不换号、终态又是 `SERVER`（在宿主 `DEFAULT_RETRYABLE_CODES` 里）
+⇒ 还要**白重试 5 次**。修法：`looksLikeUpstreamProviderError` 增补
+`gateway time-?out` / `bad gateway` / `service unavailable` /
+`(first token|upstream) timeout`，并加**双向**用例（504 必须换号；
+`504 + billing 文案` 仍必须归 `quota`；`internal server error` / `request timeout`
+仍必须归 `other` —— 判据不得放宽成「5xx 全体」）。
+
+**② 折算路径没接 per-账号代理 ⇒ 墙外环境下该渠道从聚合轮换里静默消失**（审计 A2-17 / B2）
+
+本 PR 把代理接进了**四条腿**（推理 / 原生搜索 / 余额选号 / 登录续期目录），
+**折算这条漏了**：`qoderExpiry(credential, product, cached?)` 无 fetcher 形参、
+内部 `fetchQoderCreditBalance(credential, product)` 走**全局 fetch** ⇒
+墙外折算恒失败 ⇒ `UNUSABLE` ⇒ 被 `rankCandidates` 剔除 ⇒
+**用户在聚合轮换列表里永远看不到 qoder / qodercn**，零报错、零日志，
+而面板（走选号器那条腿）看起来完全正常。
+
+⚠️ 这**不是**「与本 PR 无关的既有缺口」：`src/index.ts` 明写
+「`credits` 与 `expiry` 是两个独立消费域……**两条腿缺一不可**，这正是本仓库
+记过 6 次的那类静默陷阱」，而本 PR 恰好只接了 credits 一侧；
+`provider-expiry.ts` 的 `minimaxIntlFetchFor` 注释更**逐字**点了同一个症状
+（「只把 fetcher 接进了选号器与适配器 —— 折算路径一行没改」）。
+修法：`ProviderExpiryDeps` 加 `qoderFetchFor`（**与 minimax 分两个键** ——
+两家的解析器是不同实例，合成一个会让「只接了一家」静默通过），
+`qoderExpiry` 加第 4 形参，`createProviderExpiry` 的 `qoderFamilyExpiry(QODER, deps)`
+透传；守卫是**行为级**（真跑 `createProviderExpiry`，断言注入的解析器**按该
+accountId** 被调用、且它返回的 fetch **真的被用去发请求**）——
+⚠️ 同族先例 `minimax-proxy.spec.ts` 用的是源码文本断言，本仓库已多次实测
+其对「字面量留在死分支里」无感。
+
+**③ 非法代理字符串会让账号**永久不可用**，且入口 **UI 可达**（审计 B2-1）
+
+`sanitizeAccounts` 用 `{ ...candidate }` **原样透传**代理字段，只限「是不是字符串」、
+不限「是不是合法代理」。实测：
+
+```
+backup.import（载荷 qoderProxy = "ftp://host:21"）→ ok:true、账号落池
+  → 此后该账号每次取 fetcher 都抛「代理地址无效 — 不支持的协议 ftp」
+  → 该账号【永久不可用】
+```
+
+⚠️ 客户端**有**导入按钮 ⇒ 这条路径 UI 可达（审计先只找到 `account.create` 那条
+「零客户端写入点」的腿，对抗轮才找到真正可达的入口）。
+修法：`sanitizeAccounts` 的四个代理字段统一过 scheme 闸
+（`http` / `https` / `socks5`），**非法就清掉该字段**（降级直连）而**不是**丢弃整条
+账号 —— 删一个字段比删一条账号可逆得多，且面板上「当前：直连」一眼可见、可重填。
+⚠️ 修在这一处（而不是四个 provider 各自的读取侧）的理由：`sanitizeAccounts` 是
+「外部数据 → 池」的**唯一闸门**（`state.json` 读取与 `backup.import` 都过它），
+四个读取侧（`opencode.ts` / `gemini-proxy.ts` / `minimax-proxy.ts` / `qoder-proxy.ts`）
+**同形**地 `throw`，四处同改极易只改一家而分叉。
+
+### ⚠️ 代理口令的泄漏面：**去向决定定级**（对抗审计 B2 的翻案）
+
+审计先报了 2 个 P0，对抗轮**逐条实测去向链**后**降为 P2**：
+
+| 潜在去向 | 实测结果 |
+|---|---|
+| 宿主 `ctx.logger` | ❌ `testProxy` 期间 logger 调用 **0 次**（handler 返回信封不抛，注册处 `catch` 不触发） |
+| 客户端 `console.*` | ❌ 该文件全文零命中；`error` 只进 `React.createElement('p', …)` |
+| 落盘 / 会话历史 / 模型上下文 | ❌ 都不 |
+| 用户自己的弹窗 | ✅ **唯一落点** |
+
+⇒ **没有一条后果链能到达「用户以外的人」** ⇒ 不够 P0。
+但**仍修了两处**（都便宜且方向明确）：
+
+1. `qoder.testProxy` 的失败文案曾写
+   `` `代理 ${label}（${url}）没有在监听` `` —— `label` 已脱敏成
+   `http://user:***@host:port`，紧接着又把带**明文口令**的 `url` 贴回来，
+   **同一句里自己拆自己的台**（且错误行是用户最容易整段复制/截图的东西）。
+   ⇒ 删掉 `（${url}）`，只回显 `label`。
+2. 四家 `set*Proxy` 的**日志**都直接拼原始 `proxy` ⇒ 口令明文进日志。
+   ⇒ 统一走中立模块 `src/proxy-mask.ts` 的 `maskProxyPassword`。
+   ⚠️ 池**不能** import `opencode.ts`（provider 实现在依赖图上层，会成环），
+   而复制一份正则进池里正是本仓库「**同一语义两套判据**」的红线 ⇒
+   脱敏实现住在**双方都能依赖**的中立文件里。
+
+⚠️ **定级判据可推广**：说「泄漏」必须能说出「**谁**在什么条件下拿到它」。
+「用户自己看自己刚敲的口令」不是 P0；而「口令进日志文件、被随手贴进 issue」
+是**用户发起**的次级风险（条件性、人为中介）。
+
+### ⚠️⚠️ 两处仍**未修**（已登记，附理由）
+
+**① 401/403 分支把「额度文案」判在「认证续期」之前**（审计 A1-F-02，对抗轮判 OVERSTATED）
+
+`:1733` 的 `isBillingBusinessCode(status) || looksLikeBillingError(errorText)`
+排在续期分支之前 ⇒ `401 + "Billing daily count exceeded"` 会让**全池每个账号各写
+一个近乎一天的冷却**（`recordsQoderRateLimit('quota') = true`、
+冷却 = `nextUtc8DayStartMs()`）—— 正是「一个请求封死整池」的形态。
+且该顺序与本文件**自己的注释**矛盾（`:1725-1728` 说「401/403 的第一处置是续期」）。
+
+⚠️ **为什么不修**：对抗轮扫了**全部 1374 会话 / 163 条真实 qoder 失败**，
+`401/403 + 余额文案` **零命中**（`401 = 0`；`403 = 54 且全是 10605 排队帧`；
+billing 文案**恒走 `(110/model_error)` 即 HTTP 200 + SSE 通道**；
+`402 = 0`）⇒ 属「**结构可达、零实测**」，按本仓库成文判据（同类前提在 codearts 上
+141 会话零命中即撤回）应降级。
+⚠️ 且 A1 给的修法有**副作用**（B1-3）：在「续期失败」子分支会把上游原文替换成
+`credential expired and refresh failed` —— 与「**文案本身就是出路**」红线同型
+（用户会去重新登录，而真因是额度/网关）。⇒ 要修必须同时保留原始 `errorText`
+（拼进 AUTH 消息或作为 detail），并补「原文仍在 message 里」的用例。
+**留给能真机复现该共现的人做。**
+
+**② `auth` 行的「换号」语义也未实现**（审计 B1-4，A1 漏了这半边）
+
+语义表承诺 `auth ⇒ 换号 ✅`，但 `:1712-1756` 分支内**没有任何**
+`switchAccountOnQuota` 调用（只有额度那处硬编码）⇒ 401/403 续期失败与第二发 401
+**都直接抛**，池里第二个账号**永不被尝试**（实测 `picks=[]`：**根本没去取号**）。
+若某账号 `refresh_token` 失效，整条请求失败而池里可能仍有可用账号 ——
+与 accio「登录 N 个账号 ≠ N 倍可用性」同型。
+
+⚠️ 另：对抗轮实测 `'AUTH'` **永不入参** `classifyQoderFailure`
+（`:1774` 的 `httpErrorCode` 只在非 401/403 分支被调；`:1840` 的 SSE 生成器只抛
+`EMPTY_RESPONSE` / `TRANSPORT` / `SERVER` / `QUOTA_EXCEEDED` / `QUEUE`），
+6 种 SSE 认证形态实测**全部 → SERVER → other** ⇒ `auth` 那格当前是**死代码**
+（不是纵深防御），M8（auth 也写冷却）只红一条纯函数用例、**零行为守卫**。
+**留给按 F-01 修法一并实现的人**（AUTH 走类别表 ⇒ 换号 + 不冷却，并加
+「第二发 `body.token`」的行为用例）。
+
+## ⚠️⚠️ 传输级失败必须换号（issue IKR5ZD，2026-10-31 修复）
+
+用户报障（2026-10-28）：「`qoder: transport error: fetch failed`；到 `api2.qoder.sh`
+的 TCP 连接 10s 超时，**重试不换 IP**，错误丢失 cause」。本地逐条取证：
+
+| 指控 | 结论 |
+|---|---|
+| 10s 连接超时 | **不是插件设的** —— undici 默认 `connectTimeout`。用保证不可达的 `192.0.2.1` 实测 `10,713ms`，错误形态 `TypeError: fetch failed` → `cause.code=UND_ERR_CONNECT_TIMEOUT`、`cause.message` 含 `attempted address: …:443, timeout: 10000ms` |
+| 重试不换 IP | **成立且更硬**：该域名有 **2 个 A 记录**（`47.57.188.188` / `8.223.13.163`），但 `dns.lookup` 默认**只回第一个**，连打 **8 次建连全部落在 `47.57.188.188`**；而适配器对 transport 错误**零换号**（`fetch` 只 1 发、池 `getAvailableAccount` 0 次），宿主又把 `TRANSPORT` 当可重试码（`DEFAULT_RETRYABLE_CODES`，`maxRetries=5`、退避 500ms→10s）⇒ **6 发全打同一条出口**，对「路由被阻断」等于零重试 |
+| 错误丢失 cause | 对象层面**不成立**（`{ cause }` 从首版就有，issue 那个版本 `e8d14c6:src/qoder-adapter.ts:1703-1704` 也带着）；但 **message 只有 `fetch failed`**，可操作信息在两级 `cause` 之下 ⇒ 用户视角成立 |
+
+### 修法（三条，`src/qoder-adapter.ts`）
+
+1. **transport 错误换号**：`sendEncrypted` 外包一层 `try/catch`，命中 `code==='TRANSPORT'`
+   就调 `switchAccountOnQuota(..., 'transport')` —— **换号 = 换出口**（每账号可配独立
+   代理，见 `618a090`「国际版 SNI 阻断下唯一出路」）。修前这条调用**一次都执行不到**。
+2. **预算 2 次**（`QODER_TRANSPORT_MAX_RETRIES`）：**只换号、不同号空转** —— 同号重连对
+   阻断路由无效，而「瞬时抖动」宿主已经用退避重试 5 次兜了；再叠一层只会把「完全离线」
+   从 10s 放大到 30s/轮。换不到号就**立即抛**。
+3. **message 带 cause 链**（`transportErrorDetail`）：沿 `cause` 取最多 4 层、去重、
+   自引用不发散，输出形如
+   `qoder: transport error: fetch failed ← UND_ERR_CONNECT_TIMEOUT: Connect Timeout Error (attempted address: 1.2.3.4:443, timeout: 10000ms)`。
+   ⚠️ 结果过 `maskProxyPassword` 脱敏 —— 顺手把该函数从**锚定 `^`** 改成全局非锚定
+   （原来对「地址夹在句子中间」静默漏脱敏，而那正是错误文案最常见的形态）。
+
+### 三条边界（与 `minimaxFetchWithRetry` 同款）
+
+只处理传输错误（4xx/5xx 是服务端明确答复，重试只会掩盖真因）／**abort 绝不重试**／
+耗尽后抛**原错误**并保住 `cause`。
+
+⚠️ abort 的判据**只留一处**（`sendEncrypted` 的早退）：在重试循环里再判一遍是
+**不可观测的等价变异**（实测删掉它全绿 —— 因为 abort 时 `sendEncrypted` 抛的是原始
+错误、非 `TRANSPORT`，循环里上一行的码判据先 rethrow 了）。行为由「abort ⇒ 只发一发」
+的服务级用例守住。
+
+### 仍未修（如实登记）
+
+`dns.lookup` 的**单地址**行为没动：真要「换 IP」得对 `api2.qoder.sh` 取 `all:true`
+再逐地址尝试，那属于出口层改造，风险比换号大，单独一轮再定。
+`fetchFor` 的代理侧同理 —— 该域名若在某条链路上被 SNI 阻断，**给账号配代理**仍是当前
+唯一出路。
+
+### 复审修正（同日：一名审计 + 一名红队跑本分支，抓出的东西）
+
+- **P1 安全回退已修**：给 `maskProxyPassword` 去掉锚定时，第一版顺手把字符类收窄成
+  `[^:@/\s]` / `[^@/\s]`，于是 `http://a b:s3cr3t@h:1` 这种**带空白的脏值**从
+  「已脱敏」退回「明文输出」。`account-pool.ts` 的 `proxyLogText` 明写它接收
+  「备份文件原样透传的脏值」⇒ 这条影响面是真实日志。**字符类必须保持宽口径**
+  （`[^:@/]` / `[^@/]`）：**宁可多遮，不可漏遮**。
+- **P1 假绿已删**：原「换号重发」用例拿「两发 `Authorization` 不同」当判据 ——
+  COSY 载荷每次带新 `requestId`，**同一账号连发两次也必然不同** ⇒ 断言恒真，
+  连「换回同一个号」的变异都能过。改为「池返回**缺 uid** 的凭据 ⇒ 必然抛
+  `MISSING_CREDENTIAL`」——这条能真正证明用的是**池返回的那份凭据**。
+- **P2 无牙用例已换**：原「HTTP 500 不被传输级重试吞掉」没有判别力（500 被归
+  `other`，且它的 `LlmError` 在新 `try` **之外**抛，新 catch 根本看不到）。
+  改成「`fetch` 抛**非传输**错误时不得被包装成 TRANSPORT、一发即止」。
+- **P2 强化**：`transportErrorDetail` 补 `String(code)` 兜底（`code` 是 Symbol 时
+  原来会**自己抛错顶替原始错误**）与 **512 字符截断**（实测 10 万字符 cause 会原样
+  进日志/UI）；用例补上 cause 为字符串/普通对象/深链/相邻重复/2 跳自引用/超长。
+- **P2 注释说反已改**：正文里「换不到号才同号退避重试」与实际（**立即抛**）不一致。
+- **已登记的边界**：① 只覆盖**建连腿**，SSE 中途的 `sse transport error` 被
+  `classifyQoderFailure` 归 `other` ⇒ **不换号**（正文可能已吐一半，换号会重复内容，
+  刻意如此）；② transport 换号会把上一个号塞进本次请求的 `tried`，后续额度换号
+  少一个候选（非永久损失，transport 不写冷却）；③ `classifyQoderFailure` **永不**
+  返回 `'transport'`，该成员只作内部入参；④ `transportErrorDetail` 是仓内**第 7 份**
+  「沿 cause 链取信息」的实现（另有 `opencode-rpc.ts` 的 `describeFetchError`、
+  `minimax.ts`、`network-hint.ts`、`refresh*.ts`），口径重叠、有漂移风险，暂不合并。
+
+### 第二轮（红队）补记：无牙与不可观测，逐条登记
+
+| 腿 | 变异 | 现在 | 处置 |
+|---|---|---|---|
+| 限深 4 层 / 相邻去重 | 4→1 / 去掉去重 | **有牙**（已补深链、重复、2 跳自引用、Symbol code、10 万字符截断用例） | 已补 |
+| 换号后 `ensureUid` | 删掉 | **有牙**（缺 uid ⇒ `MISSING_CREDENTIAL` 用例） | 已补 |
+| 换号 = 换出口 | 把 `fetcherForCurrentAccount()` 提到循环外 | **有牙**（新增 `fetchFor` 观测用例：出口序列必须是 `['acct-A','acct-B']`） | 已补 |
+| 换后不采纳新凭据（`credential = switched.credential`） | 删该行 | **无牙、且无法观测** | **如实登记**：两份凭据的差异只在 WASM 的 `COSY` 签名内部；`machine_id: ''` 与「缺 uid」两条替代判据实测都不可区分（后者抛点在 `ensureUid`、在 switch 内部）。保留该行 + 代码评审，**不编恒真用例** |
+| `authRefreshed = false` | 删掉 | **无牙** | 只有「401→transport→401」的顺序能观测；该场景代价 > 收益，**登记**为未覆盖 |
+| `shouldRotateQoderAccount('transport')` | 改 false | **无牙（死代码）** | `classifyQoderFailure` 永不返回 `'transport'`，transport 换号是**直接调**；已把注释改成「别当承重件」 |
+| 删 `transportRetries += 1` | — | **挂死**（不是变红） | 循环全是已 resolve 的微任务 ⇒ 事件循环闹钟饿死、vitest 的 `testTimeout` **不触发**，只能靠 CI job 超时。**登记**：这行若被误删，CI 表现为「挂到超时」 |
+
+另外两条**行为**结论（都已改掉）：
+- `activeAccountId` 为 `''`/`undefined` 时（探测适配器 `currentAccountId: () => entry?.id ?? ''`），
+  换号拿不到排除通道、池可能把同一个号还回来 ⇒ 白等一个 10s。现在**直接抛**。
+- 换号期间池自己抛错（如 `pool read failed`）会顶掉原始 `TRANSPORT`、`cause` 也没了 ——
+  与「保住 cause」主旨相反。现在**只吞非 `LlmError`**（`LlmError` 是刻意的判断，如
+  `MISSING_CREDENTIAL`，必须如实报出）。

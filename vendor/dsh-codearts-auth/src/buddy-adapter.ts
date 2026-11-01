@@ -23,6 +23,9 @@ import { RemoteCatalogGate, REMOTE_CATALOG_COOLDOWN_MS } from './remote-catalog-
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import {
   RATE_LIMIT_FALLBACK_MS,
+  creditExhaustedResetAtMs,
+  explicitRateResetAtMs,
+  isCreditExhausted,
   isModelSaturationError,
   isRateLimited,
   parseRateLimitError,
@@ -40,7 +43,7 @@ import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { CODEBUDDY, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
 import { normalizeHarnessMessages } from './message-shape.js'
 import { projectRequestImage, type ImageRequestTarget } from './image-budget.js'
-import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js'
+import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, classifyToolArguments, toolArgsInvalidBlocks, toolArgsInvalidIsSoleOutput, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled, toolArgsInvalidFailure } from './sse.js'
 import {
   registerAdapterIdempotent,
 } from './llm-register-compat.js'
@@ -1570,9 +1573,26 @@ function errorDetail(body: string): string {
     const display = typeof data.displayMsg === 'object' && data.displayMsg !== null
       ? data.displayMsg as Record<string, unknown>
       : undefined
-    const localized = typeof display?.zh === 'string'
-      ? display.zh
-      : typeof display?.en === 'string' ? display.en : undefined
+    // ⚠️⚠️ **`displayTips` 也要认**（2026-10-31，第五族 11140 实测）：
+    // 「账号被平台限制」那份报文**只有 `displayTips`、没有 `displayMsg`**：
+    // ```
+    // {"code":11140,"msg":"request illegal",
+    //  "displayTips":{"zh":"账号存在异常行为，已被限制使用"}}
+    // ```
+    // ⇒ 旧实现在这里提不出任何本地化文案，用户只看到 `request illegal` ——
+    // 上游唯一说清原因的字段被白白埋掉（与上面 `displayMsg` 那条事故**同型**）。
+    // ⚠️ 顺序：`displayMsg`（直接面向用户的展示文案）在前，`displayTips`（提示）
+    // 在后 —— 两者都在时以 `displayMsg` 为准。
+    const tips = typeof data.displayTips === 'object' && data.displayTips !== null
+      ? data.displayTips as Record<string, unknown>
+      : undefined
+    // ⚠️ `displayMsg`（直接展示文案）优先于 `displayTips`（提示）—— 两者都在时以
+    // 前者为准；写成显式函数而非 `??` 链：`??` 与三元混排的优先级极易写错
+    //（第一版就写出「恒 nullish」被 TS 拒绝，见 git 历史）。
+    const localizedText = (source: Record<string, unknown> | undefined): string | undefined =>
+      typeof source?.zh === 'string' ? source.zh
+        : typeof source?.en === 'string' ? source.en : undefined
+    const localized = localizedText(display) ?? localizedText(tips)
     const parts = [
       // 本地化文案最可读，排在最前。
       localized,
@@ -2908,12 +2928,63 @@ export class BuddyAdapter extends LlmAdapter {
       const triedAuth = new Set<string>()
       if (currentAccountId !== '') triedAuth.add(currentAccountId)
       let refreshedCredential: BuddyCredential | undefined
+      /**
+       * 续期/取号期间抛出的**已分类**异常（Gitee IKQ99X 的真缺陷）。
+       *
+       * ## 缺陷形态（2026-10-25 实测复现，逐格与 issue 一致）
+       *
+       * `resolveCredential` 在**候选被模型级限流筛空**时会抛 `QUOTA_EXCEEDED`
+       * （`credential-resolver.ts` 的 `throwIfAllRateLimited`，文案带解禁时刻）。
+       * 旧实现把这个异常与「续期网络抖动」一起 `catch` + `console.warn` 吞掉 ⇒
+       * `refreshedCredential` 保持 `undefined`；而限流账号已被 `getAvailableAccount`
+       * 过滤掉 ⇒ 换号循环第一跳即 `break`（`rotated` 恒 `false`）⇒ 落到下面的
+       * 兜底分支报：
+       *
+       * ```
+       * buddy: credential expired and refresh failed   (code: AUTH)
+       * ```
+       *
+       * 真实原因（限流 + 解禁时刻）被**完全掩盖**，文案把用户引向「重新登录」；
+       * 而 `AUTH` 又恰好是客户端会**整条替换文案**的那个码（「API 密钥无效」），
+       * 连这句错话都留不全（见 `docs/agent-notes/client-ui.md` 的 IKLBSH）。
+       *
+       * ## ⚠️ 为什么是「记住再抛」而不是当场抛
+       *
+       * 「续期失败**不致命**」这条设计仍然成立：换号仍有机会，单个账号故障不该让
+       * 整轮陪葬（`1077c34` 的依据）。故这里**继续**往下走换号循环——
+       * 只有当**换号也没救回来**（`rotated === false`）、即将落到 AUTH 兜底时，
+       * 才把这个更具体的异常抛出去。这样「能换号就换号」与「换不到就说真话」
+       * 两件事都不牺牲。
+       *
+       * ## ⚠️ 判据为什么只认这几个码
+       *
+       * | 码 | 为什么不能降级成 AUTH |
+       * |---|---|
+       * | `QUOTA_EXCEEDED` | 是**限流**（带解禁时刻），出路是等/换号，不是重新登录 |
+       * | `PERMISSION_DENIED` | 账号级拦截，出路是停用该账号（同一请求换号可用） |
+       * | `RATE_LIMIT` | 同上，且它在 harness 的可重试集合里，降级成 AUTH 会**停掉重试** |
+       * | `MISSING_CREDENTIAL` | 「没登录」与「登录过期」的实际出路不同（前者要去加账号） |
+       *
+       * ⚠️ **刻意不把 `AUTH` 本身列进来**：那与兜底文案同码，透传与不透传对用户
+       * 完全一样，列进来只会让本判据看起来覆盖更宽。
+       *
+       * ⚠️ **本判据只管「凭据解析/续期抛出的异常」，与 `httpErrorCode` 的
+       * 「401/403 先判、恒归认证类」那条铁律不冲突**：那条管的是**上游报文状态码**
+       * （网关故障常捎带余额词，让余额词改写分类会把真凭据失效说成额度用尽）；
+       * 这里管的是**本地池状态**（候选被限流筛空）—— 两者是不同的输入源，
+       * 不存在「同族判据两套口径」。**不要**因为本条去改 `httpErrorCode` 的优先级。
+       */
+      let credentialResolutionError: unknown
       try {
         await this.options.refresh()
         refreshedCredential = await this.options.resolveCredential(options.model)
       } catch (error) {
         // 刷新失败**不致命**：换号仍有机会，单个账号故障不该让整轮陪葬。
-        console.warn(`[${this.product.id}] 刷新当前账号凭据失败，改用换号重试：${String(error)}`)
+        credentialResolutionError = error
+        console.warn(
+          `[${this.product.id}] 刷新当前账号凭据失败，改用换号重试：`
+          + `${error instanceof LlmError ? `[${error.code}] ${error.message}` : String(error)}`,
+        )
       }
       if (refreshedCredential !== undefined && refreshedCredential.access_token.length > 0) {
         credential = refreshedCredential
@@ -2986,6 +3057,40 @@ export class BuddyAdapter extends LlmAdapter {
           if (response.status !== 401 && response.status !== 403) break
         }
       }
+      /**
+       * 若「续期/取号」抛的是**已分类**异常，原样抛出；否则返回（让调用方走原兜底）。
+       *
+       * ⚠️⚠️ **抽成函数是因为它有**两个**调用点，不是洁癖**（对抗审计实测的真缺陷）：
+       * 第一版把判据内联在早退分支里，于是 `rotated === true`（换号循环真的换过号）
+       * 那条路径**完全看不到**这个异常 ⇒ 仍然报 `AUTH`。而 issue 描述的「限流账号被
+       * `getAvailableAccount` 过滤 ⇒ 第一跳 break」只是到达 `rotated === false` 的**其中一条**
+       * 路径；`rotated === true` 同样结构可达（池里还有别的号、但换过去也是 401/403）。
+       * 实测对照（同一份 resolveCredential，唯一差别是池里第二个号是否可解析）：
+       * | 条件 | 修前 | 修后 |
+       * |---|---|---|
+       * | `rotated = false` | `AUTH` | `QUOTA_EXCEEDED` |
+       * | `rotated = true` | `AUTH` | `QUOTA_EXCEEDED` |
+       *
+       * ⚠️ 透传时**必须补 `{ status: authStatus }`**（对抗审计发现的网关侧净回归）：
+       * `openai-gateway` 的 `failureToOpenAiError` 对**没有 `status`** 的 `LlmError` 走
+       * `upstreamStatusOrFallback(undefined)` ⇒ **502**。而修前那条 `AUTH` 带 `{ status: 401 }`
+       * ⇒ 网关给 401。502 在 OpenAI 客户端眼里**可重试**，而「所有账号在该模型上都在
+       * 限流」是确定性结论 —— 正是本仓库反复防的那种「白重试」。
+       * 实测三格：修前 `status=401 code=AUTH` / 修后 `status=502 code=QUOTA_EXCEEDED` /
+       * 补 status 后 `status=403 code=QUOTA_EXCEEDED` ⇒ 只有第三格两头都对。
+       *
+       * ⚠️ 用 `cause` 保留原异常（不丢栈）：`LlmError` 继承 `HarnessError`，
+       * `super(message, options)` 会把 `cause` 交给原生 `Error`。
+       */
+      const throwIfPreservedCredentialError = (): void => {
+        if (!(credentialResolutionError instanceof LlmError)) return
+        if (!PRESERVED_CREDENTIAL_ERROR_CODES.has(credentialResolutionError.code)) return
+        throw new LlmError(
+          credentialResolutionError.message,
+          credentialResolutionError.code,
+          { status: authStatus, cause: credentialResolutionError },
+        )
+      }
       // 刷新既没产出凭据、也没换到别的账号：保留原有的可诊断报错。
       if (refreshedCredential === undefined && !rotated) {
         // ⚠️ **必须先排除安全策略拦截**（补修，2026-09-28）：这条早退只看
@@ -3014,6 +3119,19 @@ export class BuddyAdapter extends LlmAdapter {
             true,
           )
         }
+        // ⚠️⚠️ **续期/取号抛出的已分类异常必须原样抛出**（真实缺陷，Gitee IKQ99X）。
+        //
+        // 走到这里说明「续期没拿到凭据 + 换号也没换到」；若是
+        // `throwIfAllRateLimited` 因**候选被模型级限流筛空**抛的 `QUOTA_EXCEEDED`
+        // （文案带解禁时刻），把它降级成 `AUTH` 会：
+        // ① 丢掉解禁时刻与「无需重新登录」这句唯一出路；
+        // ② 落进客户端会**整条替换文案**的码（「API 密钥无效」）。
+        // 判据与理由见 `credentialResolutionError` 的注释。
+        //
+        // ⚠️ 位置在 `sawContentRejection` / `sawChannelVerification` **之后**：
+        // 那两个是**上游报文**证明的、更贴近本次失败的结论；本条是**本地池状态**
+        // 的结论，只在「上游没给出更具体的说法」时才用它。
+        throwIfPreservedCredentialError()
         throw new LlmError(`${this.product.id}: credential expired and refresh failed`, 'AUTH', { status: authStatus })
       }
       if (response.status === 401 || response.status === 403) {
@@ -3050,6 +3168,13 @@ export class BuddyAdapter extends LlmAdapter {
             true,
           )
         }
+        // ⚠️⚠️ 与上面的早退分支**共用同一判据**（真实缺陷，对抗审计实测）：
+        // 第一版只把它挂在 `refreshedCredential === undefined && !rotated` 里 ⇒
+        // **只要换号循环真的换过一次号（rotated = true），这个异常就永远不被看**，
+        // 请求照旧落成 `AUTH`。实测对照（同一份 resolveCredential，唯一差别是池里
+        // 第二个号是否可解析）：rotated=false ⇒ QUOTA_EXCEEDED；rotated=true ⇒ AUTH。
+        // ⇒ 判据必须提到**两个 AUTH 出口共用**处，且**只留一份实现**。
+        throwIfPreservedCredentialError()
         throw new LlmError(
           `${this.product.id}: 所有账号均被拒绝`
           + `（HTTP ${authStatus}${authStatus === 401 ? '，请在 Jet Hub 重新登录' : ''}）：${errorDetail(detail)}`,
@@ -3391,6 +3516,20 @@ export class BuddyAdapter extends LlmAdapter {
           // 时刻抠出来（有就绝不用兜底的 1 小时）。换号后 `errorText` 可能是
           // 11140 等非限流体 —— 那种情况下面①的分支会先 continue，走不到这里。
           //
+          // ⚠️⚠️ **额度耗尽（14018 Credits exhausted）必须走自然日终点**
+          // （真实缺陷，Gitee IKQ6HJ，2026-10-25 修）：它与频率限流共用 HTTP 429，
+          // 但恢复方式完全不同 —— 上游报文里**一个时间字段都没有**（实测原文：
+          // `{"error":{"data":{"code":14018,"msg":"Credits exhausted. Please visit
+          // the link below to purchase add-on packs…","requestId":"5f0cfd4f-…"}}}`），
+          // 故 `RESET_TIME_PATTERN` 必然不命中 ⇒ 落到 `RATE_LIMIT_FALLBACK_MS`（1h）
+          // ⇒ **每小时被重新选中一次、必然再失败一次**，用户看到的是「面板说可以
+          // 用了，一试又不行」，而真实出路是等次日配额或充值。
+          //
+          // 判据与终点都取共享层（`isCreditExhausted` / `explicitRateResetAtMs` /
+          // `creditExhaustedResetAtMs`），**不在本文件另写一份** ——
+          // `account-probe.ts` 的重测回写要的是**同一个**时刻。
+          // 服务端若真给了时刻仍以它为准（`explicitRateResetAtMs` 优先）。
+          //
           // ⚠️⚠️ **饱和必须排除在记账之外**（2026-10-17 对抗审计实测的真缺陷）。
           //
           // 本循环**每轮开头**都给当前账号记限流标记，而 `isRateLimited` 对 429
@@ -3410,10 +3549,13 @@ export class BuddyAdapter extends LlmAdapter {
             && !rateLimitMarked.has(currentAccountId)) {
             rateLimitMarked.add(currentAccountId)
             const parsed = parseRateLimitError(errorText, options.model, response.status)
+            const resetAtMs = isCreditExhausted(errorText)
+              ? explicitRateResetAtMs(errorText) ?? creditExhaustedResetAtMs()
+              : parsed?.resetTimeMs ?? Date.now() + RATE_LIMIT_FALLBACK_MS
             await this.options.accountPool.updateModelRateLimit(
               currentAccountId,
               parsed?.modelId ?? options.model,
-              parsed?.resetTimeMs ?? Date.now() + RATE_LIMIT_FALLBACK_MS,
+              resetAtMs,
             )
           }
           // 取下一个未尝试过的可用账号（同样按本产品 id 过滤，否则 WorkBuddy
@@ -4258,6 +4400,42 @@ export class BuddyAdapter extends LlmAdapter {
     //   并陷入重试循环。判定为截断后 dsh 丢弃残缺调用并重试，实测一次即恢复。
     const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
     /**
+     * **模型把工具参数写坏**（结构闭合配平、引号成对，但 JSON 非法）——
+     * 与「流被掐断」是两种病理，必须分开处置（真实缺陷，Gitee IKQ8Y1）。
+     *
+     * ⚠️ `argsTruncated` 仍是 `isTruncatedArguments` 的产物（**语义未改**）：
+     * 其它调用点（`arguments:` 那一格决定「残缺参数不补 `{}`」）仍靠它。
+     * 本判据只回答「哪些块是**闭合但非法**」。
+     *
+     * ⚠️ 只收**名字可用**的块：无名块的参数没有意义（它本来就会被丢弃，
+     * 见 `droppedUnnamedCalls`），把它的 JSON 问题报成「模型写坏参数」
+     * 会把真实病因（缺 name）盖掉 —— 与 `toolOrder` 只收名字可用的块同一条纪律。
+     */
+    const invalidArgBlocks = [...toolCalls.values()]
+      .filter(block => hasUsableToolName(block.name))
+      .map(block => ({ block, kind: classifyToolArguments(block.text) }))
+      .filter(entry => entry.kind === 'invalid')
+    /**
+     * 「参数写坏」是否**是本步唯一的产出** —— 与 `reasoningLoopIsSoleOutput`
+     * **同一道门禁**（见其注释：`error` 路径**不落 `assistant/message`**，
+     * 实测 219 会话里 222 例）。
+     *
+     * 三条同时成立才报 `error`：
+     * 1. 至少一个块被判 `invalid`；
+     * 2. **零正文**（有正文就保住正文，退化成 max-tokens）；
+     * 3. **没有另一个参数可解析的可用调用**（有就照常执行它，别一起作废）。
+     *
+     * ⚠️ 判据 3 的 `hasUsableToolName` 腿不可省：一个**无名**且参数合法的块
+     * 本就会被丢弃（见 `droppedUnnamedCalls`），不该让它把整步从 `error`
+     * 拽回 `max-tokens`。
+     */
+    const argsInvalidIsSoleOutput = toolArgsInvalidIsSoleOutput(
+      invalidArgBlocks.length,
+      emittedProse,
+      toolCalls.values(),
+      finishReason === 'length' || (finishReason === undefined && !streamEnded),
+    )
+    /**
      * 是否丢弃过**名称不可用**的 tool-call 块（见上方 tool_calls 分支）。
      *
      * 丢弃是对的（无名调用无法执行、留着会污染会话），但不能让它**静默地以
@@ -4301,6 +4479,15 @@ export class BuddyAdapter extends LlmAdapter {
       // 循环命中但另有可见产出：只能报 max-tokens（保住内容），不能报 error。
       : loopDetected
         ? { kind: 'max-tokens' as const }
+      // ⚠️ **工具参数写坏必须有自己的码**（真实缺陷，Gitee IKQ8Y1）：
+      // 放在 `loopDetected` **之后**、`max-tokens` 家族**之前**。
+      // 报 max-tokens 会让 UI 说「已达到输出 token 上限」（固定 i18n，不读
+      // 我们的 message），而实测该轮 `outputTokens` 只用了 2516/128000。
+      // 门禁三条见 `argsInvalidIsSoleOutput` 的注释。
+      : argsInvalidIsSoleOutput
+        ? { kind: 'error' as const, failure: toolArgsInvalidFailure(
+            toolArgsInvalidBlocks(invalidArgBlocks),
+          ) }
       : finishReason === 'length'
         || finishReason === undefined && toolOrder.length > 0
         || argsTruncated
@@ -4317,6 +4504,39 @@ export class BuddyAdapter extends LlmAdapter {
     yield { type: 'finish', reason: resolveEmptyResponseReason(reason, blockCount) }
   }
 }
+
+/**
+ * 续期/取号（`refresh()` / `resolveCredential()`）抛出的、**不得降级成 `AUTH`**
+ * 的错误码（Gitee IKQ99X）。
+ *
+ * ## 为什么需要这张表
+ *
+ * 401/403 分支的兜底文案是「credential expired and refresh failed」+ `AUTH`。
+ * 而 `resolveCredential` 在**候选被模型级限流筛空**时会抛 `QUOTA_EXCEEDED`
+ * （`credential-resolver.ts` 的 `throwIfAllRateLimited`，文案带解禁时刻）——
+ * 把它降级成 `AUTH` 会同时丢掉「解禁时刻」与「无需重新登录」这两条唯一出路，
+ * 且 `AUTH` 是客户端会整条替换文案的码（「API 密钥无效」）。
+ *
+ * ## 每一格的依据
+ *
+ * | 码 | 真实语义 | 为什么不能降级 |
+ * |---|---|---|
+ * | `QUOTA_EXCEEDED` | 该模型上全部启用账号在限流中（带解禁时刻） | 出路是等/换号，不是重新登录 |
+ * | `PERMISSION_DENIED` | 账号级拒绝（渠道校验收窄后的形态） | 出路是停用该账号；同一请求换号可用 |
+ * | `RATE_LIMIT` | 频率类 | 它在 harness 的 `DEFAULT_RETRYABLE_CODES` 里，降级成 `AUTH` 会**停掉重试** |
+ * | `MISSING_CREDENTIAL` | 压根没有账号 | 「去加账号」与「登录过期」是两种动作 |
+ *
+ * ⚠️ **刻意不含 `AUTH`**：与兜底同码，透传与否对用户完全一样。
+ * ⚠️ **不要往这里加 `SERVER` / `TIMEOUT` / `TRANSPORT`**：那三类是**瞬时**故障，
+ * 而 `resolveCredential` 抛它们时「换号重试」仍然是对的默认动作 ——
+ * 原实现那句「刷新失败不致命」正是为它们写的。
+ */
+const PRESERVED_CREDENTIAL_ERROR_CODES: ReadonlySet<string> = new Set([
+  'QUOTA_EXCEEDED',
+  'PERMISSION_DENIED',
+  'RATE_LIMIT',
+  'MISSING_CREDENTIAL',
+])
 
 /** 凭据是否已过期；无法解析过期时间时不判定过期（与 Rust is_expired 一致）。 */
 function isCredentialExpired(credential: BuddyCredential): boolean {

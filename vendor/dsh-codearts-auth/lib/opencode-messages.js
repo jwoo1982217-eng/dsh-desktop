@@ -1,36 +1,28 @@
 /**
- * 门禁工具名。
+ * OpenCode V2 chat 请求：内置工具集 + 官方形态提示词 + 客户端工具双向别名。
+ * 上游把内置工具集（名字 + 参数 schema）当形状门禁的一部分；描述会被替换成
+ * 「禁止调用」，不参与判定。客户端工具（包括 read/shell/edit/write）全部走
+ * `dsh_` 别名隔离，参数、调用 ID、正文与结果不改写。
  *
- * ⚠️ **只保留 `read`**：实测「只带 read」必定放行，而只带 shell/edit/write/glob
- * 一律 403。少注入一个门禁就少一个与客户端工具重名的干扰源 —— 模型偶发选中
- * 注入的 shell 桩会让整轮退化/被上游限流。
+ * ## ⚠️⚠️ 2026-10-26：system 必须带「官方形态提示词」（真机实测）
+ *
+ * 改前本文件的 system 只是把 DSH 自己的提示词原样塞成第一条消息。配上
+ * Bun 传输层指纹之后逐格对照（同一份 TLS 参数、同一套头、同一个出口）：
+ *
+ * | system 内容 | 结果 |
+ * |---|---|
+ * | 官方提示词（含 `<env>` 块）+ DSH system | **200** |
+ * | 只有 DSH system（改前形态） | **429 `FreeUsageLimitError`** |
+ * | 官方提示词但截掉前半 | **429** |
+ * | 官方提示词只留尾部 `<env>` 块 | **200** |
+ *
+ * ⇒ 门禁要三样**同时**成立：Bun 的 TLS 指纹、提示词里有 `<env>`
+ * （至少 `Working directory`）、tools 含整套内置工具（其中 `read` 是必需项）。
+ * 模板与渲染在 `opencode-official-prompt.ts`；**DSH 自己的提示词仍原样保留在
+ * 官方提示词之后**（不改写、不删除，`mergeSystemWithOfficialPrompt`）。
  */
-export const FREE_LANE_GATE_TOOLS = ['read'];
-/**
- * 门禁桩工具。名字与参数 schema 必须保持上游 read 的形态（改名或空 properties 都会 403）。
- * 描述**不参与校验**（空描述同样放行），故用最直白的禁止调用文案，不再拼业务原句，
- * 也就不会与客户端自己的工具描述混淆。
- */
-export function gateTool(name) {
-    return {
-        type: 'function',
-        function: {
-            name,
-            description: 'Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    path: { type: 'string', description: 'File or directory to read' },
-                    offset: { type: 'integer', minimum: 0, description: 'Starting line or directory entry (1-based)' },
-                    limit: { type: 'integer', minimum: 0, description: 'Maximum lines or directory entries to read' },
-                },
-                required: ['path'],
-                additionalProperties: false,
-            },
-            strict: false,
-        },
-    };
-}
+import { mergeSystemWithOfficialPrompt, renderOpencodeOfficialPrompt } from './opencode-official-prompt.js';
+import { officialBuiltinTools } from './opencode-official-tools.js';
 /** 只做 DSH → OpenAI 格式转换，别名统一在请求边界分配。 */
 export function buildOpencodeTools(tools) {
     return (tools ?? []).map((tool) => ({
@@ -122,7 +114,7 @@ function adaptPayload(payload) {
     }));
     const body = {
         ...payload,
-        tools: [...clientTools, ...FREE_LANE_GATE_TOOLS.map(gateTool)],
+        tools: [...clientTools, ...officialBuiltinTools()],
         stream: true,
         stream_options: { include_usage: true },
     };
@@ -147,8 +139,13 @@ export function ensureFreeLaneShape(payload) {
 export function buildOpencodeRequest(input) {
     return adaptPayload({
         model: input.model,
-        // chat 协议没有顶层 system；只转发 DSH 自己的提示，不注入 OpenCode 身份模板。
-        messages: input.system ? [{ role: 'system', content: input.system }, ...input.messages] : input.messages,
+        // chat 协议没有顶层 system；**恒发**一条 system，且第一条消息必须是它
+        // （⚠️ 实测：官方提示词在但不在首位 ⇒ 429）。内容 = 官方形态提示词 + DSH 自己的提示，
+        // 两者用空行拼接；DSH 的提示**原样保留**，见 `opencode-official-prompt.ts`。
+        messages: [
+            { role: 'system', content: mergeSystemWithOfficialPrompt(renderOpencodeOfficialPrompt(input.model), input.system) },
+            ...input.messages,
+        ],
         tools: buildOpencodeTools(input.tools),
         ...typeof input.temperature === 'number' && Number.isFinite(input.temperature) ? { temperature: input.temperature } : {},
         // 不擅自使用模型上限作默认预算；仅在调用方明确指定时下发 max_tokens。

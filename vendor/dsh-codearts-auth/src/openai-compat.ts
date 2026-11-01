@@ -40,6 +40,9 @@ import {
   createBlankReasoningSuppressor,
   createReasoningLoopDetector,
   hasUsableToolName,
+  classifyToolArguments,
+  toolArgsInvalidBlocks,
+  toolArgsInvalidIsSoleOutput,
   isProseTruncatedByStopString,
   isReasoningLoopGuardEnabled,
   isTruncatedArguments,
@@ -54,6 +57,7 @@ import {
   stripCourseLeakIfEnabled,
   createDsmlMarkerNormalizer,
   fixDsmlMarkers,
+  toolArgsInvalidFailure,
 } from './sse.js'
 import { DsmlContentExtractor } from './dsml.js'
 import { normalizeHarnessMessages } from './message-shape.js'
@@ -113,6 +117,23 @@ export function userContentParts(
       parts.push(url === undefined
         ? { type: 'text', text: '[image unavailable]' }
         : { type: 'image_url', image_url: { url } })
+      continue
+    }
+    // ⚠️⚠️ **已经拼好的 `image_url` 块必须原样透传**（2026-10-22 真实缺陷）。
+    //
+    // 背景：`analyzeImage` 的识图请求由**插件自己**构造（不是 harness 派生历史），
+    // 它把图片直接拼成上游要的 `{type:'image_url', image_url:{url}}` 形态后交给
+    // `adapter.stream()`。而本函数此前**只认 harness 原生** `{type:'image',
+    // attachment}`（`imageUrls` 里查字节），对 `image_url` **零命中** ⇒ 该块被
+    // **静默丢弃** ⇒ VL 模型只收到文字 ⇒ 回答「我看不到图片」。
+    // 症状极具误导性：HTTP 200、正文正常、上游无报错，只有答案是错的。
+    // ⇒ 修法：认到 `image_url` 就原样放进 parts（它已经是目标形态，无需再转）。
+    if (block.type === 'image_url') {
+      const url = (block as { image_url?: { url?: unknown } }).image_url?.url
+      if (typeof url === 'string' && url.length > 0) {
+        hasImage = true
+        parts.push({ type: 'image_url', image_url: { url } })
+      }
       continue
     }
     if (block.type === 'tool-result' && Array.isArray(block.content)) {
@@ -250,7 +271,16 @@ export function serializeMessages(
     // 工具结果之外的常规内容（含顶层图片）。
     const regular = content.filter((block) =>
       !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'))
-    const parts = imageUrls === undefined ? undefined : userContentParts(regular, imageUrls)
+    // ⚠️⚠️ **不能只在 `imageUrls !== undefined` 时才走多模态**（2026-10-22 真实缺陷）：
+    // 插件自己构造的识图请求（`analyzeImage`）把图**直接拼成 `image_url` 块**，
+    // 且**没有** `imageUrls` 映射表 ⇒ 若这里仍按「有表才升级」，那些块永远走不到
+    // `userContentParts` ⇒ 被当成纯文本消息发出 ⇒ **图被静默丢弃**。
+    // ⇒ 判据改为「有映射表 **或** 内容里本来就带 `image_url` 块」。
+    const carriesInlineImage = regular.some((block) =>
+      typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'image_url')
+    const parts = imageUrls === undefined && !carriesInlineImage
+      ? undefined
+      : userContentParts(regular, imageUrls ?? new Map())
     // ⚠️⚠️ **两条互斥分支**（Issue IKLIFH 的落点）：
     // 无工具结果 → 立刻发出并让挂起图片搭车；含工具结果 → 整条延后到下一条
     // user 消息（tool 消息必须紧跟其 assistant `tool_calls`，中间插消息会 400）。
@@ -1423,6 +1453,19 @@ export async function* consumeOpenAiSse(
   // 报告 tool-calls 会让 harness 执行缺参调用并报 schema 错误，
   // 模型收到莫名错误后陷入重试循环；报告 max-tokens 则丢弃并重试。
   const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
+  /**
+   * **模型把工具参数写坏**（结构闭合配平但 JSON 非法）—— 与「流被掐断」
+   * 分开处置（真实缺陷，Gitee IKQ8Y1；与 `buddy-adapter.ts` 同因同修）。
+   *
+   * ⚠️ 这是**共享**链路（openai-compat 被多家 provider 复用）⇒ 本判据的
+   * 覆盖面比单家适配器更宽，改动前请读 `sse.ts` 的 `classifyToolArguments`。
+   *
+   * 只收**名字可用**的块：无名块的参数没有意义（它本来就会被丢弃）。
+   */
+  const invalidArgBlocks = [...toolCalls.values()]
+    .filter(block => hasUsableToolName(block.name))
+    .map(block => ({ block, kind: classifyToolArguments(block.text) }))
+    .filter(entry => entry.kind === 'invalid')
   const incompleteTools = finishReason === undefined && toolOrder.length > 0
   /**
    * 是否丢弃过**名称不可用**的 tool-call 块（见上方 tool_calls 分支）。
@@ -1531,6 +1574,20 @@ export async function* consumeOpenAiSse(
     // 不能报 error（会丢内容）。见上面 `reasoningLoopIsSoleOutput` 的表格。
     : loopDetected
       ? { kind: 'max-tokens' as const }
+    // ⚠️ **工具参数写坏必须有自己的码**（真实缺陷，Gitee IKQ8Y1）：
+    // 放在 `loopDetected` 之后、`max-tokens` 家族之前。报 max-tokens 会让 UI
+    // 说「已达到输出 token 上限」（固定 i18n，不读适配器 message），而实测
+    // 受害轮次 `outputTokens` 只用了 2516/128000。
+    // 门禁三条：有坏块 + 零正文 + 无另一个参数可解析的可用调用。
+    : toolArgsInvalidIsSoleOutput(
+        invalidArgBlocks.length,
+        emittedProse,
+        toolCalls.values(),
+        finishReason === 'length' || (finishReason === undefined && !streamEnded),
+      )
+      ? { kind: 'error' as const, failure: toolArgsInvalidFailure(
+          toolArgsInvalidBlocks(invalidArgBlocks),
+        ) }
     : finishReason === 'length'
     || incompleteTools
     || truncatedStream

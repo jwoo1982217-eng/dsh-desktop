@@ -93,6 +93,8 @@ import type { NormalizedProxy } from './opencode.js';
 export declare function proxyFetch(input: string, init: RequestInit, proxy: NormalizedProxy | undefined): Promise<Response>;
 /** 取（或建）该代理地址的 Dispatcher。 */
 export declare function buildProxyDispatcher(proxy: NormalizedProxy): Dispatcher;
+/** Android签名传输独占出口，释放时不销毁OpenCode共享缓存。 */
+export declare function createProxyDispatcher(proxy: NormalizedProxy): Dispatcher;
 /** 当前缓存的代理实例数（诊断用）。 */
 export declare function proxyCacheSize(): number;
 /** 关闭并清空全部缓存实例（插件 dispose 路径）。 */

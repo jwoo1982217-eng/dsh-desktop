@@ -2,6 +2,11 @@ import type { Context } from '@deepseek-ai/cordis';
 /** 账号池里读网关开关的最小接口（避免为此把整个 pool 类型拖进来）。 */
 interface GatewaySwitchSource {
     gatewayEnabled(): boolean;
+    /**
+     * 「允许局域网访问」开关（可选：旧测试桩只给 enabled）。
+     * 缺失按 `false` 处理 —— 与持久化的缺键语义一致（安全默认）。
+     */
+    gatewayAllowLan?(): boolean;
 }
 /**
  * 启动对外兼容网关，并把关闭动作绑定到插件生命周期。

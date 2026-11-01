@@ -13,6 +13,7 @@ import { installDesktopPocket } from './install-desktop-pocket.mjs';
 import { installDesktopTeam } from './install-desktop-team.mjs';
 import { buildTeamClient } from '../team/build-client.mjs';
 import { buildModelPicker } from './build-model-picker.mjs';
+import { buildCodeProgress } from './build-code-progress.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -124,6 +125,7 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
     // 新核心的移动适配均以本版源码为基线；桌面仍走原生分支。
     const { readdir } = await import('node:fs/promises');
     await buildModelPicker();
+    await buildCodeProgress();
     for (const name of await readdir(path.join(root, 'runtime/overlays/@deepseek-ai'))) {
       await cp(path.join(root, 'runtime/overlays/@deepseek-ai', name), path.join(modules, '@deepseek-ai', name), { recursive: true });
     }

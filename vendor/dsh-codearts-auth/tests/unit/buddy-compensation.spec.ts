@@ -68,10 +68,11 @@ describe('buddy-compensation：状态查询', () => {
     // ⚠️ 断言**不写死主机名**：`webBase` 是产品配置，改了配置不该让用例假红。
     //    这里锁的是「用的是 webBase 那一格」这个**取舍**（见模块头）。
     const { fetcher, calls } = fakeFetcher(JSON.stringify(STATUS_ACTIVE))
-    await fetchCompensationStatus(CREDENTIAL, CODEBUDDY, fetcher)
+    const product = { ...CODEBUDDY, endpoint: 'https://inference.example.test', webBase: 'https://web.example.test' }
+    await fetchCompensationStatus(CREDENTIAL, product, fetcher)
     expect(calls).toHaveLength(1)
-    expect(calls[0]!.url).toBe(CODEBUDDY.webBase + COMPENSATION_STATUS_PATH)
-    expect(calls[0]!.url.startsWith(CODEBUDDY.endpoint)).toBe(false)
+    expect(calls[0]!.url).toBe(product.webBase + COMPENSATION_STATUS_PATH)
+    expect(calls[0]!.url.startsWith(product.endpoint)).toBe(false)
   })
 
   it('POST + 空 JSON body + Bearer 鉴权（无需浏览器 cookie）', async () => {

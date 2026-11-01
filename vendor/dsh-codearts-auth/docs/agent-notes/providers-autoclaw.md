@@ -201,3 +201,116 @@ dsh web **启动时还能看到积分**，过一会儿变成「AutoClaw 登录�
 - `parseAutoclawCredential` 里 `expires_in`（相对秒数）分支仍以**读取时刻**
   为基准换算 ⇒ 若某天有实现把相对秒数写进凭据，每次读取都会往后平移。
   当前落盘的是绝对毫秒 `expires_at`，**未触发**，故未改（不扩大范围）。
+
+## ⚠️⚠️ 401 按需续期：**续的必须是「本次实际用的那个账号」**（2026-10-27 两轮审计）
+
+PR154 的**根因链完全成立**（这三段已被两位审计员逐行复核）：
+
+```
+401（AT 到期）
+  → autoclaw-adapter.ts 的 401 重试判据带 `&& this.options.refresh`
+    而两站自 6da5505（首次接入）起都没传过它 ⇒ 不续期、不重发
+  → autoclaw.ts 的 isAutoclawAuthError 首条命中 'invalid token' ⇒ 归 'AUTH'
+  → 客户端（dsh-client-ui-chat 的 failureMessage）把 message **换成固定文案
+    「API 密钥无效」并丢掉原文**
+```
+
+**但第一版修法在多账号池下不成立**——这也是本仓库里「注释写得越确定越要验」的又一例。
+
+### ① 续错号：两条**不同**的选号规则
+
+第一版闭包用 `pool.getAvailableAccount(AUTOCLAW.id, '')` 取号，而请求实际用的凭据
+来自 `createCredentialResolver` → 该家接了 `balance: { kind: 'buddy' }`
+⇒ **用哪个号由余额分档决定**：
+
+| 判据 | 请求用的号（分档） | 第一版的续期号 |
+|---|---|---|
+| 排序 | 按到期档位（`pickBuddyAccount` + `buddyBalanceTier`） | **用户手动序第一个** |
+| 限流过滤 | 按**真 `modelId`** | 传 `''` ⇒ **整体短路**（`account-pool.ts` 的 `modelId.length === 0`） |
+
+实测（真跑 `createCredentialResolver` + 复刻池逻辑）：分档选中 **B**，
+`getAvailableAccount` 返回 **A** ⇒ 401 后 **续 A、重发仍用 B 的旧 token**
+⇒ 401 原样复现，而 A 被白轮换一把 RT。
+端到端三次请求的结果是 `["AUTH","AUTH","AUTH"]`，`grant RT` 是
+`["RTA-0","RTA-1","RTA-2"]`（**全是无关账号**）。
+
+⚠️ 更隐蔽的第二层：即使续对了号，`adapter` 重发前还会**重新 `resolveCredential`**
+（又选一次号）⇒ 可能挑回另一个号。
+
+### ② 修法：把「本次用的凭据」交给回调，并**用它返回的新凭据重发**
+
+```ts
+// src/autoclaw-adapter.ts
+refresh?: (used?: AutoclawCredential) => Promise<void | AutoclawCredential>
+// 适配器：const renewed = await this.options.refresh(credential)
+//          → 形状可用就直接用它重发（不再 resolveCredential）
+// src/index.ts（两站各一条）
+refresh: async (used) => {
+  const accountId = used?.access_token
+    ? await pool.findAccountIdByCredential(AUTOCLAW.id, used.access_token).catch(() => '')
+    : ''
+  const entry = accountId ? (await pool.listAccounts(AUTOCLAW.id)).find((i) => i.id === accountId) : undefined
+  if (entry !== undefined) return await autoclaw.renewCredentialForRef(entry.credentialRef, pool, entry.id)
+  // 池里没有这个 token（单凭据路径）⇒ 退默认 ref；**读不到就显式抛**
+  const single = await autoclaw.renewCredentialForRef(AUTOCLAW.defaultCredentialRef)
+  if (single === undefined) throw new Error('autoclaw: 401 后无可续期的账号…')
+  return single
+}
+```
+
+⚠️ **返回值保持可选**：既有的零参实现、`probeById` 的 `refresh: async () => {}`
+仍然合法（返回 `undefined` 时退回旧行为）—— 不破坏任何调用方。
+
+⚠️ **池空兜底修前是死路**：`autoclaw.refresh()` 读的 `AUTOCLAW.defaultCredentialRef`
+全仓**没有任何写入点**（只有产品定义 + `fallback` 声明）⇒ 它内部
+`if (!resolved) return` 静默返回 ⇒ 用户白等一次 60s 超时、然后仍然 401。
+现在改成**显式抛错**，让适配器走原有的 401 分类路径。
+
+### ③ per-ref 单飞（去重）：PR154 把「偶发」变「必然」
+
+`AutoclawAuth` 修前**没有任何并发保护**（全仓唯一的 in-flight 表在
+`autoclaw-credits.ts`，**不覆盖这条腿**）。实测同一 ref 并发 3 次
+⇒ **3 份 grant，三份都用同一把 `RT-0`**。
+
+- **PR154 之前**：401 根本不续期，只有「定时器 / 面板按钮 / 积分自愈」三条入口 ⇒ 偶发；
+- **PR154 之后**：DSH 每轮并发发「主回复 + 标题 + 压缩」三条请求 ⇒
+  每次过期边界**必然**撞车。
+
+这与 `docs/adding-a-new-provider.md:143-147` 的明文纪律冲突
+（「三条续期入口会并发消费同一份 `refresh_token` ⇒ 必须上 per-`credentialRef`
+的 `SerialQueue`」）。这恰好是 PR155 修掉的那条形态，PR154 又新建了一份。
+
+⇐ 现在 `AutoclawAuth.refreshInFlight`（key = **原始 `refName` 实参**，
+与 `MinimaxAuth.renewInFlight` 同口径；`credentialRef()` 只校验**不归一**，
+生产三条腿传的都是同一个 `entry.credentialRef` 字符串 ⇒ 无别名风险），
+语义是**去重**：命中在飞任务就 `await` 并**返回同一份结果**。
+
+### ④ 终态判据同样是 message 正则（与 minimax 逐字同形）
+
+见 `providers-loomy-raccoon-minimax.md` 的同名小节：`msg.includes('expired')`
+/ `msg.includes('401')` 会把 `503 token expired`、`429 key expired soon`、
+`certificate has expired` 全判成终态。已收口到 `src/refresh-failure.ts`，
+AutoClaw 自己的词汇（`Invalid token`）在调用点显式声明。
+
+### ⑤ 守卫必须**行为级**（第一版是源码文本，实测五种假接线全绿）
+
+第一版在 `autoclaw-lock-wiring.spec.ts` 里用 `readFileSync` + `toMatch`/`toContain`，
+红队逐字复刻判据后实测以下**全部绿**：片段塞进字符串字面量、**行尾 `//`** 冒充
+（`codeOnly` 只剥整行 `//`）、`if (false) {…}`、`if (Math.random() >= 0) return`
+恒早退、整块塞进 `false ? … : async () => {}`。反向还有**假红**：
+`refresh: () => autoclaw.refresh()` 这类合法重构会红。
+
+⇐ 现在搬到 `tests/unit/autoclaw-401-refresh-wiring.spec.ts`，**真跑 `apply()`**、
+真驱动适配器、让第一次 chat 请求 401，断言「被续的是**本次实际用的那个账号**」
+且「重发用的是**新** token」。**7 个变异全部变红**：
+忽略 `used` / 不返回新凭据 / 删键 / 不传 `entry.id` / 空实现 / 国际版忽略 `used` /
+单飞改回串行。
+
+⚠️ **写这条守卫时踩到的两个坑**（后人会再踩）：
+1. **必须按 URL 分流**：本家两个端点的认证头是**相反的**
+   （`autoclaw-model-config` 只认 `Authorization`、`chat/completions` 只认
+   `X-Authorization`）。若对所有请求都回 401，目录那次也会 401 ⇒ 适配器回落
+   兜底表、`stream()` 一次都不发 ⇒ 用例以「没续期」**假红**。
+2. **必须钉死请求用哪个号**：若让 `resolveCredential` 自然选，两条规则都选 A
+   ⇒ 「续错号」这个缺陷根本不会暴露。用例里改成直接覆盖
+   `adapter.options.resolveCredential` 返回 B 的凭据。

@@ -157,7 +157,7 @@ function pickKnownAccountArray(value) {
 export function providerFromIssuer(issuer) {
   if (typeof issuer !== 'string' || issuer.length === 0) return 'buddy'
   const host = hostOf(issuer)
-  return host !== undefined && host.includes('workbuddy') ? 'workbuddy' : 'buddy'
+  return host !== undefined && (host === 'workbuddy.ai' || host.endsWith('.workbuddy.ai')) ? 'workbuddy' : 'buddy'
 }
 
 /** 取 URL / 裸主机名里的主机部分（大小写不敏感）；解不出返回 undefined。 */

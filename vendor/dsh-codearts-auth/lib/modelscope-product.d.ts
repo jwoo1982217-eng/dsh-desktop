@@ -163,6 +163,42 @@ export interface ModelscopeFallbackModel {
 export declare const MODELSCOPE_FALLBACK_MODELS: readonly ModelscopeFallbackModel[];
 /** 该模型是否为本地兜底表里登记过的（远端目录爆炸时的收敛依据）。 */
 export declare function isKnownModelscopeModel(id: string): boolean;
+/**
+ * 在兜底表里查一个 id，**支持日期快照后缀**（Issue #12）。
+ *
+ * ## 为什么需要它
+ *
+ * 魔搭的推理目录 `/v1/models` **只下发 4 个字段**（`id` / `object` / `owned_by` /
+ * `created`）—— **没有 `modalities`、没有 `context_window`**。所以能力判据
+ * **必然**回落到本兜底表。而魔搭会**定期换快照 id**：
+ *
+ * - 兜底表登记的是某个快照（如 `deepseek-ai/DeepSeek-V4.1-Flash-1017`）；
+ * - 上游下个月可能换成 `…-1101`，或直接退回无后缀的 `…-Flash`；
+ * - 精确查找在任一条缝里都**恒不命中** ⇒ 那个模型被判成纯文本
+ *   （`supportsImage: false`）且 `contextWindow: 0`，而真机实测它能收图
+ *   （32×32 纯红 PNG 答 `Red`）。
+ *
+ * ## 匹配规则（按优先级，四条）
+ *
+ * 1. **精确命中**：兜底表里真有这个 id ⇒ 直接用它；
+ * 2. **剥快照后精确命中**：`id` 剥掉末尾日期段 == 某条目 `id` 剥掉日期段
+ *    ⇒ 同族，用它。⚠️ 这一条是**双向**的（`X-1017` ↔ `X` 互相能认），
+ *    所以兜底表登记的是快照还是无后缀**都不影响**；
+ * 3. **`-` 边界前缀**：`id` 以 `m.id + '-'` 开头（旧快照被新快照包含的形态，
+ *    例如表里是 `X`、远端给了 `X-1017`）—— 只认 `-` 边界，避免 `Foo` 误吞
+ *    `Foobar`（那不是快照，是另一个模型）；
+ * 4. **最长优先**：多个条目都命中时取 `m.id` 最长的，避免短 id 把更具体的
+ *    条目盖掉。
+ *
+ * ⚠️ **只用于「兜底」，绝不覆盖远端明确声明**：调用方必须先看远端
+ * `modalities` / `context_window`，只有它们缺失时才走这里。远端说「纯文本」
+ * 就是纯文本 —— 本函数不能反向推翻它（否则就是「声明支持但实际不支持」的
+ * 反方向错误，同样违反本仓库的硬约定）。
+ *
+ * @param id 归一化后的模型 id（`normalizeModelscopeModelId` 的结果）
+ * @returns 命中的兜底条目；没命中返回 `undefined`
+ */
+export declare function findModelscopeFallback(id: string): ModelscopeFallbackModel | undefined;
 export type ModelscopeErrorKind = 'rate_limit' | 'quota' | 'auth' | 'server' | 'transport' | 'invalid_request' | 'context_window';
 export interface ModelscopeErrorInfo {
     kind: ModelscopeErrorKind;
@@ -174,13 +210,15 @@ export interface ModelscopeErrorInfo {
 /**
  * 把一次失败的 HTTP 响应归类为语义化错误。
  *
- * ## ⚠️ 顺序即优先级（三条都来自本项目真实缺陷）
+ * ## ⚠️ 顺序即优先级（每条都来自本项目真实缺陷）
  *
- * 1. **限流/额度必须排在 auth 之前**：魔搭与同源的 chatanywhere 在额度耗尽时
- *    可能回 401/403 而不是 429（旧 fork `src/proxy/upstream.ts` 的
- *    `NON_RETRYABLE_CODES` 与 key-pool 的 `isQuotaLikeError` 就是为这个形态写的）。
- *    若先判状态码，用户看到的会是「API key 失效」——而他的唯一有效动作
- *    （等窗口恢复 / 换一个 key）被完全掩盖。
+ * 1. **⚠️ 401/403 先判，恒归 `auth`**（2026-10-31 对抗审计同批修，与 qiniu
+ *    `classifyQiniuError` 同步）：状态码与额度文案并存时**以状态码为准** ——
+ *    认证类是**账号态**、不是模型冷却，落 quota 会被 `markLimited` 写成
+ *    UTC+8 次日零点冷却，把认证故障放大成封池（loomy 2026-10-06「全池被封」
+ *    事故同型；不变式见 `docs/agent-notes/providers-loomy-raccoon-minimax.md`）。
+ *    原「额度耗尽可能回 401/403 故额度先判」的方向反了：宁可漏判额度
+ *    （不换号）不可误判成封号。
  * 2. **400 单独归 `invalid_request`**：魔搭对请求体形状极严格（见模块头的
  *    工具包装事故），把它归成 server/可重试会让 harness 白重试 5 次、
  *    每次都拿到同一个 400。

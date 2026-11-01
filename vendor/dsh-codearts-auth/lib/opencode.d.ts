@@ -12,7 +12,7 @@ export interface OpencodeFingerprint {
 }
 /** 账号凭据（存 `ctx.credentials`，不进 settings 明文）。 */
 export interface OpencodeCredential {
-    /** Zen API key（`sk-…`），身份本体；匿名槽用字面量 `public`。 */
+    /** Zen API key（旧 `sk-…`／2026-10-22 起 `oc_sk_…`），身份本体；匿名槽用字面量 `public`。 */
     api_key: string;
     nickname?: string;
     /** 首次添加时生成；旧账号缺失时由 `newAccountFingerprint` 补。 */

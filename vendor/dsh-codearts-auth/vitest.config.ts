@@ -47,6 +47,13 @@ export default defineConfig({
     env: {
       DSH_JET_HUB_STATE_DIR: fallbackStateDir,
       QODER_RUNTIME_INFO: noSuchRuntimeInfo,
+      // ⚠️ 单测**禁止真发网络**（2026-10-30 合并审计补）：opencode 的 Bun 指纹
+      // 传输层（`wreq-js`）在本机装得上时绕过所有网络桩，对上游真发请求。
+      // `bunTlsFetch` 见此 env 即抛 `BunTlsUnavailableError` ⇒ 适配器按既有
+      // 回退路径走 `proxyFetch` ⇒ 旧的 `vi.stubGlobal('fetch')` /
+      // `vi.mock('undici')` 桩重新生效。e2e 配置（vitest.e2e.config.ts）
+      // **不注入**本 env ⇒ 真机验收路径不受影响；生产环境同样不设。
+      DSH_UNIT_TEST_NO_WREQ: '1',
     },
   },
 })

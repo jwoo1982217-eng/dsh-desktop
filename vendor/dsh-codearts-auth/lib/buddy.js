@@ -14,14 +14,14 @@
  * 本模块只放常量与纯函数（无网络、无存储），网络流程见 buddy-oauth.ts。
  */
 // ── API 端点常量（逆向自 genie 扩展 product.json + index.js） ──
-/** 主 API 端点（product.json endpoint）。 */
-export const API_ENDPOINT = 'https://copilot.tencent.com';
+/** 国内账号协议 API 端点（WorkBuddy 5.9.2 随包 product.json）。 */
+export const API_ENDPOINT = 'https://www.workbuddy.cn';
 /** API 路径前缀（product.json authentication.attributes.prefixPath）。 */
 export const PREFIX_PATH = '/plugin';
-/** 平台标识（product.json authentication.attributes.platform）。 */
-export const PLATFORM = 'ide';
-/** 登录网站首页（copilot.tencent.com → www.codebuddy.cn 映射）。 */
-export const WEBSITE_HOME = 'https://www.codebuddy.cn';
+/** 国内账号平台标识（authentication.attributes.platform）。 */
+export const PLATFORM = 'workbuddy';
+/** 国内 WorkBuddy 登录网站。 */
+export const WEBSITE_HOME = 'https://www.workbuddy.cn';
 /** 获取 auth state 端点：POST /v2/plugin/auth/state?platform=ide */
 export const AUTH_STATE_PATH = '/v2/plugin/auth/state';
 /** 轮询 token 端点：GET /v2/plugin/auth/token?state=... */
@@ -73,18 +73,17 @@ export const HTTP_HEADER_AUTH_REFRESH_SOURCE = 'X-Auth-Refresh-Source';
 export const HTTP_HEADER_PRODUCT = 'X-Product';
 export const HTTP_HEADER_PRODUCT_CODE = 'X-Product-Code';
 /**
- * User-Agent 标识（对齐 IDE 的 getUserAgent() → CodeBuddyIDE/${platformVersion}）。
- * platformVersion 来自 IDE product.json version 字段（1.106.1），非 genie 版本。
+ * 国内 WorkBuddy 的桌面 / CLI 版本标识（5.9.2 / 5.8.3）。
  */
-export const BUDDY_USER_AGENT = 'CodeBuddyIDE/1.106.1';
+export const BUDDY_USER_AGENT = 'WorkBuddy/5.9.2 WorkBuddy/5.9.2 CLI/5.8.3';
 /** X-Product-Code 值（对齐 IDE headers 设置）。 */
-export const BUDDY_PRODUCT_CODE = 'codebuddy';
+export const BUDDY_PRODUCT_CODE = 'workbuddy';
 /** X-Product 默认值（deploymentType，对齐 ProductEndpointHttpInterceptor）。 */
 export const BUDDY_DEPLOYMENT_TYPE = 'SaaS';
 /** 刷新来源标识（对齐 IDE 的 ide-main）。 */
 export const AUTH_REFRESH_SOURCE = 'ide-main';
 /** API 端点的裸域名（X-Domain 头的值）。 */
-export const API_DOMAIN = 'copilot.tencent.com';
+export const API_DOMAIN = 'www.workbuddy.cn';
 /**
  * 从凭据 expires_at 解析毫秒时间戳（兼容毫秒时间戳 / 秒级时间戳 / ISO 8601）。
  * 无法解析或缺失时返回 undefined。

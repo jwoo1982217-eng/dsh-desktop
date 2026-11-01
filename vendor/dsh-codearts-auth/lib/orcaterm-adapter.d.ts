@@ -16,6 +16,7 @@
  *
  * @module orcaterm-adapter
  */
+import type { AccountPool } from './account-pool.js';
 import type { Context } from '@deepseek-ai/cordis';
 import type { GenerateOptions, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm';
 /** 从账号池取到的一件凭据。两种形态互斥，由 `kind` 区分。 */
@@ -129,6 +130,7 @@ export declare class OrcaTermAdapter {
         /** 取该 provider 的可用账号（账号池 + 凭据解析）。 */
         resolveCredential: (modelId: string) => Promise<OrcaTermCredential | undefined>;
         /** 记录一次用量（失败也要记），供面板展示。 */
+        accountPool?: AccountPool;
         providerClosed?: () => boolean;
         recordUsage?: (record: {
             at: number;
@@ -179,6 +181,7 @@ export declare class OrcaTermAdapter {
  */
 export declare function registerOrcaTermLlm(ctx: Context, options: {
     resolveCredential: (modelId: string) => Promise<OrcaTermCredential | undefined>;
+    accountPool?: AccountPool;
     providerClosed?: () => boolean;
     recordUsage?: (record: {
         at: number;

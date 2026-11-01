@@ -1,5 +1,5 @@
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import {
@@ -17,6 +17,11 @@ import {
 } from '../../src/llm-adapter.js'
 import { nextUtc8DayStartMs } from '../../src/model-queue.js'
 import { setBenefitMemoryCache } from '../../src/models.js'
+import {
+  resetCodeArtsBenefitClaimFlight,
+  resetCodeArtsBenefitLearned,
+} from '../../src/llm-adapter.js'
+import { CODEARTS_BENEFIT_CLAIM_URL } from '../../src/codearts-credits.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
 const CREDENTIAL_REF = credentialRef('CODEARTS_ACCESS_TOKEN')
@@ -131,6 +136,23 @@ function stripCommentsAndKeepStrings(source: string): string {
   return out
 }
 
+/**
+ * ⚠️⚠️ **必须逐用例隔离两个模块级缓存**（2026-10-27）。
+ *
+ * `claimCodeArtsBenefitShared` 的跨请求去重表与 `codeArtsBenefitLearned` 都是
+ * **模块级**的 —— 那是生产想要的行为（同一凭据 60s 内只领一次、补头成功过就记住），
+ * 但单测里会**跨用例污染**：前一条用例领过 ⇒ 后一条在 60s 窗口内复用旧 Promise
+ * ⇒ `claimCalls` 变 0，报出「领了一次却没发请求」这种无从归因的假红（实测踩过）。
+ *
+ * ⚠️ 也可能反向污染：前一条用例「补头成功」把模型记进 learned ⇒ 后一条
+ * 「未确认」用例变成直接带头 ⇒ 序号序列整体错位。
+ */
+beforeEach(() => {
+  resetCodeArtsBenefitClaimFlight()
+  resetCodeArtsBenefitLearned()
+  setBenefitMemoryCache(undefined)
+})
+
 describe('CodeArtsAdapter', () => {
   it('providerInfo identifies the codearts route', () => {
     expect(makeAdapter().providerInfo('codearts')).toMatchObject({ id: 'codearts', name: 'CodeArts Agent' })
@@ -139,51 +161,104 @@ describe('CodeArtsAdapter', () => {
   it('listModels advertises the openpangu-2.0 and deepseek-v4 models alongside the GLM family', async () => {    // 对齐 deveco-code-rust 参考实现 codearts.rs：新增盘古模型
     // openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)，
     // 后端 /v1/default/models 下发的 model_id 为全小写。
-    // DeepSeek V4（对齐 deveco-code 62834ff6）：CodeArts Agent 模型列表新增
-    // deepseek-v4-flash / deepseek-v4-pro（UI 标注每日 1000 万免费 Tokens 福利）。
-    // ⚠️ 早期注释称「deepseek-v4-flash-0731 后端未注册」，该结论**有误**
-    // （2026-09-23 修正，对齐 deveco-code-rust fb1b4a2）：它返回 404 的真实原因是
-    // **缺少 maas_type: benefit 头**，带上即成功；带日期后缀与无后缀是后端上两个
-    // 不同的模型，不能互相替代。
+    //
+    // ⚠️⚠️ 2026-10-27 兜底表全表真机实测校准（本用例跟着改）：
+    // - `deepseek-v4-pro` **已下架**：不带 maas_type 回 `ModelArts.81009 Invalid model`
+    // - `deepseek-v4-flash` **仍然可用**（200）：虽不在 builtin 目录里，但真机能调通
+    //   ⇒ 保留（判据是「能不能调通」，不是「在不在目录里」）
+    // - 新增 `deepseek-v4.1-flash-1017`（issue IKQY27）：与老版是两个独立注册的模型
+    //
+    // ⚠️ benefit 头的判定**不属本用例范围**：由 PR #156 统一处理（静态兜底表将被
+    //    删除，唯一权威改为远端 gateway/config 的 result.models）。
     const models = await makeAdapter().listModels('codearts')
     const ids = models.map(model => model.id)
     expect(ids).toContain('openpangu-2.0-flash')
     expect(ids).toContain('openpangu-2.0-pro')
     expect(ids).toContain('deepseek-v4-flash')
-    expect(ids).toContain('deepseek-v4-pro')
     expect(ids).toContain('deepseek-v4.1-flash')
+    expect(ids).toContain('deepseek-v4.1-flash-1017')
+    // 已下架（实测 404）的不得再出现，否则用户选中后必然失败。
+    expect(ids).not.toContain('deepseek-v4-pro')
     const flash = models.find(model => model.id === 'openpangu-2.0-flash')
     const pro = models.find(model => model.id === 'openpangu-2.0-pro')
     const dsFlash = models.find(model => model.id === 'deepseek-v4-flash')
-    const dsPro = models.find(model => model.id === 'deepseek-v4-pro')
     expect(flash).toMatchObject({ provider: 'codearts', name: 'openpangu-2.0-flash' })
     expect(pro).toMatchObject({ provider: 'codearts', name: 'openpangu-2.0-pro' })
     expect(dsFlash).toMatchObject({ provider: 'codearts', name: 'deepseek-v4-flash' })
-    expect(dsPro).toMatchObject({ provider: 'codearts', name: 'deepseek-v4-pro' })
     // 默认模型仍是 GLM-5.2（新增模型不应改变默认模型）。
     expect(ids[0]).toBe('GLM-5.2')
   })
 
-  it('resolveModel discloses contextWindow for GLM-5.2 and deepseek-v4 models', async () => {
-    // GLM-5.2：202752；glm-5.3-flash：1048576（1M，对齐 deveco-code-rust 90aeb17d）；
-    // deepseek-v4-flash/pro：1048576（1M）；deepseek-v4.1-flash：1000000
-    // （对齐 IDE 下发的 inferhub-provider 模型配置，2026-09 kernel 日志）。
-    // 其余模型（GLM-5.1/GLM-5/openpangu-*）未公开容量，context 应为 undefined。
+  /**
+   * ★★ `catalogConfirmedRemote()` 三态 —— 供 `model.list` 的「已下架」判据用。
+   *
+   * ## 为什么需要它（PR159 首版的缺口，2026-10-28 修）
+   *
+   * `model.list` 会据「模型不在全量目录里」判断它已被上游下架、从而**不补回**
+   * 设置页。但 `listAllModels()` 在**冷缓存 / 远端降级**下返回的是**编译期兜底
+   * 表**（远端目录的**子集** —— Issue IKJW33 实测 `cline` 冷缓存 3 条 vs 远端
+   * 460 条）。拿子集当在售集合 ⇒ 用户关掉的**在售**模型（例如 codearts 只存在于
+   * 远端的新模型 `glm-5.3`）会被判成已下架 ⇒ 从设置页彻底消失、再也打不开。
+   *
+   * ⇒ 只有本方法返回 `true`（**证明**这份目录来自远端完整读取）时才允许隐藏。
+   *
+   * ⚠️ 判据两条腿都必须成立，缺一即 `false`（保守）：
+   * - 从未拉到远端（`remoteModels === undefined`）⇒ 目录是兜底子集；
+   * - 拉到了但**残缺**（两个目录端点只有一个成功）⇒ 同样是子集。
+   */
+  it('★★ catalogConfirmedRemote：冷启动 / 远端完整 / 远端残缺 三态', async () => {
+    // ① 冷启动：从未成功拉到远端（默认 `fetchRemoteModels` 未注入）⇒ false
+    const cold = makeAdapter()
+    expect(cold.catalogConfirmedRemote(), '冷启动时目录只是兜底子集，不得据此判已下架').toBe(false)
+
+    // ② 远端成功且两个端点都取全 ⇒ true
+    const warm = makeAdapter({
+      fetchRemoteModels: async () => [{ id: 'GLM-5.2', name: 'GLM-5.2' }],
+      catalogComplete: () => true,
+    })
+    await warm.listModels('codearts')
+    expect(warm.catalogConfirmedRemote()).toBe(true)
+
+    // ③ 远端读到了、但残缺（只有一个端点成功）⇒ false（残缺目录同样不能反推「已下架」）
+    const partial = makeAdapter({
+      fetchRemoteModels: async () => [{ id: 'GLM-5.2', name: 'GLM-5.2' }],
+      catalogComplete: () => false,
+    })
+    await partial.listModels('codearts')
+    expect(partial.catalogConfirmedRemote()).toBe(false)
+  })
+
+  it('resolveModel discloses contextWindow for every model in the catalog', async () => {
+    // ⚠️ 2026-10-29 重取证（IDE 0.2.6 抓包 record 38 + AgentCenter 双源一致）：
+    //    权威来源是 IDE 自己下发的 `provider["inferhub-provider"].models[*].limit.context`。
+    //    - GLM-5.2：**202_752**（09-11~10-20 是 202_752；10-21 改 1M；
+    //      **10-29 又改回 202_752** —— 三次漂移史见 CONTEXT_WINDOWS 注释，
+    //      运行时权威已由 AgentCenter 动态下发，本表只是冷缓存兜底）
+    //    - glm-5.3：1_048_576（2026-10-21 报障模型，原先**完全没有**条目）
+    //    - openpangu-2.0-flash / -pro：524_288（原先没有条目 ⇒ 用户没有占用条）
+    //    - deepseek-v4.1-flash：1_048_576（本表原先写 1_000_000，按 IDE 权威值改正）
+    // ⚠️ **本家不再有「context 为 undefined」的目录条目** —— 表里查不到时走
+    //    具名兜底 `CODEARTS_FALLBACK_CONTEXT_WINDOW`（真实报障：缺窗口 ⇒
+    //    DSH 的上下文占用条整条不渲染）。逐项守卫见
+    //    `codearts-context-window.spec.ts`。
     const adapter = makeAdapter()
     const glm52 = await adapter.resolveModel('codearts', 'GLM-5.2')
-    expect(glm52.context).toEqual({ contextWindow: 202752 })
+    expect(glm52.context).toEqual({ contextWindow: 202_752 })
     const glm53flash = await adapter.resolveModel('codearts', 'glm-5.3-flash')
     expect(glm53flash.context).toEqual({ contextWindow: 1_048_576 })
+    const glm53 = await adapter.resolveModel('codearts', 'glm-5.3')
+    expect(glm53.context).toEqual({ contextWindow: 1_048_576 })
     const dsFlash = await adapter.resolveModel('codearts', 'deepseek-v4-flash')
     expect(dsFlash.context).toEqual({ contextWindow: 1048576 })
     const dsPro = await adapter.resolveModel('codearts', 'deepseek-v4-pro')
     expect(dsPro.context).toEqual({ contextWindow: 1048576 })
     const dsV41Flash = await adapter.resolveModel('codearts', 'deepseek-v4.1-flash')
-    expect(dsV41Flash.context).toEqual({ contextWindow: 1_000_000 })
+    expect(dsV41Flash.context).toEqual({ contextWindow: 1_048_576 })
+    // 表里**没有**条目的模型也必须给出窗口（否则用户看不到占用比）。
     const glm51 = await adapter.resolveModel('codearts', 'GLM-5.1')
-    expect(glm51.context).toBeUndefined()
+    expect(glm51.context).toEqual({ contextWindow: 524_288 })
     const pangu = await adapter.resolveModel('codearts', 'openpangu-2.0-pro')
-    expect(pangu.context).toBeUndefined()
+    expect(pangu.context).toEqual({ contextWindow: 524_288 })
   })
 
   // 回归：dsh-llm 0.1.1-rc.2 的 LlmRuntime.prepareCall() 会直接调用
@@ -197,7 +272,8 @@ describe('CodeArtsAdapter', () => {
     expect(call.model).toMatchObject({
       provider: 'codearts',
       id: 'GLM-5.2',
-      context: { contextWindow: 202752 },
+      // 2026-10-29 双源取证：GLM-5.2 = 202_752（漂移史见 CONTEXT_WINDOWS）。
+      context: { contextWindow: 202_752 },
       inputModalities: ['text'],
     })
     expect(typeof call.stream).toBe('function')
@@ -332,10 +408,15 @@ describe('CodeArtsAdapter', () => {
       .not.toMatch(/declaredEfforts:\s*\[\s*['"](?:on|off)['"]/)
   })
 
-  it('maps the "off" effort onto top-level thinking.type=disabled, and sends nothing for "on"', async () => {
-    // ⚠️ 必须断言「开启档不发该字段」：`enabled` 与服务端默认等价，发了只是噪声；
-    // 更重要的是不能把它写成 raccoon 那种 `extra_body.thinking` 嵌套方言
-    // （两者是不同网关的方言，混用会静默无效）。
+  /**
+   * 思考开关：**按 IDE 的 `enable_thinking` 方言**（2026-10-30 与 IDE 抓包对齐后改）。
+   *
+   * ⚠️ 旧实现发顶层 `thinking:{type:'disabled'}`（2026-09-29 测出来的「唯一生效控制」）。
+   * 本次真机判别推翻了「唯一」：`enable_thinking` 的 `true`/`false` **双向都生效**
+   * （判据 `reasoning_tokens`：true=34、false=n/a 且 reasoning 字符 0、不发=45）。
+   * 既然 IDE 用的是 `enable_thinking`，就只留这一份方言，不再发 `thinking`。
+   */
+  it('maps the "off" effort onto enable_thinking=false, and sends enable_thinking=true for "on"', async () => {
     const seen: Array<Record<string, unknown>> = []
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       seen.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
@@ -358,15 +439,18 @@ describe('CodeArtsAdapter', () => {
     }
 
     const off = await run('off')
-    expect(off.thinking).toEqual({ type: 'disabled' })
-    // 顶层字段，不是嵌套方言。
+    expect(off.enable_thinking).toBe(false)
+    // ⚠️ 旧方言**不得**再发（同一语义两个字段 = 迟早分叉）。
+    expect(off.thinking).toBeUndefined()
     expect(off.extra_body).toBeUndefined()
 
     const on = await run('on')
+    expect(on.enable_thinking).toBe(true)
     expect(on.thinking).toBeUndefined()
 
+    // 未指定档位 ⇒ 宿主注入默认档（本家 'on'）⇒ 同样是 true
     const unset = await run(undefined)
-    expect(unset.thinking).toBeUndefined()
+    expect(unset.enable_thinking).toBe(true)
   })
 
   /**
@@ -414,12 +498,18 @@ describe('CodeArtsAdapter', () => {
       expect((await sentBody(65_536)).max_tokens).toBe(65_536)
     })
 
-    it('未传 / 非法值回落到默认 65536（不编造别的数值）', async () => {
-      expect((await sentBody(undefined)).max_tokens).toBe(65_536)
-      expect((await sentBody(0)).max_tokens).toBe(65_536)
-      expect((await sentBody(-1)).max_tokens).toBe(65_536)
-      expect((await sentBody(Number.NaN)).max_tokens).toBe(65_536)
-      expect((await sentBody(Number.POSITIVE_INFINITY)).max_tokens).toBe(65_536)
+    /**
+     * ⚠️ 2026-10-30 与 IDE 对齐后：**缺省值 65536 → 32000**。
+     *
+     * 取证：Reqable 4 条真实 IDE 请求的 `max_tokens` **恒 32000**（4/4），
+     * 而 AgentCenter 给该模型的**上限**是 65536 ⇒ 32000 是 IDE 的**默认预算**，
+     * 不是能力边界。⇒ 缺省时对齐 IDE 的 32000；**钳制上界仍是 65536**
+     * （调用方明确要长输出时不许被静默削掉，见下方那条用例）。
+     */
+    it('未传 / 非法值回落到 IDE 默认预算 32000（不编造别的数值）', async () => {
+      for (const bad of [undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect((await sentBody(bad)).max_tokens, String(bad)).toBe(32_000)
+      }
     })
 
     it('对**每一个** CodeArts 模型都生效 —— 适配器层是统一边界，不逐模型开洞', async () => {
@@ -427,6 +517,132 @@ describe('CodeArtsAdapter', () => {
         expect((await sentBody(128_000, model)).max_tokens, model).toBe(65_536)
       }
     })
+  })
+
+  /**
+   * ⚠️⚠️ 守卫：**出站字段集必须与 IDE 抓包对齐**（2026-10-30）。
+   *
+   * 判据来自 Reqable 4 条真实 IDE 聊天请求（键集 4/4 完全一致）：
+   * `enable_thinking, max_tokens, messages, model, stream, stream_options,
+   *  temperature, tool_choice, tool_stream, tools, user_prompt`
+   *
+   * 本用例只钉**插件曾经缺的 5 个**与**必须删掉的 2 个**：
+   * - 缺过：`enable_thinking` / `stream_options` / `temperature` / `tool_choice` / `user_prompt`；
+   * - 多发：`include` / `reasoning_summary`（IDE 从不下发，本仓也无消费者）。
+   *
+   * ⚠️ `prompt_cache_key` **刻意保留**（唯一有意偏离 IDE 的字段，理由见
+   * llm-adapter.ts 的长注释）⇒ 本用例**不断言它缺席**，否则会把那处有意设计判红。
+   */
+  it('出站字段集与 IDE 抓包对齐：补齐 5 个、移除 IDE 不发的 2 个', async () => {
+    const seen: Array<Record<string, unknown>> = []
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    // ⚠️ 必须用**非 DSML** 模型（`deepseek-v4-flash` 走 DSML，会刻意不发 tools
+    // ⇒ `tool_choice` 随之省略，用它测这一条会假红）。`deepseek-v4.1-flash-1017`
+    // 实测 `needsDsmlToolMode === false`，正是 GUI 的真实路径。
+    const adapter = makeAdapter({ fetchImpl })
+    for await (const _ of adapter.stream({
+      provider: 'codearts',
+      model: 'deepseek-v4.1-flash-1017',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '第一句' }] },
+        { role: 'assistant', content: [{ type: 'text', text: '好的' }] },
+        { role: 'user', content: [{ type: 'text', text: '这一句应成为 user_prompt' }] },
+      ],
+      tools: [{
+        name: 'bash',
+        description: 'Run shell',
+        parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+      }],
+      reasoningEffort: 'on',
+      signal: new AbortController().signal,
+    } as never)) { /* drain */ }
+    const body = seen.at(-1)!
+
+    // ① IDE 有、插件曾缺的 5 个
+    expect(body.enable_thinking).toBe(true)
+    expect(body.stream_options).toEqual({ include_usage: true })
+    expect(body.temperature).toBe(0)
+    expect(body.tool_choice).toBe('auto')
+    expect(body.user_prompt).toBe('这一句应成为 user_prompt')
+
+    // ② IDE 从不发、插件曾多发的 2 个
+    expect(body.include).toBeUndefined()
+    expect(body.reasoning_summary).toBeUndefined()
+
+    // ③ 既有的共同字段仍在
+    expect(body.stream).toBe(true)
+    expect(body.tool_stream).toBe(true)
+    expect(body.model).toBe('deepseek-v4.1-flash-1017')
+  })
+
+  /**
+   * ⚠️ DSML 分支的**有意差异**：该分支刻意不发 `tools`（工具 schema 改注入 system 提示），
+   * ⇒ `tool_choice` 也随之省略（没有 `tools` 时它无意义）。本用例把这条差异
+   * **钉死**，防止有人为了「对齐 IDE」在 DSML 分支上强行补发 `tools`。
+   */
+  it('DSML 模型不发 tools、因而也不发 tool_choice（有意差异，勿强行对齐）', async () => {
+    const seen: Array<Record<string, unknown>> = []
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    for await (const _ of adapter.stream({
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      tools: [{
+        name: 'bash',
+        description: 'Run shell',
+        parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+      }],
+      signal: new AbortController().signal,
+    } as never)) { /* drain */ }
+    const body = seen.at(-1)!
+    expect(body.tools).toBeUndefined()
+    expect(body.tool_choice).toBeUndefined()
+  })
+
+  /**
+   * ⚠️ `user_prompt` 的取值语义：**最后一条真正的用户发言**，不是工具结果。
+   *
+   * ⚠️⚠️ 若从**序列化后**的 wire 数组取，工具结果被展平成 `role:'tool'`、
+   * 而 harness 原始消息里工具结果搭载在 **user** 消息中 ⇒ 会取到几百 KB 的
+   * 文件内容，与 IDE「用户一句话」的语义完全相反。本用例专钉这一点。
+   */
+  it('user_prompt 取「用户原话」而非工具结果（末尾是工具结果时回退）', async () => {
+    const seen: Array<Record<string, unknown>> = []
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    })
+    const adapter = makeAdapter({ fetchImpl })
+    for await (const _ of adapter.stream({
+      provider: 'codearts',
+      model: 'deepseek-v4-flash',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '请读文件' }] },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'c1', name: 'bash', arguments: '{"command":"cat a"}' }],
+        },
+        { role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'AAA' }] }] },
+      ],
+      signal: new AbortController().signal,
+    } as never)) { /* drain */ }
+    expect(seen.at(-1)!.user_prompt).toBe('请读文件')
   })
 
   it('streams text deltas from an OpenAI-compatible SSE response', async () => {
@@ -468,12 +684,19 @@ describe('CodeArtsAdapter', () => {
     expect(texts).toEqual(['ok'])
   })
 
-  it('listModels advertises glm-5.3-flash with the GLM family', async () => {
-    // 对齐 deveco-code-rust 90aeb17d：CodeArts Agent 后端新增 GLM-5.3 Flash
-    // （benefit 免费额度模型，后端注册 id 为全小写 glm-5.3-flash）。
+  it('★ glm-5.3-flash 已从兜底表移除（实测 404，不再是可用模型）', async () => {
+    // ⚠️⚠️ 2026-10-27 改写（原用例断言「目录里有 glm-5.3-flash」）。
+    //
+    // 旧事实（2026-09，对齐 deveco-code-rust 90aeb17d）：它是 benefit 免费额度
+    // 模型，后端注册 id 全小写 `glm-5.3-flash`。
+    //
+    // 新事实（真机实测）：不带头回 `InferHub.002002009.404 The model is not
+    // registered` —— 它已不是当前可调用的模型。
+    // ⚠️ 至于「它是否随福利活动下线」的**归因**留给 PR #156（那边把 benefit
+    //    判定整体改为只认远端集合），本用例只锁「兜底表不再列它」这一事实。
     const models = await makeAdapter().listModels('codearts')
-    expect(models.map((model) => model.id)).toContain('glm-5.3-flash')
-    // 默认模型仍是 GLM-5.2（新增模型不应改变默认模型）。
+    expect(models.map((model) => model.id)).not.toContain('glm-5.3-flash')
+    // 默认模型仍是 GLM-5.2。
     expect(models[0]!.id).toBe('GLM-5.2')
   })
 
@@ -482,19 +705,27 @@ describe('CodeArtsAdapter', () => {
     // 参与 SDK-HMAC-SHA256 签名并随请求发送，否则后端返回
     // InferHub.002002009.404 "model is not registered"。
     // （逆向自 CodeArts Agent IDE mitmproxy 抓包，对齐 deveco-code-rust 90aeb17d。）
-    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      const headers = new Headers(init?.headers)
-      expect(headers.get('maas_type')).toBe('benefit')
-      const auth = headers.get('Authorization') ?? ''
-      expect(auth).toContain('maas_type')
-      return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
-    })
-    const adapter = makeAdapter({ fetchImpl })
-    const texts: string[] = []
-    for await (const chunk of adapter.stream({ ...streamOptions, model: 'glm-5.3-flash' } as never)) {
-      if (chunk.type === 'text-delta') texts.push(chunk.text)
+    // ⚠️ 必须显式声明「远端集合确认过它」：删掉静态兜底表后，首次是否带头
+    // 完全取决于远端 `gateway/config` 集合；不声明就会读到本机真实缓存，
+    // 断言会随开发机的缓存内容漂移。
+    setBenefitMemoryCache(['glm-5.3-flash'])
+    try {
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const headers = new Headers(init?.headers)
+        expect(headers.get('maas_type')).toBe('benefit')
+        const auth = headers.get('Authorization') ?? ''
+        expect(auth).toContain('maas_type')
+        return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+      })
+      const adapter = makeAdapter({ fetchImpl })
+      const texts: string[] = []
+      for await (const chunk of adapter.stream({ ...streamOptions, model: 'glm-5.3-flash' } as never)) {
+        if (chunk.type === 'text-delta') texts.push(chunk.text)
+      }
+      expect(texts).toEqual(['ok'])
+    } finally {
+      setBenefitMemoryCache(undefined)
     }
-    expect(texts).toEqual(['ok'])
   })
 
   it('does not send maas_type for other models', async () => {
@@ -514,7 +745,12 @@ describe('CodeArtsAdapter', () => {
     // → 发消息后调用失败（实测不带该头返回 InferHub.002002009.404
     // "The model is not registered"，带上即成功）。
     // 对齐 deveco-code-rust fb1b4a2 的动态判定。
-    setBenefitMemoryCache([]) // 隔离磁盘缓存，只走静态兜底集合
+    // 2026-10-25 起：**首次请求是否带头**只看「远端集合是否明确列出该模型」
+    // （`isCodeArtsBenefitModelKnown`，判据只剩远端 gateway/config 集合）。
+    // 这里把它放进远端集合，模拟「后端确认它是 benefit 模型」的形态
+    // ⇒ 首次请求即带头并参与签名。
+    // 未确认的形态由后面「404 → 补头」用例覆盖。
+    setBenefitMemoryCache(['deepseek-v4.1-flash'])
     try {
       const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
         const headers = new Headers(init?.headers)
@@ -1424,7 +1660,8 @@ describe('CodeArtsAdapter', () => {
     // DSH 契约：listModels 的结果仅供参考，缺省不构成请求拒绝。
     const resolved = await adapter.resolveModel('codearts', 'GLM-5.2')
     expect(resolved.id).toBe('GLM-5.2')
-    expect(resolved.context?.contextWindow).toBe(202752)
+    // 2026-10-29 双源取证：GLM-5.2 = 202_752（漂移史见 CONTEXT_WINDOWS）。
+    expect(resolved.context?.contextWindow).toBe(202_752)
   })
 
   // ── 目录门控：没有已登录账号就不显示该 provider 的模型 ──
@@ -3238,14 +3475,23 @@ describe('CodeArtsAdapter', () => {
    * 避免与真实失败互相掩盖」。按证据改，不按建议改。
    */
   describe('★ benefit 去头重试必须接上 4xx 通道（issue IKLBSH A6）', () => {
-    it('★ 4xx + InferHub.4004.200：去头重试一次并成功（修复前直接抛 INVALID_REQUEST）', async () => {
-      setBenefitMemoryCache([]) // 只走静态兜底集合 ⇒ deepseek-v4.1-flash 是 benefit 模型
+    it('★ 4xx + InferHub.4004.200：先领一次（领不到）再去头重试一次并成功', async () => {
+      setBenefitMemoryCache(['deepseek-v4.1-flash']) // 远端集合确认 ⇒ 首次即带头
       try {
         const seen: Array<string | null> = []
         let chatCalls = 0
+        let claimCalls = 0
         const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-          if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
             return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          // ⚠️ benefit 领取（opengw）必须先分流出去：它不是 chat 请求，
+          // 混进 chatCalls / seen 会把「恰好两次 chat」的断言放大成三条。
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            claimCalls += 1
+            // 领取失败（非 0000）⇒ 触发原有的去头降级。
+            return new Response(JSON.stringify({ error_code: 'APIG.9999', error_msg: 'no资格' }), { status: 200 })
           }
           chatCalls += 1
           const maasType = new Headers(init?.headers).get('maas_type')
@@ -3267,18 +3513,21 @@ describe('CodeArtsAdapter', () => {
         }
         // ① 真的产出了内容（= 去头重试生效）；
         expect(texts).toEqual(['ok'])
-        // ② 恰好两次请求，且第一次带头、第二次**不带**头；
+        // ② 恰好两次 chat 请求，且第一次带头、第二次**不带**头；
         expect(seen).toEqual(['benefit', null])
         // ③ **只去头一次**：不得因两条通道各试一次而放大成三轮。
         expect(chatCalls).toBe(2)
+        // ④ 降级前先领了一次福利（对标 codearts2api 的 `benefit_auto_claim`）；领不到才降级。
+        expect(claimCalls).toBe(1)
       } finally {
         setBenefitMemoryCache(undefined)
       }
     })
 
-    it('★ 对照：非 benefit 模型上同一报文**不得**触发去头重试（判据不许放宽）', async () => {
-      // `isBenefitModel` 前置条件是**有意**的：去掉它会把任何来源的同名码
-      // 都变成可重试（IKJOF7 的建议 1 未被采纳的理由即此）。
+    it('★ 对照：本轮**没带**该头时同一报文不得触发去头重试（判据不许放宽）', async () => {
+      // `benefitHeaderSent` 前置条件是**有意**的：去掉它会把任何来源的同名码
+      // 都变成可重试。更关键的是「去掉一个根本没带上的头」等于逐字节重发同一
+      // 请求，只会白白用掉唯一一次自愈名额并把它锁死。
       setBenefitMemoryCache([])
       try {
         let chatCalls = 0
@@ -3309,8 +3558,45 @@ describe('CodeArtsAdapter', () => {
       }
     })
 
-    it('★ 对照：4xx 报文**不含**该码时不得触发去头重试（判据不得放宽成「凡 4xx 都重试」）', async () => {
+    it('★ SSE 通道的孪生对照：本轮没带该头时报 4004.200 不得重试、也不得去领取', async () => {
+      // 本机真实形态（2026-10-26 复现）：另有一个压缩插件会给 CodeArts 请求
+      // **补** `maas_type: benefit`，而我们的请求本身没带该头。此时上游回的
+      // 4004.200 与我们无关 —— 「去掉一个没带上的头」是逐字节相同的重发，
+      // 白白用掉唯一一次自愈名额，还会同时锁死补头方向。
       setBenefitMemoryCache([])
+      try {
+        let chatCalls = 0
+        let claimCalls = 0
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input)
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            claimCalls += 1
+            return new Response(JSON.stringify({ error_code: '0000', error_msg: '' }), { status: 200 })
+          }
+          chatCalls += 1
+          return new Response(
+            'data:{"text":"[DONE]","error_code":"InferHub.4004.200","error_msg":"benefit not found"}\n\n',
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        let thrown: unknown
+        try {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4-flash' } as never)) { /* 不应产出 */ }
+        } catch (error) {
+          thrown = error
+        }
+        expect((thrown as LlmError).code).toBe('BENEFIT_NOT_FOUND')
+        // 一次请求、零次领取：去头/领取都**不该**在这里发生。
+        expect(chatCalls).toBe(1)
+        expect(claimCalls).toBe(0)
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★ 对照：4xx 报文**不含**该码时不得触发去头重试（判据不得放宽成「凡 4xx 都重试」）', async () => {
+      setBenefitMemoryCache(['deepseek-v4.1-flash'])
       try {
         let chatCalls = 0
         const maasTypes: Array<string | null> = []
@@ -3321,8 +3607,10 @@ describe('CodeArtsAdapter', () => {
           chatCalls += 1
           maasTypes.push(new Headers(init?.headers).get('maas_type'))
           // 另一个 400：同样带 benefit 头，但**不是** benefit-not-found。
+          // ⚠️ 也不能用 `InferHub.002002009.404` —— 它现在是**另一个**自愈信号
+          // （补头方向），会让本用例测到的就不是「判据有没有放宽」了。
           return new Response(
-            JSON.stringify({ error_code: 'InferHub.002002009.404', error_msg: 'model is not registered' }),
+            JSON.stringify({ error_code: 'InferHub.9999.400', error_msg: 'boom' }),
             { status: 400, headers: { 'content-type': 'application/json' } },
           )
         })
@@ -3337,15 +3625,21 @@ describe('CodeArtsAdapter', () => {
       }
     })
 
-    it('★ SSE 200 通道的既有行为不变（本次只加 4xx 那条腿）', async () => {
+    it('★ SSE 200 通道：先领一次（领不到）再去头重试，chat 仍恰好两次', async () => {
       // 回归守卫：SSE 形态（HTTP 200 + 内嵌 error_code）原先就能去头重试，
       // 改动后必须仍然如此（且同样只去头一次）。
-      setBenefitMemoryCache([])
+      setBenefitMemoryCache(['deepseek-v4.1-flash'])
       try {
         const seen: Array<string | null> = []
+        let claimCalls = 0
         const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-          if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
             return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            claimCalls += 1
+            return new Response(JSON.stringify({ error_code: 'APIG.9999', error_msg: 'no资格' }), { status: 200 })
           }
           const maasType = new Headers(init?.headers).get('maas_type')
           seen.push(maasType)
@@ -3364,6 +3658,169 @@ describe('CodeArtsAdapter', () => {
         }
         expect(texts).toEqual(['ok'])
         expect(seen).toEqual(['benefit', null])
+        // 降级前领了一次（与 4xx 通道同一门禁，只领一次）。
+        expect(claimCalls).toBe(1)
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    /**
+     * ★ 领取成功 → **保持** `maas_type: benefit` 重放（本次改动的正例）。
+     *
+     * 依据：codearts2api README（原文核实）「限时福利必须先领取才能调用；领取幂等」。
+     * 领到之后账号就有福利包了 ⇒ 该走免费额度通道；若这时反而去头，用户就被
+     * 推到积分通道上 —— 那正是不足 14 记录的静默资损。
+     */
+    it('★ 领取成功 → 带头重放并成功（绝不去头，且只领一次）', async () => {
+      setBenefitMemoryCache(['deepseek-v4.1-flash'])
+      try {
+        const seen: Array<string | null> = []
+        let claimCalls = 0
+        let headedChats = 0
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            claimCalls += 1
+            // ✅ 领取成功：响应体 `error_code === '0000'`
+            return new Response(JSON.stringify({ error_code: '0000', error_msg: '' }), { status: 200 })
+          }
+          const maasType = new Headers(init?.headers).get('maas_type')
+          seen.push(maasType)
+          if (maasType !== 'benefit') {
+            // ⚠️ 领到之后仍被去头 ⇒ 资损回归，直接失败并说明是哪一次。
+            throw new Error(`领到福利后第 ${seen.length} 次 chat 丢了 maas_type 头（应带头重放）`)
+          }
+          headedChats += 1
+          if (headedChats === 1) {
+            // 第一次：还没领，上游按实测回 benefit-not-found。
+            return new Response(
+              'data:{"text":"[DONE]","error_code":"InferHub.4004.200","error_msg":"benefit not found"}\n\n',
+              { status: 200, headers: { 'content-type': 'text/event-stream' } },
+            )
+          }
+          // 第二次：领取后重放 ⇒ 正常出流。
+          return new Response('data: {"choices":[{"delta":{"content":"after-claim-ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        const texts: string[] = []
+        for await (const chunk of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) {
+          if (chunk.type === 'text-delta') texts.push(chunk.text)
+        }
+        // ① 正文来自「领到后带头重放」；② 两次 chat **都带头**（从未降级）；③ 只领一次。
+        expect(texts).toEqual(['after-claim-ok'])
+        expect(seen).toEqual(['benefit', 'benefit'])
+        expect(claimCalls).toBe(1)
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    /**
+     * ★ **未在远端集合确认的模型先发常规请求**。
+     *
+     * 判据只剩远端 `gateway/config` 集合（官方内核同款）。本仓库曾有一张静态
+     * 兜底表，写于 2026-09-23，依据是**当时**的实测；它不会随后端演进更新，
+     * 而后端已把 `deepseek-v4.1-flash` 改按常规 `0.18x` 模型下发：不带该头正常
+     * 出流，带上反而恒定 `InferHub.4004.200 benefit not found`（账号无 benefit 包）。
+     *
+     * 旧实现因此**每次都先带错头**，再靠 4004 通道去头重试 —— 用户首条消息报
+     * 「codearts: benefit not found」的直接原因（本轮报障）。表已删除。
+     *
+     * ⇒ 远端集合**未确认**该模型时先发常规请求；只有上游回
+     * `InferHub.002002009.404`（该模型只按 benefit 通道注册）才补头重试一次。
+     */
+    it('★ 未在远端集合确认：先发常规请求，404 未注册 → 补头重试成功', async () => {
+      setBenefitMemoryCache([]) // 远端集合未确认 ⇒ 首次请求不许带头
+      try {
+        const seen: Array<string | null> = []
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          const maasType = new Headers(init?.headers).get('maas_type')
+          seen.push(maasType)
+          if (maasType === null) {
+            // 常规通道：该模型只按 benefit 通道注册 ⇒ 200 + 内嵌 404。
+            return new Response(
+              'data:{"text":"[DONE]","error_code":"InferHub.002002009.404","error_msg":"The model is not registered, please request other model"}\n\n',
+              { status: 200, headers: { 'content-type': 'text/event-stream' } },
+            )
+          }
+          return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        const texts: string[] = []
+        for await (const chunk of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) {
+          if (chunk.type === 'text-delta') texts.push(chunk.text)
+        }
+        expect(texts).toEqual(['ok'])
+        // 首次**不带**、补头后才带 —— 与「4004 去头」方向恰好相反。
+        expect(seen).toEqual([null, 'benefit'])
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    /**
+     * ★ 补头与去头各只一次 ⇒ 最多三轮后收敛，不得来回乒乓。
+     *
+     * 「账号没有 benefit 包」+「模型只按 benefit 通道注册」同时成立时无解
+     * （任何一次请求都不通），此时必须**如实抛出**，而不是无限重试把界面拖死。
+     */
+    it('★ 补头 / 去头各只一次：不得来回乒乓，最终如实抛错', async () => {
+      setBenefitMemoryCache([])
+      try {
+        const seen: Array<string | null> = []
+        let claimCalls = 0
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            claimCalls += 1
+            return new Response(JSON.stringify({ error_code: 'APIG.9999', error_msg: 'no资格' }), { status: 200 })
+          }
+          const maasType = new Headers(init?.headers).get('maas_type')
+          seen.push(maasType)
+          const code = maasType === null ? 'InferHub.002002009.404' : 'InferHub.4004.200'
+          const msg = maasType === null ? 'The model is not registered' : 'benefit not found'
+          return new Response(
+            `data:{"text":"[DONE]","error_code":"${code}","error_msg":"${msg}"}\n\n`,
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        let thrown: unknown
+        try {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) { /* 不应产出 */ }
+        } catch (error) {
+          thrown = error
+        }
+        // 常规 → 补头 → 去头（三轮）后收敛。
+        expect(seen).toEqual([null, 'benefit', null])
+        /**
+         * ⚠️⚠️ **未确认的模型不得领取**（2026-10-27 审计 P1 修，期望值由 1 改为 0）。
+         *
+         * 本用例的 `setBenefitMemoryCache([])` 表示「远端确认**没有** benefit 模型」
+         * ⇒ `benefitHeaderCertain === false`。而 `InferHub.4004.200` 这个码**不区分**：
+         * ① 该账号没有 benefit 包；② 这个模型根本不该带该头（PR 自己取证过：
+         * 把该头送给非 benefit 模型就回 `4004.200`）。
+         *
+         * 于是这条「补头方向带出来的 4004.200」如果去领取，就是**在无关场景里
+         * 打一次写请求**（对抗审计实测：一次 `stream()` 里 4 次 chat + 1 次写）。
+         *
+         * ⇒ 修法：领取的前置条件收紧成「该模型由远端 `gateway/config` 确认过」
+         *   （或本进程内补头成功过）。未确认时直接走既有的去头降级 —— 只发读请求。
+         *   序列不变（逃→补→去→抛），只是不再有那次写。
+         */
+        expect(claimCalls, '★ 未确认模型不得触发领取（写操作）').toBe(0)
+        // 如实抛出「未注册」——此时已无可用手段。
+        expect((thrown as LlmError).code).toBe('MODEL_NOT_REGISTERED')
       } finally {
         setBenefitMemoryCache(undefined)
       }
@@ -3467,3 +3924,239 @@ describe('CodeArtsAdapter 残缺目录自愈（★ IKJVTF I3）', () => {
     expect(calls).toBe(afterFirst)
   })
 })
+
+  /**
+   * ★★ **2026-10-27 审计修的四条不变式**（每条都对应一处实测击穿）。
+   *
+   * 这一组钉的是「自愈状态机」的**边界**：写操作的前置条件、跨请求去重、
+   * 进程内学习、以及「只领一次」这条原先**完全没被守卫**的不变式
+   * （对抗审计实测：删掉那条门禁后 115 条用例全绿，而探针变成无限循环）。
+   */
+  describe('★★ benefit 自愈的写操作边界（2026-10-27 审计修）', () => {
+    it('★★★ 领取恒成功 + 上游恒 4004.200 ⇒ 只领一次、且必然收敛（钉住「不乒乓」）', async () => {
+      /**
+       * ⚠️⚠️ 这是本轮**最关键的守卫**：对抗审计把 `if (!benefitClaimAttempted)`
+       * 改成 `if (true)` 后，PR 原有的 115 条用例**全绿**，而同配置的探针
+       * 变成「chat+claim 无限循环」（4s 超时）。
+       *
+       * 根因：`claimBenefitOnce()` 成功 ⇒ `continue` 保持头重放 ⇒ 又 4004.200
+       * ⇒ 若门禁被去掉就**再领一次** ⇒ 永远出不去。也就是说「各只一次」这条
+       * 被写进 PR 描述的不变式，原先**一条用例都没钉住**。
+       *
+       * ⇒ 本用例：领取**恒成功**、上游**恒** 4004.200，断言
+       *   ① chat 有界（≤3）；② 领取**恰好一次**；③ 最终如实抛错。
+       */
+      setBenefitMemoryCache(['deepseek-v4.1-flash'])
+      try {
+        const seen: Array<string | null> = []
+        let claimCalls = 0
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            claimCalls += 1
+            // ⚠️ 领取**永远成功** —— 这是让「无门禁版本」无限循环的关键设定。
+            return new Response(JSON.stringify({ error_code: '0000' }), { status: 200 })
+          }
+          const maasType = new Headers(init?.headers).get('maas_type')
+          seen.push(maasType)
+          // ⚠️ 上游**永远**回 4004.200（无论带不带头）⇒ 逼出自愈上限。
+          return new Response(
+            'data:{"text":"[DONE]","error_code":"InferHub.4004.200","error_msg":"benefit not found"}\n\n',
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        let thrown: unknown
+        try {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) { /* 不应产出 */ }
+        } catch (error) {
+          thrown = error
+        }
+        expect(
+          claimCalls,
+          '★★★ 领取是**写操作**，必须**恰好一次**；无门禁版本会无限循环（审计实测 4s 超时）',
+        ).toBe(1)
+        expect(seen.length, '★ 自愈必须收敛（chat 有界），不得乒乓').toBeLessThanOrEqual(3)
+        expect((thrown as LlmError).code).toBe('BENEFIT_NOT_FOUND')
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★★ 3 条并发同时 4004.200 ⇒ 只发 1 次领取（写操作必须跨请求去重）', async () => {
+      /**
+       * ⚠️ 修前 `benefitClaimAttempted` 是 `stream()` 局部的 ⇒ 3 条并发各领一次
+       * （对抗审计实测 `claims=3`）。而 DSH 一轮会并发发主回复 + 标题 + 压缩
+       * 三条请求，标题/压缩是后台的、用户看不到它们的失败，但**写请求照发**。
+       */
+      setBenefitMemoryCache(['deepseek-v4.1-flash'])
+      try {
+        let claimCalls = 0
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            claimCalls += 1
+            // ⚠️ 故意慢一点，让三条请求真正重叠（否则测不出「复用同一个 Promise」）
+            await new Promise((resolve) => setTimeout(resolve, 10))
+            return new Response(JSON.stringify({ error_code: 'APIG.9999' }), { status: 200 })
+          }
+          return new Response(
+            'data:{"text":"[DONE]","error_code":"InferHub.4004.200","error_msg":"benefit not found"}\n\n',
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        const run = async (): Promise<void> => {
+          try {
+            for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) { /* noop */ }
+          } catch { /* 三条都应失败，不影响断言 */ }
+        }
+        await Promise.all([run(), run(), run()])
+        expect(
+          claimCalls,
+          '★★ 并发去重失效 ⇒ 一轮对话发 3 次写请求（标题/压缩是后台请求，用户看不到）',
+        ).toBe(1)
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★★ 远端集合取不到时，补头成功一次后**下一轮直接带头**（不得每条请求都付两轮）', async () => {
+      /**
+       * ⚠️ 修前 `benefitHeaderPromoted` 是 `stream()` 局部变量 ⇒ 远端集合为空时
+       * （本机常态：`gateway/config` 回 `4000 invalid channel`）benefit-only 模型
+       * **每条请求**都要「无头 404 → 补头 → 成功」两次 chat。
+       * 实测：连续两次 `stream()` 头序列 `[null,'benefit',null,'benefit']`；
+       * 一轮 3 条并发 ⇒ **6 次上游**。修前（有静态表）同场景只需 1 次。
+       */
+      setBenefitMemoryCache([])   // ← 远端「确认无」⇒ 首轮一定不带头
+      try {
+        const seen: Array<string | null> = []
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            return new Response(JSON.stringify({ error_code: 'APIG.9999' }), { status: 200 })
+          }
+          const maasType = new Headers(init?.headers).get('maas_type')
+          seen.push(maasType)
+          if (maasType === null) {
+            // 无头 ⇒ 未注册（逼出补头方向）
+            return new Response(
+              'data:{"text":"[DONE]","error_code":"InferHub.002002009.404","error_msg":"not registered"}\n\n',
+              { status: 200, headers: { 'content-type': 'text/event-stream' } },
+            )
+          }
+          // 带头 ⇒ 成功出流
+          return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        const first = async (): Promise<void> => {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) { /* noop */ }
+        }
+        await first()
+        expect(seen, '首轮：无头 → 补头（这是远端集合缺失时的正常代价）').toEqual([null, 'benefit'])
+        seen.length = 0
+        await first()
+        expect(
+          seen,
+          '★★ 第二轮仍从「无头」开始 ⇒ 每条请求都多付一次上游往返（进程内学习没生效）',
+        ).toEqual(['benefit'])
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★★ 4xx 判据必须优先读结构化 error_code：正文回显同串不得触发补头', async () => {
+      /**
+       * ⚠️ 修前 `isModelNotRegisteredBody` 是裸 `body.includes('InferHub.002002009.404')`
+       * ⇒ 对抗审计构造了一个**与「未注册」无关**的 400：正文里回显了用户内容，
+       * 而用户内容恰好含这串字符 ⇒ 也命中 ⇒ 多打一次上游，还把 `maas_type`
+       * 送给一个非 benefit 模型。
+       *
+       * ⇒ 现在：能解析出结构化 `error_code` 时**只认全等**（与 SSE 通道同判据）；
+       * 裸子串只作「解析不出结构化字段」时的兜底。
+       *
+       * ⚠️ 本用例的关键是 `error_code` **存在但不等于**该码，且正文**仍含**该串 ——
+       * 只有这样才能区分「全等优先」与「裸子串」两种实现（我第一版用「无 error_code
+       * 字段」的报文，两种实现都给 true ⇒ **无牙**，变异实测全绿）。
+       */
+      setBenefitMemoryCache([])
+      try {
+        const seen: Array<string | null> = []
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            return new Response(JSON.stringify({ error_code: 'APIG.9999' }), { status: 200 })
+          }
+          seen.push(new Headers(init?.headers).get('maas_type'))
+          // ⚠️ 结构化码是「别的东西」，但 error_msg 里回显了未注册码的那串字符。
+          return new Response(JSON.stringify({
+            error_code: 'InferHub.9999.400',
+            error_msg: 'invalid tool call arguments: {"q":"InferHub.002002009.404"}',
+          }), { status: 400, headers: { 'content-type': 'application/json' } })
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        try {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'glm-5.3' } as never)) { /* noop */ }
+        } catch { /* 预期抛出 */ }
+        expect(
+          seen,
+          '★ 正文回显的同串字符串不得被当成「模型未注册」（结构化 error_code 优先）',
+        ).toEqual([null])
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+
+    it('★★ 未确认模型被补头带出 4004.200 时不得领取（写操作只对确认过的模型开放）', async () => {
+      /**
+       * ⚠️ 对抗审计实测：一个从未被远端确认的模型（手填 / 打错大小写 / 已下线）
+       * 在一次 `stream()` 里打出 **4 次 chat + 1 次领取**。
+       *
+       * 而 `4004.200` **不区分**「该账号没有 benefit 包」与「这个模型不该带该头」
+       * ⇒ 在「模型根本不存在」这种与福利无关的场景里打一次写请求。
+       */
+      setBenefitMemoryCache([])   // ← 一个模型都没确认
+      try {
+        let claimCalls = 0
+        const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input)
+          if (url.startsWith(QUEUE_STATUS_BASE)) {
+            return new Response('{"status":"working"}', { status: 200, headers: { 'content-type': 'application/json' } })
+          }
+          if (url === CODEARTS_BENEFIT_CLAIM_URL) {
+            claimCalls += 1
+            return new Response(JSON.stringify({ error_code: '0000' }), { status: 200 })
+          }
+          const maasType = new Headers(init?.headers).get('maas_type')
+          const code = maasType === null ? 'InferHub.002002009.404' : 'InferHub.4004.200'
+          return new Response(
+            `data:{"text":"[DONE]","error_code":"${code}","error_msg":"x"}\n\n`,
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        })
+        const adapter = makeAdapter({ fetchImpl })
+        try {
+          for await (const _ of adapter.stream({ ...streamOptions, model: 'some-paid-or-typo-model' } as never)) { /* noop */ }
+        } catch { /* 预期抛出 */ }
+        expect(
+          claimCalls,
+          '★★ 模型未被远端确认却去领取 ⇒ 在与福利无关的场景（打错 id / 模型下线）打一次写请求',
+        ).toBe(0)
+      } finally {
+        setBenefitMemoryCache(undefined)
+      }
+    })
+  })

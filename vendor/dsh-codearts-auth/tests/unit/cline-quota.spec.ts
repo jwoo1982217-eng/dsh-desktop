@@ -32,7 +32,7 @@ const LIMITS_FIXTURE = {
 /** 凭据形态与实测一致（`account_id` 是 `usr-…`、令牌带 `workos:` 前缀）。 */
 const CRED: ClineCredential = {
   access_token: 'workos:eyJhbGciOiJSUzI1NiIs',
-  refresh_token: 'tmgEeM2rd9ybYoWpXl8JqUfvK',
+  refresh_token: 'synthetic-cline-refresh-fixture-0000',
   account_id: 'usr-01M3BCV4FYCGJKAWD3MJG3DBQM',
   email: 'ijetlee@163.com',
 }

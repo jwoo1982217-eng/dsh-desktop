@@ -9,6 +9,8 @@ export interface RotationRequest {
     sources?: Map<object, Map<string, string>>;
 }
 export declare function rotationRequest(provider: string): RotationRequest | undefined;
+/** 目录与控制面读取不继承推理请求的选号锁、余额资格或失败换号上下文。 */
+export declare function withoutAccountRotation<T>(read: () => T): T;
 /** 在迭代器的每一步恢复上下文，覆盖准备后的 stream、异常与取消清理。 */
 export declare function rotatingStream<T>(provider: string, model: string, create: () => AsyncIterable<T>, signal?: AbortSignal): AsyncIterable<T>;
 /** 按稳定 ID 续接用户排列；已删除的上次账号不参与，新增账号自然进入环。 */

@@ -33,6 +33,7 @@
  * 文件持久化惯例）。
  */
 import type { Context } from '@deepseek-ai/cordis';
+import Schema from '@deepseek-ai/schemastery';
 import type { ProviderAccountEntry } from './types.js';
 /** Jet Hub schema namespace（老契约的 settings 命名空间名）。 */
 export declare const JET_HUB_NS = "jet-hub";
@@ -99,6 +100,18 @@ export type AggregateOrderMap = Record<string, string[]>;
 export type AggregateOrderMode = 'expiry' | 'manual';
 /** 各 provider 的「锁定永久积分」开关：provider id → 已锁定。 */
 export type PermanentLockMap = Record<string, boolean>;
+/**
+ * Jet Hub 的**唯一**入口位置。
+ *
+ * 两个取值严格互斥，任一时刻只有一个入口存在（见 {@link JetHubState.panelEntry}）。
+ * 用字符串枚举而不是布尔，是为了将来加第三个位置时只需在 {@link PANEL_ENTRY_VALUES}
+ * 里多一项 + 一条渲染分支，不动文档形状、不写迁移。
+ */
+export type PanelEntry = 'sidebar' | 'settings';
+/** {@link PanelEntry} 的合法取值，也是 RPC 写入侧的校验表（唯一真源）。 */
+export declare const PANEL_ENTRY_VALUES: readonly PanelEntry[];
+/** 缺键 / 脏值 / 老文档迁移时的默认入口。 */
+export declare const DEFAULT_PANEL_ENTRY: PanelEntry;
 /** 持久化文档结构（两种后端共用）。 */
 export interface JetHubState {
     accounts: ProviderAccountEntry[];
@@ -164,6 +177,19 @@ export interface JetHubState {
      */
     gatewayEnabled?: boolean;
     /**
+     * 「允许局域网访问」开关（2026-10-20）：`true` = 网关绑 `0.0.0.0`（全部网卡，
+     * 局域网可达）；`false`/缺键 = 只绑回环或 env 配置的本机地址。
+     *
+     * ⚠️ 缺键语义为**关闭**（与 `gatewayEnabled` 的「缺键即启用」**刻意相反**）：
+     * 暴露面变大必须是用户的显式选择——老文档没有这个键、被手工改坏、或旧版本
+     * 代码整体重写时丢了本键，都必须回到「只绑回环」的安全默认。丢键的后果仅是
+     * 用户重新打开一次开关（可逆），而反方向的丢键（静默回到全网卡监听）是
+     * 未授权暴露。
+     *
+     * ⚠️ 与 `gatewayEnabled` 同级、可以住在这里：丢键后果可逆且用户可见。
+     */
+    gatewayAllowLan?: boolean;
+    /**
      * 渠道原生搜索总开关（`false` = 全部搜索回官方 provider）。
      *
      * 「原生搜索」指支持它的渠道（CodeBuddy / WorkBuddy）用**自己后端的搜索接口**
@@ -178,6 +204,38 @@ export interface JetHubState {
      * 默认开启才符合「装上就能用」）。
      */
     nativeWebSearchEnabled?: boolean;
+    /**
+     * 「ZCode 会话负载均衡」开关（{@link sanitizeSessionBalanceEnabled}）。
+     *
+     * 语义：**开** = ZCode 多账号按 DSH sessionId 做会话亲和（同一会话**优先**
+     * 落同一账号；账号今日负载达阈值后会被沉底、正在跑的会话会迁移一次），没有
+     * sessionId 的请求随机分摊；**关** = 回到「手动顺序首个可用账号」的既有语义。
+     *
+     * ⚠️ 与 `nativeWebSearchEnabled` 同级、**可以**住在这里：老版本代码整体
+     * 重写 `state.json` 时丢掉本键，后果仅是**回到手动顺序**，用户再开一次即可
+     * —— 没有任何不可逆后果。缺键语义为**启用**（2026-10-30 用户要求的默认）。
+     */
+    sessionBalanceEnabled?: boolean;
+    /**
+     * 「面板入口」：Jet Hub 的**唯一**入口位置（{@link PanelEntry}）。
+     *
+     * 两个取值**严格互斥**，任一时刻只有一个入口存在：
+     * - `'sidebar'`（默认）= 主导航里多一行，点它把 Jet Hub 渲染进中央主面板；
+     *   `settings.section` 那一节随之注销。
+     * - `'settings'` = 只剩「设置 → 插件 → Jet Hub」；主导航那一行随之注销。
+     *
+     * ⚠️ **必须住宿主**，不能放浏览器 `localStorage`：Web 侧的 origin 是
+     * `127.0.0.1:<随机端口>`，每次启动端口都变 ⇒ `localStorage` 会随旧 origin
+     * 一起被抛弃，表现为「改掉的入口下次启动又变回来了」。而它又与
+     * `gatewayEnabled` 同级：老版本代码整体重写 `state.json` 时会丢掉本键，
+     * 后果仅仅是**入口回到默认「仅侧栏」**（可逆，用户再改一次即可），没有不可逆后果。
+     *
+     * 缺键语义为 `'sidebar'`：老用户升级后行为与升级前一致（升级前默认就显示那一行）。
+     *
+     * ⚠️ **本键取代了旧的布尔 `sidebarEntryEnabled`**：老文档里只有旧键时按
+     * {@link sanitizePanelEntry} 迁移（只有明确 `false` 才映射成 `'settings'`）。
+     */
+    panelEntry?: PanelEntry;
     /**
      * 供应商自定义显示顺序（「供应商开关」弹窗的拖拽排序，2026-10-06）。
      *
@@ -291,6 +349,48 @@ export interface JetHubStore {
     save(state: JetHubState): Promise<void>;
 }
 /**
+ * 持久化文档的 schema（两种后端共用）。
+ *
+ * ⚠️ 必须是 schemastery（`plainSchema` 会调它的 `toJSON()`）。
+ *
+ * ⚠️ **导出仅供测试**：老契约后端（SettingsStore，**≤0.1.6 的
+ * `settings.register` 契约**）的 `scope.get()` 按「schema defaults →
+ * registrant 的 base → 用户文档」三层解析，也就是**会过一遍本 schema**；
+ * 而单测里那些 `scope.get()` 替身默认不过。`tests/unit/jet-hub-store.spec.ts`
+ * 的「老契约后端」组用本导出复刻真实行为 —— 否则「schema 的 `.default()` 把
+ * 迁移短路」这类缺陷会整组躲过去（2026-10-24 复核 C1 实测如此）。
+ *
+ * ⚠️ 上面的版本限定是必要的：0.1.7 起 `settings` 换成 `SettingsForms`（没有
+ * `register`），本插件在那里走 FileStore，**不经过**本 schema。
+ *
+ * 生产代码不要直接用它做校验，走 sanitize 函数。
+ */
+export declare const jetHubSchema: Schema<Schemastery.ObjectS<NoInfer<{
+    accounts: Schema<any[], any[], "defined">;
+    disabledModels: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
+    loomyPermanentLocked: Schema<boolean, boolean, "defined">;
+    gatewayEnabled: Schema<boolean, boolean, "defined">;
+    gatewayAllowLan: Schema<boolean, boolean, "defined">;
+    nativeWebSearchEnabled: Schema<boolean, boolean, "defined">;
+    sessionBalanceEnabled: Schema<boolean, boolean, "defined">;
+    panelEntry: Schema<string, string, "plain">;
+    providerOrder: Schema<string[], string[], "defined">;
+    minimaxXff: Schema<string, string, "defined">;
+    providerClosed: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
+}>>, Schemastery.ObjectT<NoInfer<{
+    accounts: Schema<any[], any[], "defined">;
+    disabledModels: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
+    loomyPermanentLocked: Schema<boolean, boolean, "defined">;
+    gatewayEnabled: Schema<boolean, boolean, "defined">;
+    gatewayAllowLan: Schema<boolean, boolean, "defined">;
+    nativeWebSearchEnabled: Schema<boolean, boolean, "defined">;
+    sessionBalanceEnabled: Schema<boolean, boolean, "defined">;
+    panelEntry: Schema<string, string, "plain">;
+    providerOrder: Schema<string[], string[], "defined">;
+    minimaxXff: Schema<string, string, "defined">;
+    providerClosed: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
+}>>, "plain">;
+/**
  * 归一化「本机 OpenAI 网关」开关。
  *
  * 判据与 `sanitizePermanentLocks` 相反：**只有显式 `false` 才算停用**，
@@ -301,6 +401,16 @@ export interface JetHubStore {
  * 任何一次读取失败都变成「网关被静默关闭」，而用户根本不知道自己关过它。
  */
 export declare function sanitizeGatewayEnabled(raw: unknown): boolean;
+/**
+ * 归一化「允许局域网访问」开关。
+ *
+ * ⚠️ 方向与 {@link sanitizeGatewayEnabled} **刻意相反**：只有显式 `true` 才算
+ * 打开，其余（缺键 / `false` / 字符串 / 对象 / 数组）一律按**关闭**处理。
+ * 理由：它把网关暴露给整个网络，丢失/脏值必须回到「只绑回环」的安全默认——
+ * 反过来（缺键即开启）会让任何一次读取失败都变成**未授权暴露**，而用户对此
+ * 毫无知觉。
+ */
+export declare function sanitizeGatewayAllowLan(raw: unknown): boolean;
 /**
  * 归一化「渠道原生搜索」总开关。
  *
@@ -314,6 +424,34 @@ export declare function sanitizeGatewayEnabled(raw: unknown): boolean;
  * 要 API Key。
  */
 export declare function sanitizeNativeWebSearchEnabled(raw: unknown): boolean;
+/**
+ * 归一化「ZCode 会话负载均衡」开关（{@link JetHubState.sessionBalanceEnabled}）。
+ *
+ * 缺键语义为**启用**（2026-10-30 用户要求的默认方向）：老文档没有本键、或被
+ * 老版本代码整体重写时丢键，都回到「会话亲和 + 随机分摊」开启态 —— 与
+ * {@link sanitizeNativeWebSearchEnabled} 的判据同构（`raw !== false`）。
+ *
+ * ⚠️ 字符串 `'false'` **不算** `false`（与 panelEntry 那条同款）：那是脏数据，
+ * 不是用户意图。
+ */
+export declare function sanitizeSessionBalanceEnabled(raw: unknown): boolean;
+/**
+ * 归一化「面板入口」（{@link JetHubState.panelEntry}）。
+ *
+ * 判据两层，顺序不能反：
+ * 1. `raw` 命中 {@link PANEL_ENTRY_VALUES} 就原样返回（新文档 / 合法值优先）；
+ * 2. 否则看老布尔 `legacySidebarEnabled` —— **只有显式 `false`** 才算
+ *    `'settings'`，其余（`undefined` / `true` / 字符串 / 对象 / 数组）一律
+ *    回 {@link DEFAULT_PANEL_ENTRY}。
+ *
+ * ⚠️ 方向不能反。文档缺失、被手工编辑成脏值、或老版本代码整体重写时丢了本键，
+ * 都必须**回到默认「仅侧栏」** —— 反过来会让任何一次读取失败都变成「侧栏入口
+ * 被静默藏起来」，而用户从来没改过它。
+ *
+ * ⚠️ 字符串 `'false'` **不算** `false`：它是脏数据，不是用户意图。这一条与
+ * {@link sanitizeNativeWebSearchEnabled} 的判据同构（那边也是 `raw !== false`）。
+ */
+export declare function sanitizePanelEntry(raw: unknown, legacySidebarEnabled?: unknown): PanelEntry;
 /**
  * 归一化供应商自定义显示顺序（{@link JetHubState.providerOrder}）。
  *

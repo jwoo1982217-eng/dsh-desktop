@@ -227,6 +227,26 @@ export const CANONICAL_OVERRIDES: Readonly<Record<string, Readonly<Record<string
       // 对外 id（`normalizeNameKey('Qwen 3.8 Flash')`）→ 三家在用的既有规范键。
       'qwen-3-8-flash': 'qwen3-8-flash',
     }),
+    /**
+     * Magicrew（超级麦吉国内站，2026-10-29，参与聚合）。
+     *
+     * ⚠️ **只有一条**，成因与 accio **相反**（那边是「展示名有空格」，这边是
+     * 「**上游 id 自带连字符**」）：magicrew 走默认的 `id` 通道，而它的 id 是
+     * `qwen-3.8-flash`（**带**连字符）⇒ `normalizeModelKey` 只转点号 ⇒
+     * 得 `qwen-3-8-flash`；而 loomy / trae / qoder 的 id 是 `qwen3.8-flash`
+     *（**不带**）⇒ 得 `qwen3-8-flash`。
+     *
+     * ⇒ **同一模型两个键** ⇒ 被拆成两个虚拟模型 ⇒ 用户在聚合的
+     * 「Qwen3.8-Flash 轮换列表」里**看不到 magicrew**（症状**静默**：它只是
+     * 不在候选表里）。与 accio 那条同因同形，只是成因反过来。
+     *
+     * ⚠️ 其余 26 个**不登记**：它们的键本来就与既有渠道一致（已逐个跑过
+     * `normalizeModelKey` / `canonicalKeyFor`，`via` 全是 `id` 且键与 buddy 等家
+     * 逐字相同），加补丁是多此一举，且会遮住将来真实的对不上。
+     */
+    magicrew: Object.freeze({
+      'qwen-3.8-flash': 'qwen3-8-flash',
+    }),
   })
 
 /**

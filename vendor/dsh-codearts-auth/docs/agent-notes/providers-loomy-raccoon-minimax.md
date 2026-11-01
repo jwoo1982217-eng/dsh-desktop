@@ -634,7 +634,7 @@ mode  = CFB, padding = NoPadding
 因为 `100002 params_invalid_error: param phone invalid` **无法区分**
 「号码格式错」与「该区号不支持」，不做未验证的猜测。
 
-### 11. ⚠️ `tags` 里的 `vision` **不是**图片能力契约（真实缺陷，用户 2026-10-03 报障）
+### 11. ⚠️ 图片能力：**默认支持**，只禁真正的纯文本模型（2026-10-03 / 10-21 两次漏判）
 
 **症状**：给 `sn-deepseek-v4-1-flash`（DeepSeek-V4.1-Flash）发图，模型回
 「无法读取图片 / 不支持图片」。
@@ -672,18 +672,35 @@ mode  = CFB, padding = NoPadding
 | `sn-kimi-k3` | ✅ | ✅ 1/1 |
 | `sn-glm-5-3` | ✅ | ⚠️ **1/3**（provider 侧节点不一致，见下） |
 
-⇒ **6 个可见模型全部能读图**。`tags` 的真实用途是**客户端「Raccoon-Auto 选模」的
+⇒ **6 个兜底可见模型全部能读图**（2026-10-21 远端新增的
+`sn-deepseek-v4-1-flash-1017` 同样实测 200 / 四色全对，见下）。`tags` 的真实用途是**客户端「Raccoon-Auto 选模」的
 偏好标签**（`TASK_TAG_PATTERNS` 给消息打 vision 标记后挑一个带 `vision` 的模型），
 它回答的是「该模型适不适合处理这类任务」，**不是**「能不能吃图」。
 
-**修法**（与 `buddy-adapter.ts` 的 `IMAGE_CAPABILITY_OVERRIDES` 同构）：
-`RACCOON_IMAGE_CAPABILITY_OVERRIDES` 白名单 + `raccoonSupportsImage(id, tags)`，
+**修法（2026-10-21 策略翻转：默认支持 + 纯文本黑名单）**：
+判据是 `raccoonSupportsImage(modelId)` —— **默认返回 `true`**（声明
+`['text','image']`），只把实测确认的纯文本模型登记到 `RACCOON_TEXT_ONLY_MODELS`
+里**显式禁掉**；判定内核 `raccoonSupportsImageWith(textOnly, id)` 入参化，
+否则空集合下「纯文本被禁」那条分支永远测不到。
 **两条路径都要改** —— 远端解析（`raccoon-auth.ts`）与本地兜底表（`raccoon-product.ts`）。
-⚠️ 兜底表与远端判定是**两个真相源**，用单测「兜底表的图片能力与远端实测 tags 判定
-逐条一致」锁死，防它们悄悄分叉（同 Qoder「两处等待逻辑必须共用同一实现」的教训）。
+⚠️ 兜底表与远端判定是**两个真相源**，用单测「兜底表的图片能力与远端判定逐条一致」
+锁死，防它们悄悄分叉（同 Qoder「两处等待逻辑必须共用同一实现」的教训）。
 
-⚠️ **别改成「该家恒支持图片」**：白名单只覆盖**实测确认**的个案，将来上架纯文本
-模型时，恒 true 会把图放行、让上游回一个更难懂的 400 —— 错误更晚、更难排查。
+**为什么从白名单翻转为黑名单**（两次漏判）：
+
+1. 2026-10-03：`tags` 不含 `vision` 的 `sn-deepseek-v4-1-flash` 被判 text
+   —— 当时用「精确 id 白名单」修；
+2. 2026-10-21：远端上架同族新版本 `sn-deepseek-v4-1-flash-1017`（`tags` 逐字
+   相同、仍无 `vision`）⇒ 精确 id 查不到 ⇒ 又被打回 text。实测该 id 带图 200、
+   四象限色 `红/绿/蓝/白` 全对（与无后缀版一致）。
+⇒ 白名单式判据**必然腐坏**（远端每次滚版本都要补一次静态表），故改为
+「默认 image + 纯文本黑名单」；黑名单同样按**基础 id**（剥末尾 `-NNNN`）命中，
+否则纯文本模型滚版本后也会漏禁。
+
+⚠️ **代价（必须知道）**：若远端上线**真正的纯文本模型**而没及时登记，DSH 会放行
+图片、上游则可能**静默忽略**（不是报错）⇒ 模型凭文字幻觉作答（accio 的 GLM 5.1
+实测同型）。⇒ 黑名单是唯一刹车，新增条目必须先实测「带图被**明确拒绝**」，
+而不是「200 但答非所问」。
 
 ⚠️ **实测时的两个坑**（否则会得到假的「不支持」）：
 
@@ -703,9 +720,11 @@ fallback 组（`raccoon-4eb26a` / `raccoon-0c119c` / `raccoon-ecc5fd`），
 排查脚本（只读、gitignored）：`scripts/probe-raccoon-vision.mjs`（打远端原始
 条目）、`scripts/probe-raccoon-vision-real.mjs`（真实发图，支持 `PROBE_MODELS`
 与 `NO_THINKING=1`）、`scripts/probe-raccoon-catalog-fields.mjs`（穷举键并集）。
-回归用例在 `tests/unit/raccoon-product.spec.ts` 的「图片能力判定（tags 不是能力
-契约）」段与 `tests/unit/raccoon-adapter.spec.ts` 的两条 ⚠️ 用例。
-⚠️ 已做**反向验证**：白名单清空 → 4 条变红；兜底表改回 `false` → 2 条变红。
+回归用例在 `tests/unit/raccoon-product.spec.ts` 的「图片能力判定（默认支持，
+纯文本模型显式禁掉）」段，与 `tests/unit/raccoon-adapter.spec.ts` 的三条 ⚠️ 用例
+（默认 image / 未知新模型 image / 纯文本集合 text，均含版本后缀形态）。
+⚠️ 已做**反向验证**：短路「基础 id 命中黑名单」那两行 → 2 条变红；把默认
+`return true` 改成 `false` → 7 条变红。
 
 ### e2e 探针
 
@@ -1708,3 +1727,186 @@ loomy, raccoon, minimax, zcode`）。
 ⚠️ **根治方向**（尚未做）：把它改成**具名参数对象**（`{ auth: {...}, modelAdapters }`）。
 已复发五次说明「靠注释提醒补占位」不足以防住 —— 但那是独立重构，
 需要同时改 `src/index.ts` 与全部测试调用点，不要顺手做。
+
+## ⚠️⚠️ minimax 同账号去重的「三件套」不可只做第一件（2026-10-25 合并审计）
+
+`!147` 补了 minimax 的同账号去重（按 `user_id` 查池、命中则**不删条目**、标停用+改名）。
+方向对，但只搬了 officeace 三件套的**第 1 件**。实测两个后果：
+
+| 缺的腿 | 后果（实测） |
+|---|---|
+| 新鲜凭据**转写回保留卡** + 清重复卡凭据 | 续期调度器**刻意不看 `enabled`** ⇒ 同一上游账号挂**两条续期链**。MiniMax 的 refresh_token 是轮换式的 ⇒ 两条链互相作废，症状正是「旧的那条掉登录」（本 PR 要治的形态） |
+| 命中**已停用**原卡时反转 | 用户手动停用过这个号 → 同号重登 → **两张卡全停用** ⇒ `getAvailableAccount()` 返回 `null`（它按 `enabled` 过滤）而 `login.poll` 报登录成功 ⇒ **零可用号**（officeace 2026-10-17 修过同一格） |
+
+⚠️ 还有一个**前置**缺陷：`user_id` 全仓只有 `persistLogin` 一处写入，而它只写**新**账号。
+存量凭据（PR 之前登录的）**没有** `user_id`（本机三份实测零份带它），而
+`findAccountIdByIdentityField` 对缺失字段是**跳过**（不是「不匹配」）⇒ 去重对存量用户
+**永不触发**。唯一能补的地方是启动自愈 `repairAccountNicknames` —— 它本来就把
+`identity.userId` 拿到了手，却只写了 `nickname`。
+
+⇒ 现行实现：`src/minimax-dedup.ts`（`dedupeMinimaxAccount`，四种结局逐格可测）+
+`repairAccountNicknames` 一并补写 `user_id` + `refresh()`（第 5 条续期路径，
+`index.ts` 在 `getAvailableAccount()` 返回空时走它）也继承身份。
+守卫：`tests/unit/minimax-dedup.spec.ts`（6 条）、`minimax-identity-inherit.spec.ts`（9 条）。
+
+⚠️ 「收口在**唯一**出口」这类声明要按**调用点**数，不要按注释数：本 PR 声称 4 条续期路径
+收口到 `refreshCredentialFor`，实际还有第 5 条 `refresh()`，且它此前直接把续期结果落盘
+（`nickname`/`user_id` 双双消失，每 30 分钟一轮必然复现）。
+
+⚠️ 两个新 spec 的 cordis 闸门曾用 `import.meta.resolve('@deepseek-ai/cordis')` ——
+**Vite SSR 下恒抛**（`__vite_ssr_import_meta__.resolve is not a function`）⇒ 两条最承重的
+行为用例**永久 SKIP**，而 PR 说明写着「完整安装的 checkout 里会真跑」（假的）。
+探针必须与用例体用**同一种**加载方式（`await import()`）；SKIP≠PASS 仍然成立。
+
+## ⚠️⚠️⚠️ 续期机制重构（PR155 修正版）：**终态判据 / 单飞 / 巡检生命周期**（2026-10-27 两轮审计）
+
+> 背景：PR155 把「定时批量轮换」改成「按需 + 60s 错峰巡检」，**方向是对的**
+> （`refreshAll` 改纯对账 + 抖动散列确实拆掉了「全池同秒过期」），
+> 但两轮独立审计（含对抗性红队）打穿了四处，全部已修在本仓库。
+> **每一条都是「线上会让用户重新登录」的形态**，改这块前必读。
+
+### ① 终态判据**不得**用 message 正则 —— 它把健康账号标死
+
+修前（两家**逐字同形**的两份实现）：
+
+```ts
+// ❌ autoclaw-auth.ts 与 minimax-auth.ts 各一份
+if (/invalid_grant|expired|revoked/i.test(message)) throw new TerminalError(...)
+// autoclaw 那份更宽：msg.includes('Invalid token') || msg.includes('expired') || msg.includes('401')
+```
+
+实测三处**误判**（都来自真实上游形态）：
+
+| 上游报文 | 旧判据 | 后果 |
+|---|---|---|
+| `HTTP 503 {"error":"token expired"}` | **终态** | 网关抖动一次 = 账号需重登 |
+| `HTTP 429 {"error":"rate limited, key expired soon"}` | **终态** | 限流一次 = 账号需重登 |
+| `fetch failed`（`cause: certificate has expired`） | **终态** | 证书/代理抖动 = 账号需重登 |
+
+⚠️ 第三条最隐蔽：本仓库自己记着「环境 HTTPS 检查代理约 50% 概率打断」
+（见本文件「传输级重试」一节），而 `certificate has expired` 里恰含 `expired`。
+⚠️ `msg.includes('401')` 更是**子串**判据 —— 任何报文里带这三个字符都命中。
+
+而 `refreshable:false` 是**单向门**（`refreshAll` + 巡检都会跳过）⇒ 误标一次
+**永不自愈**，用户看到的就是「要一个个点回来」。
+
+⇒ 现在收口到 **`src/refresh-failure.ts`**（全仓唯一实现），三步**顺序不可颠倒**：
+
+1. **先排传输层**（沿 `cause` 链读 `UND_ERR_*` / `CERT_*` / 文案含 `certificate`）
+   ⇒ 一律非终态。`certificate has expired` 在这一步被吃掉，第 3 步看不到它。
+2. **再看 HTTP 状态码**：`5xx` / `429` / `408` / `401` ⇒ 非终态。
+3. **最后只认结构化 `invalid_grant`**（RFC 6749 §5.2 的唯一标准码）。
+   个别上游用自有词汇的（AutoClaw 业务码信封回 `msg:"Invalid token"`）在
+   **调用点显式声明**词表（`AUTOCLAW_TERMINAL_OAUTH_ERRORS`），
+   而不是把宽词塞回共享模块。
+
+⚠️ **方向性取舍**：漏判（该标死没标死）= 每 30 分钟白撞一次；
+误判（不该标死标死）= **账号报废、必须重登**。两者不对称 ⇒ 一律偏向「不标死」。
+
+### ② 单飞必须是**去重**，不是「串行化」
+
+修前 `refreshAccountCredential`：
+
+```ts
+// ❌ 等完在飞任务后，**照样再发一份**
+const existing = this.renewInFlight.get(refName)
+if (existing !== undefined) await existing.catch(() => undefined)
+const task = (async () => { … grant … })()
+```
+
+实测并发 5 次 ⇒ **5 份 grant、同时在飞峰值 4**，RT 序列
+`['RT-0','RT-1','RT-1','RT-1','RT-1']`。而 RT 是**一次性轮换**的
+⇒ 2 份起必然 `invalid_grant`，输家还会把「别人刚续成功」误读成「RT 已死」
+⇒ **把好号标死**。端到端三条并发请求（主回复 + 标题 + 压缩）⇒ **全部失败**。
+
+⇐ 现在与 `renewEntry` **同形**：命中在飞任务就 `await` 并 **直接返回**。
+守卫：`tests/unit/minimax-renew-mechanism.spec.ts` 的「并发 5 次 ⇒ 只发 1 份」。
+
+⚠️ **AutoClaw 同一格此前完全没有单飞**（全仓唯一的 in-flight 表在
+`autoclaw-credits.ts`，不覆盖这条腿）⇒ 已补 `AutoclawAuth.refreshInFlight`，
+并且**刻意保持 `refreshAccountCredential` 返回 `void`**（`JetHubAuthLike` 契约），
+另开 `renewCredentialForRef` 返回凭据给适配器重发（两者共用同一张在飞表）。
+
+### ③ 巡检定时器**必须**挂 `ctx.effect` 回收
+
+修前：`setInterval` + `unref`，**全类没有 clear 路径**。
+`unref` 只解决「不阻止进程退出」，**不解决「fiber 卸载后仍在跑」**。
+
+实测：`fiber.dispose()` 后推进 130s ⇒ 巡检 tick **照跑**；而旧实例读的是
+**共享的 credentials 后端**（不是快照）⇒ 它会继续对**新池**发 grant。
+插件热重载 ⇒ 旧实例没死 + 新实例已起 ⇒ **两个实例并发轮换同一批一次性 RT**。
+
+⇐ 现在：`stopRenewPatrol()`（幂等）+ `src/index.ts` 的
+`ctx.effect(() => () => { minimax.stopRenewPatrol(); minimaxIntl.stopRenewPatrol() })`。
+⚠️ 还有第二层：**每个账号之前**再查一次 `patrolStopped` —— 在飞的一轮可能正卡在
+`await grant` 上几十秒，醒来后会继续把剩余账号全轮换一遍。
+
+### ④ 「读凭据」而不是「读 `refreshable`」—— 单向门的另一半
+
+`refreshAll` 与巡检**都**曾经 `if (!entry.refreshable) continue`。
+而那个布尔是**每轮由凭据对账出来的镜像**，写 `false` 的唯一来源就是 ①的终态判定
+⇒ 判据一误判就形成闭环：跳过它 → 永远不再判 → 永远回不来。
+
+⚠️ 这是 `AGENTS.md` 与 `docs/adding-a-new-provider.md:132-135` 的**明文红线**
+（「不看 `refreshable`」），而 PR 在巡检里**新复制了同一个门**。
+
+⇐ 现在两处都读**凭据本体**（`isMinimaxRefreshable(credential)`），
+且「凭据读不到 / 解析失败」**不**标 `refreshable:false`（那是存储问题，不是服务端拒绝）。
+
+### ⑤ 启动自愈 `repairAccountNicknames` 写盘前必须重读（CAS）
+
+它有**两次** `await`（读凭据 → 查身份端点 ~120ms），然后拿**那份旧凭据**展开整体
+`set`。而 `index.ts` 把本函数（fire-and-forget）与巡检首轮排成了相邻两行
+⇒ 启动时必然并发。实测 `set` 序列 `['NEW_RT','OLD_RT']`
+⇒ **刚轮换出来的新 RT 被覆盖掉**（一次性 RT 前提下 = 账号报废）。
+
+⚠️ 生产上**每次启动必现**：本机存量三份凭据**零份**带 `user_id` ⇒ 自愈必然写盘。
+
+⇐ 现在写前重读，**只在最新那份上合并身份字段**，绝不动令牌材料。
+守卫：`minimax-renew-mechanism.spec.ts` 的同名组。
+
+### ⑥ CAS 丢弃前要把新 RT 压进历史栈（否则是净损失）
+
+`renewEntryInner` 的 CAS 分支修前直接 `return`：本次 grant **已在上游完成轮换**，
+而我们把这把新 RT 丢掉了（实测 `MINE_NEW_RT` 永久消失且**未压栈**）。
+一次性 RT 语义下这**不是零代价** —— 它花掉一次轮换额度、什么也没留下，
+还让救援链少了一把弹药。
+
+⇐ 现在把 `next.refresh_token` 压进 `previous_refresh_tokens`（**只补 RT，
+不碰 access_token / expires_at**），并与 `grantOnce` 共用
+`mergePreviousRefreshTokens`（同义判据只留一份实现）。
+
+### ⑦ 抢救链必须**层级合并**（修前在「响应丢失」下恰好失效）
+
+修前：
+
+```ts
+// ❌ 第 1 层重试若抛终态，异常直接冒出去 ⇒ 历史代际一次都不试
+catch (e) { if (终态) { …历史…; throw e } else { sleep; return grantOnce() } }
+```
+
+实测：首轮网络错 → 重试终态时 RT 序列 `['DEAD_RT','DEAD_RT']`（`OLD_RT_1` 从未被试）；
+对照组「首轮即终态」是 `['DEAD_RT','OLD_RT_1']`（救回成功）。
+而「响应丢失」正是本特性的**主要**设计场景 ⇒ 抢救链在最该生效处失效。
+
+⇐ 现在单一循环：不管终态是第几次抛出的，都过一遍历史代际（历史代际本身不重试）。
+
+### ⑧ 巡检的 margin / jitter / 间隔是「口径快照」，改它要同步改守卫
+
+`MINIMAX_RENEW_MARGIN_MS = 5min` / `JITTER_SPAN = 10min` /
+`PATROL_INTERVAL = 60s` / `ONDEMAND = 60s` / `RETRY_DELAY = 1.5s` /
+`PREVIOUS_TOKENS = 3`。守卫里有一条**精确计数**断言
+（「剩余 8min × 12 个 id ⇒ 只续 7 个」）钉住整张表：
+`margin→0` 变 1、`margin→1h` 变 12、`jitter span→0` 变 0 ⇒ 三个方向都会红。
+⚠️ 这是**有意的快照**，不是恒真式：改常量必须同步改那个数字。
+
+### ⑨ 预判续期失败必须**降级**，不能把请求打死
+
+`isMinimaxExpiringWithin` 是 fail-open（读不到 `expires_at` ⇒ 该续），
+而 adapter 里原本是裸 `await refresh()` ⇒ 「凭据缺/非法 `expires_at`」的账号
+一旦某次续期失败，**上游一次都不发**、请求直接失败（旧判据会正常放行）。
+生产写入点都会写 `expires_at`，故可达面是「备份导入 / 第三方转换 / 手工编辑」。
+
+⇐ 现在 `try/catch` + 降级为「用现有凭据继续发」，并**留 warn**
+（`warn` 走 `registerMinimaxLlm` 注入的 `ctx.logger.warn`，缺省兜底 `console.warn`）。
+401 之后那条「先续期再重发」路径仍然按原语义报 `AUTH`，不掩盖真终态。

@@ -165,11 +165,11 @@ describe('buddy request headers', () => {
   it('requestHeaders sends X-Domain and the IDE User-Agent', () => {
     const headers = credentialRequestHeaders({ access_token: 'AT', refresh_token: 'RT', domain: 'copilot.tencent.com' })
     expect(headers['X-Domain']).toBe('copilot.tencent.com')
-    expect(headers['User-Agent']).toBe('CodeBuddyIDE/1.106.1')
+    expect(headers['User-Agent']).toBe('WorkBuddy/5.9.2 WorkBuddy/5.9.2 CLI/5.8.3')
   })
 
   it('requestHeaders falls back to the default domain', () => {
-    expect(credentialRequestHeaders({ access_token: 'AT', refresh_token: 'RT' })['X-Domain']).toBe('copilot.tencent.com')
+    expect(credentialRequestHeaders({ access_token: 'AT', refresh_token: 'RT' })['X-Domain']).toBe('www.workbuddy.cn')
   })
 
   /**
@@ -185,7 +185,7 @@ describe('buddy request headers', () => {
    */
   it('requestHeaders 对空串 domain 同样回退（?? 的陷阱）', () => {
     expect(credentialRequestHeaders({ access_token: 'AT', refresh_token: 'RT', domain: '' })['X-Domain'])
-      .toBe('copilot.tencent.com')
+      .toBe('www.workbuddy.cn')
   })
 
   it('requestHeaders adds enterprise headers only for enterprise accounts', () => {

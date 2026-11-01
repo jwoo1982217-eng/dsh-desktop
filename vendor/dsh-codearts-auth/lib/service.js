@@ -1,3 +1,4 @@
+import { directFetch } from './direct-fetch.js';
 import { Service } from '@deepseek-ai/cordis';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { runLoginFlow, runOAuthFlow, startOAuthFlow } from './login.js';
@@ -87,7 +88,7 @@ export class CodeArtsAuth extends Service {
     /** 登录会话是否仍处于活跃状态；stop() 置 false，防止在途刷新回写已登出凭据。 */
     active = true;
     /** 用于测试的可注入 fetch；默认为全局 fetch。 */
-    fetchImpl = fetch;
+    fetchImpl = directFetch;
     /**
      * 按凭据 ref 分的**续期互斥队列**（进程内）。
      *
@@ -398,6 +399,7 @@ export class CodeArtsAuth extends Service {
                     current: entry,
                     refresh: (c) => this.refreshCredentialUnderLock(entry.credentialRef, c),
                     save: (c) => this.ctx.credentials.set(ref, JSON.stringify(c)),
+                    makeTerminalError: (message) => new RefreshTokenExpiredError(message),
                     warn: (message) => this.ctx.logger?.warn?.(message),
                     info: (message) => this.ctx.logger?.info?.(message),
                 });
@@ -509,6 +511,14 @@ export class CodeArtsAuth extends Service {
      * 为什么用「可用账号」而不是遍历全部账号：模型目录是**账号无关**的（同一个
      * 华为云账号体系下发同一份目录），取第一个能解析出 AK/SK 的账号即可，
      * 无需为每个账号各拉一次。
+     */
+    /**
+     * ⚠️ 返回**完整 `RemoteModel`**（含 `rateLabel`），不是只有 `{id, name}`。
+     *
+     * 2026-10-21 修：此前签名写死 `Array<{id,name}>` ⇒ 即使
+     * `fetchCodeArtsRemoteModels` 解析出了倍率，也会在**这一层被丢弃**
+     * （TS 结构类型允许「少字段」赋值，编译不报错、运行期静默丢字段 ——
+     * 正是「目录里明明有倍率却显示不出来」的根因）。
      */
     async refreshModels(pool) {
         if (!this.active)

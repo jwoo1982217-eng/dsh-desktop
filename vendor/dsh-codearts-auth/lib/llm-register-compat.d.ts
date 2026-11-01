@@ -125,6 +125,21 @@ export declare function recordThroughStream(openStream: () => AsyncIterable<unkn
  *
  * 回归用例：`tests/unit/token-ledger-wiring.spec.ts` 的「两层包装的嵌套顺序」段
  *（按 dsh-llm 的 `prepareCall → call.stream` 真实路径驱动，含闭包式适配器用例）。
+ *
+ * ## 顺带做「analyzeImage 的路由作用域」摘除包装
+ *
+ * 本插件的 `analyzeImage` 工具**只服务 codearts 的纯文本模型**（图片经
+ * `kimi-k2.6-vl` 两段式中转，见 `codearts-vision.ts` 模块头与真实报障取证）。
+ * 但工具注册是**进程全局**的，而本插件注册了 20 个渠道 ⇒ 该工具会进入
+ * **每一家**发给上游的工具表。2026-10-23 真实报障：buddy/workbuddy 因此每轮
+ * `400 invalid function call parameters`（腾讯两站严格校验工具定义）。
+ *
+ * 这里在**每个**适配器上逐请求摘掉该工具（判据与工具层共用
+ * `codearts-vision.ts` 的 `shouldOfferAnalyzeImage`）。为何不用 `dsh-tools` 的
+ * `restrict()`：工具表在 `systemPrompt.assemble()` 那一步就固化，而「用户刚选的
+ * 新模型」只在 session-controller 的投影里、组装时读不到 ⇒「切模型的第一步仍会
+ * 400」。适配器层的 `options.provider` 是**本次请求的真实路由**，零时序、零竞态
+ *（时序分析见 `codearts-vision.ts` 模块头）。
  */
 /** 同时覆盖 SDK 的 prepareCall 和直接 stream；不改写或持久化旧消息形状。 */
 export declare function wrapAdapterWithRotation<T extends object>(providers: readonly string[], adapter: T): T;

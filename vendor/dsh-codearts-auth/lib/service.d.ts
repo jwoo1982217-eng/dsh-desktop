@@ -2,7 +2,7 @@ import { Service, type Context } from '@deepseek-ai/cordis';
 import { type CredentialRef } from '@deepseek-ai/dsh-credentials';
 import type { LoginFlowOptions } from './types.js';
 import { AccountPool } from './account-pool.js';
-import { type RemoteCatalogOutcome } from './models.js';
+import { type RemoteCatalogOutcome, type RemoteModel } from './models.js';
 /**
  * CodeArts 历史单凭据 ref 常量。
  *
@@ -226,10 +226,15 @@ export declare class CodeArtsAuth extends Service {
      * 华为云账号体系下发同一份目录），取第一个能解析出 AK/SK 的账号即可，
      * 无需为每个账号各拉一次。
      */
-    refreshModels(pool: AccountPool): Promise<Array<{
-        id: string;
-        name: string;
-    }>>;
+    /**
+     * ⚠️ 返回**完整 `RemoteModel`**（含 `rateLabel`），不是只有 `{id, name}`。
+     *
+     * 2026-10-21 修：此前签名写死 `Array<{id,name}>` ⇒ 即使
+     * `fetchCodeArtsRemoteModels` 解析出了倍率，也会在**这一层被丢弃**
+     * （TS 结构类型允许「少字段」赋值，编译不报错、运行期静默丢字段 ——
+     * 正是「目录里明明有倍率却显示不出来」的根因）。
+     */
+    refreshModels(pool: AccountPool): Promise<RemoteModel[]>;
     /**
      * 最近一次 {@link refreshModels} 的各来源成败（issue IKJVTF，审计 I3）。
      *

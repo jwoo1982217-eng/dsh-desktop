@@ -34,6 +34,18 @@ export declare const AUTOCLAW_WALLETS_PATH = "/agent-assetmgr/api/v2/wallets";
 export declare const AUTOCLAW_LEDGERS_PATH = "/agent-assetmgr/api/v1/ledgers_std";
 export declare const AUTOCLAW_DAILY_CLAIM_PATH = "/userapi/v1/user-info";
 export declare const AUTOCLAW_CREDITS_TIMEOUT_MS = 15000;
+/**
+ * 签到腿**刷新（登录事件）**的单次请求超时。
+ *
+ * ⚠️ 存在的理由（2026-10-27 审计 P2-2）：`refreshAutoclawToken` 会**依次试两个
+ * 端点**，若沿用它的 60s 默认值，光刷新就 120s，加 claim 自身 15s ⇒ **135s**
+ * （实测真实挂钟 120,015ms；修复前上界 15s，**9 倍**）。而这段等待发生在
+ * **签到之前** ⇒ 用户点「一键领取积分」后界面最长转两分多钟，每个账号各付一次。
+ *
+ * 取值 5s：刷新是**增量能力**（登录事件 → 活动奖励），不值得为它拖长一个
+ * 既有功能；两个端点各 5s ⇒ 最坏 10s，仍在可接受范围。
+ */
+export declare const AUTOCLAW_CLAIM_REFRESH_TIMEOUT_MS = 5000;
 export declare const AUTOCLAW_CREDIT_UNIT = "\u79EF\u5206";
 /**
  * 流水翻页上限（页 × 100 条）。
@@ -73,6 +85,43 @@ export interface AutoclawCreditsOptions {
     readonly product?: AutoclawProduct;
     readonly fetcher?: typeof fetch;
     readonly deviceId?: string;
+    /**
+     * 日志出口（可选）；宿主 RPC 层经 `ProviderCallContext.warn` 传入。
+     *
+     * ⚠️ 存在的理由（2026-10-27 审计 P1-3）：刷新失败原先被裸 `catch` 完全吞掉
+     * ⇒ `outcome` 与**成功逐字相同**，而本文件**没有任何日志出口**（改前全仓零日志）。
+     * 本 PR 的立论正是「没登录就没奖励」这个**静默缺失** —— 它引入的新失败路径
+     * 不能同样是静默的。
+     */
+    readonly warn?: (message: string) => void;
+    /**
+     * 把**轮换后的**凭据写回（可选）。
+     *
+     * ⚠️⚠️ 存在的理由（2026-10-27 审计 **P0**，两路独立审计各自命中）：
+     * `refreshAutoclawToken` 会解析并返回轮换后的 `refresh_token`
+     * （`autoclaw-oauth.ts` 的 `newRefresh`），而本文件的刷新腿原先**只取
+     * `access_token`、把 `refresh_token` 直接丢弃**。
+     *
+     * 若服务端按 OAuth 2.1 RTR **一次性轮换**，丢弃就等于**每天烧掉一次续期能力**：
+     * 旧 refresh_token 立即失效 ⇒ 此后每轮刷新的 401 被静默降级 ⇒ 活动奖励永不再发；
+     * 而自愈/续期读到盘上的死 token 会抛 `RefreshTokenExpiredError` ⇒
+     * `pool.updateAccount(…, { refreshable: false })` ⇒ 用户被要求重登，
+     * **而重登拿到的 token 又会在下一次签到时被同样烧掉**。
+     *
+     * ⚠️ 判断依据不是「我觉得会轮换」，而是**本仓库自己的记载**：
+     * `src/jet-hub-rpc.ts` 的续期注释明写「续期**会轮换** refresh_token，并发会让
+     * 后写的把先写的新 token 覆盖成已失效的旧 token」（并为此建了
+     * `balanceHealInFlight`）；同 provider 的 `autoclaw-auth.ts` 那条续期腿
+     * **会** `credentials.set` 落盘 —— **同一字段两套口径**。
+     * 而 `docs/agent-notes/providers-autoclaw.md` 把「续期端点是否仍接受这批
+     * refresh_token」登记为**未测**。
+     *
+     * ⇒ 修法：把整份刷新结果交给调用方落盘（与 `autoclaw-auth.ts` 同源）。
+     * **没有落盘出口时不得静默丢弃** —— 会 `warn` 出声（见实现）。
+     */
+    readonly persist?: (credential: AutoclawCredential) => Promise<void>;
+    /** 刷新腿的单次请求超时；缺省 {@link AUTOCLAW_CLAIM_REFRESH_TIMEOUT_MS}。 */
+    readonly refreshTimeoutMs?: number;
 }
 /**
  * 构造 AutoClaw API 认证请求头。
@@ -199,6 +248,10 @@ export declare function fetchAutoclawCreditBalance(credential: AutoclawCredentia
 /**
  * 执行 AutoClaw 每日签到领额度。
  * 遵循 POST /userapi/v1/user-info 规范，不抛出异常。
+ *
+ * ⚠️ 调用前会先刷新一次 token —— 那是服务端认定的「登录」事件，
+ *    活动奖励（如「1 亿 Tokens」）只在那之后的那次签到请求上发放。
+ *    详见 {@link refreshCredentialForLoginEvent}。
  */
 export declare function claimAutoclawDailyQuota(credential: AutoclawCredential, options?: AutoclawCreditsOptions): Promise<ClaimOutcome>;
 //# sourceMappingURL=autoclaw-credits.d.ts.map

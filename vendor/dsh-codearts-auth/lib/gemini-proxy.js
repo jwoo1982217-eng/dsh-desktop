@@ -30,6 +30,7 @@
  * 补的是**宿主管不到的那一格**：只有环境变量、没有插件内出口时的 per-账号配置。
  */
 import { asProxyText } from './account-pool.js';
+import { networkBlockedHint } from './network-hint.js';
 import { normalizeProxy } from './opencode.js';
 import { proxyFetch } from './opencode-proxy.js';
 export { normalizeProxy };
@@ -116,25 +117,15 @@ export const geminiFetchForAccount = createGeminiFetcherResolver((accountId) => 
  * @returns 有代理嫌疑时返回提示语，否则返回 `undefined`（调用方用原措辞）。
  */
 export function geminiNetworkHint(error, aborted) {
-    // ⚠️ 必须**沿 cause 链**找真因：Node 把传输错误压成一句 `TypeError: fetch failed`，
-    // 真因（`UND_ERR_CONNECT_TIMEOUT` / `ENOTFOUND` / `ECONNREFUSED` …）只在 cause 上。
-    // 遍历上限防病态自引用链（与 `opencode-rpc.ts` 的 `describeFetchError` 同款处理）。
-    let current = error;
-    let codes = '';
-    for (let i = 0; i < 8 && current !== null && current !== undefined; i += 1) {
-        const code = current.code;
-        if (typeof code === 'string' && !codes.includes(code))
-            codes += `${code} `;
-        current = current.cause;
-    }
-    const message = error instanceof Error ? error.message : String(error);
-    // 连接超时 / 连不上 / DNS 解析失败 —— 三者对用户都是同一个结论：「出不去」。
-    const unreachable = /UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|ENOTFOUND|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|ECONNRESET/i.test(codes);
-    if (!unreachable && !aborted)
-        return undefined;
-    const reason = codes.trim().length > 0 ? `（${codes.trim()}）` : '';
-    return `连不上 Google${reason}：Gemini 全部端点都在墙外，插件进程不走系统代理。`
-        + '请为该账号设置出口代理（账号卡片上的「代理」按钮），或在启动 DSH 前导出 HTTPS_PROXY；'
-        + '浏览器能授权是因为浏览器读系统代理，插件进程不读。';
+    // 判据与码表在 `network-hint.ts`（全仓唯一一份）—— 这里只负责 Gemini 专属的出路文案。
+    // 曾经的重复实现见 git 历史：同一码表在 `refresh.ts` / 此处各有一份，改一处漏一处。
+    return networkBlockedHint({
+        error,
+        aborted,
+        subject: 'Google',
+        remedy: 'Gemini 全部端点都在墙外，插件进程不走系统代理。'
+            + '请为该账号设置出口代理（账号卡片上的「代理」按钮），或在启动 DSH 前导出 HTTPS_PROXY；'
+            + '浏览器能授权是因为浏览器读系统代理，插件进程不读。',
+    });
 }
 //# sourceMappingURL=gemini-proxy.js.map

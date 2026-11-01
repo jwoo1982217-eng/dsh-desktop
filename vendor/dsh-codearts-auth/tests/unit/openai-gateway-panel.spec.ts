@@ -5,6 +5,9 @@ import { fileURLToPath } from 'node:url'
 import {
   copyToClipboard,
   formatModelIdList,
+  gatewayAllowLanHint,
+  gatewayAllowLanSwitchDisabled,
+  gatewayAllowLanToggleNotice,
   gatewayApiKeyHint,
   gatewayButtonLabel,
   gatewayButtonTitle,
@@ -182,6 +185,42 @@ describe('本机网关面板的文案与判定', () => {
    *
    * 判据用**真实函数的返回值**（而不是源码文本），对实现方式中立。
    */
+  /**
+   * ★★ **`running: true` + `address: null` 不得崩、也不得说反话**
+   * （2026-10-22 对抗审计 m-1）。
+   *
+   * ## 为什么这是**合法组合**而不是脏数据
+   *
+   * 宿主侧 `running`（`isGatewayRunning()`）与 `address`（`gatewayAddress()`）是
+   * **两次独立 `degrade`**，任一次抛错都让对应字段为空。
+   *
+   * ## 两条真缺陷（实测）
+   *
+   * 1. **崩**：`isWildcardHost(undefined)` 走 `normalizeHostForCompare` 抛
+   *    `TypeError: Cannot read properties of undefined (reading 'normalize')`
+   *    ⇒ 整个网关状态面板直接不渲染（用户只看到一片空白）。
+   * 2. **说反话**：修了不崩之后，`gatewayFootnote` 仍落到「只绑定 127.0.0.1」
+   *    那句，而「允许局域网访问」开关可能是**开着的** ⇒ 又一条与事实
+   *    相反的安全声明（正是 IKL7UN 那条纪律要消除的）。
+   *
+   * ⚠️ 判据分两层：**不崩**（两个函数都能返回）+ **不说反话**
+   * （不得出现「只绑定 127.0.0.1」）。只测第一层会让第二条漏掉。
+   */
+  it('★★ running:true + address:null 不崩、且不得声称「只绑定 127.0.0.1」', () => {
+    const unknown = { ...RUNNING, allowLan: true, address: null }
+    // ① 不崩（两个入口都要跑一遍）
+    expect(() => gatewayFootnote(unknown)).not.toThrow()
+    expect(() => gatewayStatusLines(unknown)).not.toThrow()
+    // ② 不得说反话
+    expect(
+      gatewayFootnote(unknown),
+      '地址未知时不得声称只绑了回环（开关可能开着）',
+    ).not.toContain('只绑定 127.0.0.1')
+    // ③ 修法本身也要有城市：必须如实说「读不到地址」
+    expect(gatewayFootnote(unknown)).toContain('读不到它的监听地址')
+    // ④ 反向对照：正常回环仍必须说「只绑定 127.0.0.1」
+    expect(gatewayFootnote(RUNNING), '不得把回环那句改掉').toContain('只绑定 127.0.0.1')
+  })
   it('★★ 面板文案一律不得含 markdown 标记（星号会原样显示）', () => {
     const bridged = { ...RUNNING, address: { host: '172.21.0.8', port: 8326 } }
     const texts = [
@@ -242,6 +281,42 @@ describe('本机网关面板的文案与判定', () => {
     expect(gatewayStatusLines(ENV_BLOCKED).join()).toContain('DSH_OPENAI_GATEWAY_ENABLED')
   })
 
+  it('★ 四条「没在监听」文案必须**全部**转述 lastError（Issue #11 审计 P1-1）', () => {
+    // ⚠️ 本文件有**四条**文案都在描述「已选择开启但没在监听」。PR 起初只给两条
+    // 接了 `lastError`，另两条仍印「通常是端口被占用」这个**猜测** —— 这正是
+    // 本 PR 声称要消除的那句话，而 `gatewayButtonTitle` 是**真实渲染的页头
+    // tooltip**。这条用例把四条一起钉住，防止将来只补其中几条。
+    const reason = 'listen EADDRINUSE: address already in use'
+    const failed = {
+      enabled: true,
+      running: false,
+      blockedByEnv: false,
+      allowLan: false,
+      hostFromEnv: false,
+      address: null,
+      apiKey: null,
+      models: [],
+      modelsSource: 'none',
+      lastError: { kind: 'start-failed', reason, at: 1 },
+    }
+    // ① 状态行
+    expect(gatewayStatusLines(failed).join('\n')).toContain(reason)
+    // ② 主开关切换提示
+    expect(gatewayToggleNotice(failed, true)).toContain(reason)
+    // ③ 页头 tooltip（审计指出这条此前完全没接）
+    expect(gatewayButtonTitle(failed)).toContain(reason)
+    // ④ 局域网开关切换提示（审计指出这条此前把用户指向「先开总开关」，归因错误）
+    expect(gatewayAllowLanToggleNotice(failed, true)).toContain(reason)
+
+    // ⚠️ 反向对照：没有 lastError 时四条都必须回落到**通用**提示（而不是空串/
+    // 也不该凭空编原因）——否则上面的断言在「无条件都说失败」的实现下也会绿。
+    const noReason = { ...failed, lastError: null }
+    expect(gatewayStatusLines(noReason).join('\n')).toContain('端口被其它程序占用')
+    expect(gatewayToggleNotice(noReason, true)).toContain('端口是否被占用')
+    expect(gatewayButtonTitle(noReason)).toContain('端口被占用')
+    expect(gatewayAllowLanToggleNotice(noReason, true)).toContain('先打开网关总开关')
+  })
+
   it('状态未读取时开关禁用，避免用户对着未知状态做操作', () => {
     expect(gatewaySwitchDisabled(null)).toBe(true)
   })
@@ -300,6 +375,233 @@ describe('凭据的展示与复制', () => {
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+
+  // ⚠️ 这条锁的是「局域网 http 打不开复制」那个报障的修复（2026-10-23）。
+  //    `navigator.clipboard` 只在安全上下文存在；用 `http://<内网 IP>` 访问时它是
+  //    `undefined`，而此时**必须**降级到 `execCommand('copy')`，不能直接返回 false。
+  it('非安全上下文（局域网 http，没有 navigator.clipboard）时降级到 execCommand', async () => {
+    const execCommand = vi.fn().mockReturnValue(true)
+    const appended: any[] = []
+    const body = {
+      appendChild: (el: any) => { el.parentNode = body; appended.push(el); return el },
+      removeChild: (el: any) => { el.parentNode = null; return el },
+    }
+    const textarea = {
+      value: '',
+      style: {} as Record<string, string>,
+      parentNode: null as any,
+      setAttribute: vi.fn(),
+      select: vi.fn(),
+      setSelectionRange: vi.fn(),
+    }
+    const focus = vi.fn()
+    vi.stubGlobal('navigator', {})  // 没有 clipboard —— 正是局域网 http 的样子
+    vi.stubGlobal('document', {
+      body,
+      activeElement: { focus },
+      createElement: vi.fn().mockReturnValue(textarea),
+      execCommand,
+    })
+    try {
+      expect(await copyToClipboard('secret')).toBe(true)
+      expect(execCommand).toHaveBeenCalledWith('copy')
+      // 值必须真的塞进 textarea，否则复制到的是空串
+      expect(textarea.value).toBe('secret')
+      // 必须真的插入 DOM 才能选中；用完必须摘掉，不能留垃圾节点
+      expect(appended).toHaveLength(1)
+      expect(textarea.parentNode).toBeNull()
+      // 焦点要还给用户，否则键盘操作位置丢失
+      expect(focus).toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('降级路径也失败时返回 false（不能让 UI 以为复制成功了）', async () => {
+    const body = {
+      appendChild: (el: any) => { el.parentNode = body; return el },
+      removeChild: (el: any) => { el.parentNode = null; return el },
+    }
+    vi.stubGlobal('navigator', {})
+    vi.stubGlobal('document', {
+      body,
+      activeElement: null,
+      createElement: () => ({
+        value: '',
+        style: {} as Record<string, string>,
+        parentNode: null as any,
+        setAttribute() {},
+        select() {},
+        setSelectionRange() {},
+      }),
+      execCommand: vi.fn().mockReturnValue(false),
+    })
+    try {
+      expect(await copyToClipboard('secret')).toBe(false)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  // ⚠️ 2026-10-31 审计（P2 补牙）：showManualCopy 原先零覆盖 —— 删掉函数体只剩
+  //    return false，全文件测试仍全绿。三层降级的核心承诺「用户总能拿到文本」
+  //    不能只靠注释自律。本组三条用例直接观测第三层的 DOM 行为。
+  describe('第三层手动复制面板（showManualCopy）', () => {
+    /** 造一个足够真实的 DOM 桩：overlay/box/textarea/button 各自独立创建。 */
+    function makeDomStub() {
+      const appended: any[] = []
+      const removed: any[] = []
+      const documentListeners: Array<{ type: string; fn: (e: any) => void; options?: any }> = []
+      /**
+       * 只看**当前还挂在 body 上**的节点：legacyCopy 的 textarea 会 append 后
+       * 立刻 removeChild（ parentNode=null），手动面板则一直挂着。
+       * 断言「面板挂出来了」必须过滤掉前者，否则 appended[0] 是那个已摘除的
+       * 隐形 textarea。
+       */
+      const live = () => appended.filter((el) => el.parentNode !== null)
+      const makeEl = (tag: string) => {
+        const listeners: Record<string, Array<(e: any) => void>> = {}
+        const el: any = {
+          tagName: tag,
+          value: '',
+          style: {} as Record<string, string>,
+          parentNode: null as any,
+          children: [] as any[],
+          setAttribute: vi.fn((k: string, v: string) => { el[`data-attr-${k}`] = v }),
+          focus: vi.fn(),
+          select: vi.fn(),
+          setSelectionRange: vi.fn(),
+          append: (...kids: any[]) => { el.children.push(...kids) },
+          remove: vi.fn(() => { removed.push(el) }),
+          // 递归子树查找（真实 DOM 的 querySelector 语义的最小实现）——
+          // 重复弹守卫用 overlay.querySelector('textarea') 取文本框
+          querySelector: (sel: string) => {
+            const tag = sel.replace(/[[\]']/g, '')
+            const walk = (node: any): any => {
+              for (const kid of node.children ?? []) {
+                if (kid.tagName === tag) return kid
+                const hit = walk(kid)
+                if (hit) return hit
+              }
+              return undefined
+            }
+            return walk(el)
+          },
+          addEventListener: (type: string, fn: (e: any) => void) => {
+            ;(listeners[type] ??= []).push(fn)
+          },
+          __fire: (type: string, event: any) => {
+            for (const fn of listeners[type] ?? []) fn({ target: el, ...event })
+          },
+        }
+        return el
+      }
+      const documentStub = {
+        body: {
+          appendChild: (el: any) => { el.parentNode = documentStub.body; appended.push(el); return el },
+          removeChild: (el: any) => { el.parentNode = null; return el },
+          // 查询选择器桩：返回当前**还挂着**的 overlay（无则 null）—— 重复弹守卫读它。
+          // 同样要过滤已摘除的 legacyCopy textarea。
+          querySelector: (sel: string) => (sel.includes('manual-copy')
+            ? (live().find((el) => el.tagName === 'div') ?? null)
+            : null),
+        },
+        // ⚠️ 每次createElement 给独立对象（不能用 mockReturnValue 单例）——
+        //    legacyCopy 与 showManualCopy 各自创建元素，共享对象会让第二个
+        //    消费者拿到被前一个污染的实例（这也正是被测实现依赖的真实语义）。
+        createElement: (tag: string) => makeEl(tag),
+        addEventListener: (type: string, fn: (e: any) => void, options?: any) => {
+          documentListeners.push({ type, fn, options })
+        },
+        removeEventListener: (type: string, fn: (e: any) => void, options?: any) => {
+          const i = documentListeners.findIndex((l) => l.type === type && l.fn === fn)
+          if (i >= 0) documentListeners.splice(i, 1)
+        },
+        __documentListeners: documentListeners,
+      }
+      vi.stubGlobal('navigator', {})
+      vi.stubGlobal('document', documentStub)
+      /**
+       * 面板 overlay = 当前仍挂在 body 上的 div（legacyCopy 的 textarea 已摘除，
+       * 且它不是 div）。三条用例共用这一判定，避免各自摸 appended 数组下标。
+       */
+      const findLiveOverlay = () => live().find((el) => el.tagName === 'div')
+      const liveOverlays = () => live().filter((el) => el.tagName === 'div')
+      const findTextarea = (el: any): any => {
+        if (el === undefined || el === null) return undefined
+        if (el.tagName === 'textarea') return el
+        for (const kid of el.children ?? []) {
+          const hit = findTextarea(kid)
+          if (hit) return hit
+        }
+        return undefined
+      }
+      return { appended, removed, documentListeners, findLiveOverlay, liveOverlays, findTextarea }
+    }
+
+    it('★ execCommand 失败 ⇒ body 上真的挂出含完整文本的 overlay（用户总能拿到文本）', async () => {
+      const { findLiveOverlay, findTextarea } = makeDomStub()
+      try {
+        expect(await copyToClipboard('secret-key-123')).toBe(false)
+        const overlay = findLiveOverlay()
+        expect(overlay, '第三层必须真的往 body 挂面板').toBeDefined()
+        const ta = findTextarea(overlay)
+        expect(ta, '面板里必须有 textarea').toBeDefined()
+        expect(ta.value, '面板必须携带完整原文').toBe('secret-key-123')
+        expect(ta.setAttribute).toHaveBeenCalledWith('readonly', '')
+        expect(ta.setAttribute, '密钥不是词，别让浏览器画拼写红线').toHaveBeenCalledWith('spellcheck', 'false')
+        // 打开即全选（Ctrl+C 直接可用）
+        expect(ta.select).toHaveBeenCalled()
+        expect(ta.setSelectionRange).toHaveBeenCalledWith(0, 'secret-key-123'.length)
+      } finally {
+        vi.unstubAllGlobals()
+      }
+    })
+
+    it('★ Escape 关闭面板且阻断冒泡（宿主 document 级的 Esc 监听不得收到事件）', async () => {
+      const { documentListeners, findLiveOverlay } = makeDomStub()
+      try {
+        await copyToClipboard('secret')
+        const overlay = findLiveOverlay()
+        expect(overlay, '面板必须已挂出').toBeDefined()
+        // 面板必须在 document 上注册了 capture 阶段的 keydown（否则宿主先收到 Esc）
+        const captureKeydown = documentListeners.find((l) => l.type === 'keydown' && l.options?.capture === true)
+        expect(captureKeydown, 'Escape 拦截必须是 capture 阶段').toBeDefined()
+
+        // 模拟按 Esc：断言 stopPropagation 被调（阻断宿主监听）+ overlay 被移除
+        const stopPropagation = vi.fn()
+        const preventDefault = vi.fn()
+        captureKeydown!.fn({ key: 'Escape', stopPropagation, preventDefault })
+        expect(stopPropagation, '必须阻断冒泡，否则宿主的大模态会被误关').toHaveBeenCalled()
+        expect(overlay.remove, 'Escape 必须关掉面板本身（而不是宿主的大模态）').toHaveBeenCalled()
+        // 关闭后 document 监听必须摘掉（不泄漏）
+        expect(
+          documentListeners.some((l) => l.type === 'keydown' && l.options?.capture === true),
+          '关闭后 keydown 监听必须移除',
+        ).toBe(false)
+      } finally {
+        vi.unstubAllGlobals()
+      }
+    })
+
+    it('★ 连点失败 ⇒ 不叠加面板（复用已有 overlay，更新内容重新全选）', async () => {
+      const { liveOverlays, findTextarea } = makeDomStub()
+      try {
+        await copyToClipboard('first-value')
+        await copyToClipboard('second-value')
+        const overlays = liveOverlays()
+        expect(
+          overlays,
+          '连点 N 次不得叠 N 个遮罩（重复弹守卫）',
+        ).toHaveLength(1)
+        const ta = findTextarea(overlays[0])
+        expect(ta.value, '复用面板时内容要更新成最新一次的').toBe('second-value')
+        expect(ta.select, '复用时重新全选').toHaveBeenCalled()
+      } finally {
+        vi.unstubAllGlobals()
+      }
+    })
   })
 
   it('面板默认不把密钥明文渲染进 DOM，只有点「显示明文」才出现', () => {
@@ -1433,5 +1735,166 @@ describe('供应商卡片的折叠', () => {
   it('脏输入退化为展开（宁可多显示，也不要藏起来）', () => {
     expect(gatewayCardExpanded(null)).toBe(true)
     expect(gatewayCardExpanded({})).toBe(true)
+  })
+})
+
+/**
+ * 「允许局域网访问」开关（2026-10-20）的判定与文案。
+ *
+ * ⚠️ 安全文案的两条既有规矩在这里继续生效：
+ * 1. **不得出现 `**`**（React 文本节点会原样显示星号）；
+ * 2. 非回环警告**必须点名宿主**（红队 netns 实测宿主可达，只说「同网络设备」
+ *    会把它漏掉 —— 既有用例守着这条）。
+ */
+describe('「允许局域网访问」开关的判定与文案', () => {
+  const base = { enabled: true, running: true, blockedByEnv: false } as const
+
+  it('★ 只在 env 显式给了 host 时禁用（那一刻翻开关改变不了监听地址）', () => {
+    expect(gatewayAllowLanSwitchDisabled(null)).toBe(true)
+    expect(gatewayAllowLanSwitchDisabled({ ...base, allowLan: false, hostFromEnv: false, address: null })).toBe(false)
+    expect(gatewayAllowLanSwitchDisabled({ ...base, allowLan: false, hostFromEnv: true, address: null })).toBe(true)
+    // ⚠️ 网关总开关关闭时**不禁用**：用户可以先选好，打开总开关时立即生效。
+    expect(gatewayAllowLanSwitchDisabled({
+      ...base, enabled: false, allowLan: false, hostFromEnv: false, address: null,
+    })).toBe(false)
+  })
+
+  it('★ 提示文案按状态分支，且不得出现 markdown 星号', () => {
+    const off = gatewayAllowLanHint({ ...base, allowLan: false, hostFromEnv: false, address: null })
+    const on = gatewayAllowLanHint({ ...base, allowLan: true, hostFromEnv: false, address: null })
+    const overridden = gatewayAllowLanHint({ ...base, allowLan: true, hostFromEnv: true, address: null })
+    expect(off).toContain('127.0.0.1')
+    expect(off).not.toContain('**')
+    expect(on).toContain('0.0.0.0')
+    expect(on).toContain('API Key')
+    expect(on).not.toContain('**')
+    // env 覆盖时必须明说「不生效」——「打开了却没反应」比禁用并解释更让人困惑。
+    expect(overridden).toContain('DSH_OPENAI_GATEWAY_HOST')
+    expect(overridden).toContain('不生效')
+  })
+
+  it('★ 切换通知按结果分支', () => {
+    expect(gatewayAllowLanToggleNotice({ ...base, allowLan: true, hostFromEnv: true, address: null }, true))
+      .toContain('不生效')
+    expect(gatewayAllowLanToggleNotice({
+      ...base, allowLan: true, hostFromEnv: false, address: { host: '0.0.0.0', port: 8326 },
+    }, true)).toContain('局域网 IP')
+    expect(gatewayAllowLanToggleNotice({
+      ...base, allowLan: false, hostFromEnv: false, address: { host: '127.0.0.1', port: 8326 },
+    }, false)).toContain('127.0.0.1')
+    // 网关没在监听时不得谎称「已改绑」。
+    expect(gatewayAllowLanToggleNotice({
+      ...base, running: false, allowLan: true, hostFromEnv: false, address: null,
+    }, true)).toContain('没有在监听')
+  })
+
+  it('★ 翻 LAN 开关失败时必须转述真实原因，不得把用户指向「先开总开关」（Issue #11）', () => {
+    // ⚠️ 这条锁的是**错误归因**：翻 LAN 开关时网关总开关**本来就是开的**
+    // （用户刚点的就是 LAN 开关），而换绑自身可能失败（要关旧实例再重建）。
+    // 原先一律回「先打开网关总开关」⇒ 把用户指向一个已经满足的条件。
+    const withReason = gatewayAllowLanToggleNotice({
+      ...base,
+      running: false,
+      allowLan: true,
+      hostFromEnv: false,
+      address: null,
+      lastError: { kind: 'start-failed', reason: 'listen EADDRINUSE: address already in use' },
+    }, true)
+    expect(withReason).toContain('EADDRINUSE')
+    expect(withReason).toContain('换绑失败')
+    expect(withReason).not.toContain('先打开网关总开关')
+
+    // 反向对照：没有 lastError 时才允许说「先打开总开关」——
+    // 否则上一条断言在「无条件都说换绑失败」的实现下也会绿（无牙）。
+    const withoutReason = gatewayAllowLanToggleNotice({
+      ...base, running: false, allowLan: true, hostFromEnv: false, address: null, lastError: null,
+    }, true)
+    expect(withoutReason).toContain('先打开网关总开关')
+  })
+
+  it('★ 绑 0.0.0.0 时状态行必须教用户把地址换成局域网 IP（0.0.0.0 抄走连不上）', () => {
+    const lines = gatewayStatusLines({
+      enabled: true,
+      running: true,
+      blockedByEnv: false,
+      allowLan: true,
+      hostFromEnv: false,
+      address: { host: '0.0.0.0', port: 8326 },
+      apiKey: null,
+      models: [],
+      modelsSource: 'none',
+    })
+    const joined = lines.join('\n')
+    expect(joined).toContain('0.0.0.0')
+    expect(joined).toContain('局域网 IP')
+    // 非回环警告必须点名宿主（既有守卫，见脚注用例的同条理由）。
+    expect(joined).toContain('宿主')
+  })
+
+  it('★ 回环部署的状态行不出现局域网指引（避免把精简过的文案重新撑肿）', () => {
+    const lines = gatewayStatusLines({
+      enabled: true,
+      running: true,
+      blockedByEnv: false,
+      allowLan: false,
+      hostFromEnv: false,
+      address: { host: '127.0.0.1', port: 8326 },
+      apiKey: null,
+      models: [],
+      modelsSource: 'none',
+    })
+    expect(lines.join('\n')).not.toContain('局域网 IP')
+  })
+})
+
+/**
+ * ★★ **「已选择允许局域网、但网关没在监听」不得谎报「已监听」**（2026-10-22 对抗审计 P2）。
+ *
+ * ## 修的那个真缺陷
+ *
+ * `gatewayAllowLanHint` 原来只判 `status.allowLan`，不判 `status.running` ⇒ 用户打开
+ * 开关但**网关总开关关着 / 端口被占 / env 停用**时，它输出「**已监听**全部网卡」——
+ * 这是**错误的安全陈述**（谎报暴露），且与同一弹窗里另外两条文案直接矛盾：
+ * - `gatewayStatusLines` 说「网关已关闭，不会监听任何端口」；
+ * - `gatewayFootnote` 说「网关只绑定 127.0.0.1」。
+ *
+ * ⇒ 三条文案对「现在到底在不在监听」给出**三种答案**。
+ * ⚠️ 这正是本仓 IKL7UN 反复记的那种「面板输出它自己声称要消除的错误安全陈述」，
+ *   只是方向反了（谎报暴露而非谎报安全）。
+ * ⚠️ 同文件 `gatewayAllowLanToggleNotice` **已经**判了 `running` ⇒ 这是
+ *   「同一语义两套判据」的实例，本次把 hint 补齐到同口径。
+ *
+ * ⚠️ 既有那条「提示文案按状态分支」的用例用的 `base` 是 `running: true`
+ * ⇒ **只覆盖了「已在监听」那一格**，对「已选择但未监听」零判别力（我实测：
+ *    把 `&& status.running` 去掉后它仍 107 passed）。
+ */
+describe('★ 局域网开关：已选择但未监听时不得谎报「已监听」', () => {
+  it('★★ allowLan=true 且 running=false ⇒ 不得出现「已监听」，必须说「还没生效」', () => {
+    const hint = gatewayAllowLanHint({
+      enabled: false,
+      running: false,
+      blockedByEnv: false,
+      allowLan: true,
+      hostFromEnv: false,
+      address: null,
+    } as never)
+    expect(hint, '⚠️⚠️ 网关没在监听，绝不能说「已监听」').not.toContain('已监听')
+    expect(hint, '必须如实说「没有在监听」').toContain('没有在监听')
+    expect(hint, '必须给出可执行的出路（打开总开关）').toContain('总开关')
+    // 与另外两条文案不矛盾的核验：这句不得断言「已绑定」。
+    expect(hint).not.toContain('已改绑')
+  })
+
+  it('★ allowLan=true 且 running=true ⇒ 仍然说「已监听」（修复不得削掉正向那一格）', () => {
+    const hint = gatewayAllowLanHint({
+      enabled: true,
+      running: true,
+      blockedByEnv: false,
+      allowLan: true,
+      hostFromEnv: false,
+      address: { host: '0.0.0.0', port: 8326 },
+    } as never)
+    expect(hint).toContain('已监听')
+    expect(hint).toContain('0.0.0.0')
   })
 })

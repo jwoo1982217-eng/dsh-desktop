@@ -48,8 +48,8 @@ async function probe(model: string, messages: unknown[]): Promise<{ blocked: boo
       Authorization: `Bearer ${String(cred.access_token)}`,
       Accept: 'text/event-stream', 'Content-Type': 'application/json',
       'X-Domain': 'copilot.tencent.com', 'X-Product-Code': 'codebuddy',
-      'X-IDE-Name': 'CodeBuddy', 'X-IDE-Type': 'CodeBuddy', 'X-IDE-Version': '1.106.1',
-      'X-Product': 'CodeBuddy', 'User-Agent': 'CodeBuddyIDE/1.106.1',
+      'X-IDE-Name': 'CodeBuddy', 'X-IDE-Type': 'CodeBuddy', 'X-IDE-Version': '4.12.2',
+      'X-Product': 'CodeBuddy', 'User-Agent': 'CodeBuddyIDE/4.12.2',
     },
     body: JSON.stringify({ model, messages, stream: true, max_tokens: 16 }),
   })

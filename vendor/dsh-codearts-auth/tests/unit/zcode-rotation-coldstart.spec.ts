@@ -347,4 +347,58 @@ describe('ZCode 冷启动首轮切号（activeAccountId 尚未记录）', () => 
     expect(result.auths[0]).toContain('jwt-FALLBACK')
     expect(result.marks).toEqual([])
   })
+
+  it('★★ picked 出参腿：适配器用 resolveCredential 写回的 accountId 进 tried（P2-3 补牙）', async () => {
+    /**
+     * ⚠ 2026-10-31 对抗审计补牙：`resolved.accountId ?? currentAccountId?.()`
+     * 的出参消费腿被砍（退回纯 `currentAccountId()`）时既有用例全绿 —— 因为
+     * 本文件既有桩的 `resolveCredential` **不写 `picked.accountId`**，两态同值。
+     *
+     * 真实接线（`index.ts` session-balance 之后）两者**会分叉**：
+     * `deps.reportAccount` 是进程级 Map，多会话并发下 `currentAccountId()` 可能
+     * 返回**别的会话**刚写入的账号；`picked.accountId` 才是本笔实际选中的。
+     * 本用例复刻该分叉：`resolveCredential` 选 acct-B 并写出参，而进程级
+     * `active` 被「并发会话」污染成 acct-A —— 切号时 `tried` 必须含 acct-B
+     * （出参值），不是 acct-A（Map 值）。
+     */
+    const { pool, triedSeen } = makePool([account('acct-A'), account('acct-B')])
+    let active = 'acct-A' // 进程级 Map 被并发会话污染后的旧值
+    const adapter = new ZcodeAdapter({
+      credentialRef: 'R' as never,
+      // 与真实接线同形：选 acct-B、写 `picked` 出参、**同时**污染进程级 Map。
+      resolveCredential: async (
+        _modelId?: string,
+        _sessionId?: string,
+        picked?: { accountId?: string },
+      ) => {
+        if (picked !== undefined) picked.accountId = 'acct-B'
+        active = 'acct-A' // 并发会话覆盖（模拟共享 Map 被别的请求改写）
+        return account('acct-B').credential
+      },
+      refresh: async () => {},
+      mintCaptcha: async () => 'param',
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        const headers = (init.headers ?? {}) as Record<string, string>
+        if (headers['Authorization']?.includes('jwt-B')) {
+          return errorResponse(429, { code: 1005, msg: 'exceed quota limit' })
+        }
+        return okSse()
+      }) as never,
+      gate: new ModelGate({ sleep: async () => {} }),
+      sleep: async () => {},
+      product: ZCODE,
+      accountPool: pool as never,
+      currentAccountId: () => active,
+    })
+
+    try {
+      for await (const _chunk of adapter.stream(streamOptions())) { /* 消费 */ }
+    } catch { /* acct-B 也被标死时 QUOTA_EXCEEDED 可接受；断言在 tried */ }
+
+    // ★ 承重断言：传给池的 `tried` 必须含 acct-B（出参值）。变异（M6 退回
+    //   currentAccountId）时这里只会含 acct-A ⇒ 红。
+    expect(triedSeen.length).toBeGreaterThan(0)
+    expect(triedSeen[0]?.has('acct-B'), 'tried 用的是进程级 Map 值而非出参值 ⇒ 并发下失败记错账号')
+      .toBe(true)
+  })
 })

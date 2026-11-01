@@ -130,7 +130,7 @@ describe('RPC 接线：宿主开窗结果必须回传，客户端据此决定是
     // ⚠️ 本改动只该影响 officeace。若把 `window.open` 整个删掉，
     //    另外 14 家的登录会**全部**失效。
     expect(clientSource, '普通 window.open 回退被删除 ⇒ 其余 provider 无法登录')
-      .toContain('openAccountLoginWindow({ provider, loginUrl')
+      .toContain('openAccountLoginWindow({ provider, accountId, loginUrl, rpcCall')
   })
 
   it('⑨ 无痕窗口打开后登录轮询照常进行（轮询不依赖浏览器 cookie）', () => {

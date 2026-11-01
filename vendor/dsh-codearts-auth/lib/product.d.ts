@@ -4,12 +4,24 @@
  * 这些产品同源：共用同一 CLI 内核、同一认证协议（cli-external-link）与同一套
  * ProductProvider 机制，差异全部收敛到这里，使多个 provider 共用一套实现。
  *
- * 实测依据（2026-09-14，逆向各产品 cli/product.json + 真实请求）：
+ * 配置依据（国内版 2026-10-27 本机 5.9.2 随包 product.json；国际版沿用原配置）：
  *
  * | 产品              | endpoint                    | platform       | genieVersion |
  * |-------------------|-----------------------------|----------------|--------------|
- * | CodeBuddy（中国） | https://copilot.tencent.com | ide            | —            |
- * | WorkBuddy（国际） | https://www.workbuddy.ai    | workbuddy-ai   | 5.5.2        |
+ * | WorkBuddy（中国） | https://www.workbuddy.cn    | workbuddy      | 5.9.2        |
+ * | WorkBuddy（国际） | https://www.workbuddy.ai    | workbuddy-ai   | 5.9.4        |
+ *
+ * ⚠️⚠️ **`genieVersion` 是本表最关键的一列**：客户端发出去的 `X-IDE-Version` 与
+ * `User-Agent` 里的版本**都取它**（反编译实证见 `CODEBUDDY.clientVersion` 的注释）。
+ * 它来自客户端 `product.json` 的 `genieVersion`，**不是**同文件的 `version`
+ * （后者是 VS Code 基底版本，只在 `genieVersion` 缺失时兜底）。
+ * 实测值来源（2026-10-30）：
+ * - CodeBuddy：`CodeBuddy CN/resources/app/product.json` → `version=1.106.1`、`genieVersion=4.12.2`
+ * - WorkBuddy：`WorkBuddyAI/resources/app.asar.unpacked/cli/product.json` → `genieVersion=5.9.4`
+ *
+ * ⚠️ **本仓仍缺一个客户端会发的头：`X-Product-Version`**（= 客户端的
+ * `productVersion`，与 `platformVersion` 是两个量）。官方拦截器会发它，我们没发。
+ * 当前不发也能 200（实测），故先登记为缺口、不擅自新增未验证的信号。
  *
  * 关于「模型列表为何不能共用」：两者的**路径与响应解析完全相同**
  * （`GET /v3/config` → `data.data.models` / `data.data.agents`），
@@ -61,6 +73,8 @@ export interface BuddyProduct {
     id: 'buddy' | 'workbuddy';
     /** auth/state 的 platform 查询参数 */
     platform: string;
+    /** 国内新版使用当前账号协议；国际版仍保留旧的 state 账户查询。 */
+    accountProtocol?: 'account-scoped';
     /**
      * API endpoint（含协议），所有 `/v2/plugin/*`、`/v3/config` 与 chat 请求
      * 都以此为基址。**这是不同区域产品之间最关键的差异**：模型池由它决定。
@@ -193,7 +207,7 @@ export declare const CODEBUDDY: BuddyProduct;
 /**
  * WorkBuddy 国际版（腾讯 WorkBuddy AI），platform = workbuddy-ai。
  *
- * 逆向自 `C:\Users\Jet\AppData\Local\Programs\WorkBuddyAI`（5.5.2）的 cli/product.json：
+ * 逆向自 `C:\Users\Jet\AppData\Local\Programs\WorkBuddyAI`（5.9.4）的 cli/product.json：
  * - `applicationName` = "workbuddy-ai"
  * - `endpoint` = "https://www.workbuddy.ai"（**与中国版不同**，模型池随区域变化）
  * - `authentication.attributes.platform` = "workbuddy-ai"

@@ -87,6 +87,14 @@ export interface OpencodePoolLike {
     opencodeFingerprintGenerationFor(accountId: string): number;
 }
 /**
+ * 匿名通道的 id 前缀 —— **全仓唯一的判据来源**。
+ *
+ * `src/index.ts` 的 `ensureDefaultAnonymousSlot`（「池里已经有匿名槽了吗」）
+ * 与客户端的 `isAnonymousAccountId`（`plugin-src/client/jet-hub.js`）都按这个
+ * 前缀判。三处必须同形，故这里导出常量供守卫用例对拍。
+ */
+export declare const OPENCODE_ANONYMOUS_ID_PREFIX: string;
+/**
  * 处理一个 opencode RPC 方法。
  *
  * @param method 来自主 `handleMethod` 的方法名。

@@ -117,6 +117,28 @@
  *    有专门一条锁死这个现状）。
  */
 import { pickBuddyAccount } from './buddy-balance-selector.js';
+import { sessionBalanceEnabled } from './session-balance.js';
+/**
+ * 显式声明「**本家没有免费模型概念**」的 `isFreeModel` 实现。
+ *
+ * ## 为什么需要这个常量（而不是让字段可选）
+ *
+ * `isFreeModel` 曾经是**可选**字段。于是新增一家 `balance: { kind: 'buddy' }`
+ * 装配时，漏传它 **既没有编译报错、也没有运行时报错** —— 只是静默地让该家的
+ * 免费模型走付费路径，被「锁定永久积分」拦住，报出「额度都属于永久」这种与
+ * 事实相反的文案，并把用户推向「解锁永久积分」（不可逆烧钱）。
+ *
+ * 这正是 Qoder 的实际事故：`src/qoder-adapter.ts` 的兜底表早在 `isFree: true`
+ * 上标好了 4 个免费模型，`toCatalogEntry` 也把 `isFree` 透出给了 UI，唯独
+ * 装配层漏了这三个字。同类缺陷此前在 buddy / workbuddy / trae 已经复发过一轮。
+ *
+ * ⇒ 把它改成**必填**后，新增渠道时漏写是**编译错误**。确实没有免费模型的渠道
+ * 用本常量显式表态，语义比裸写 `() => false` 清楚得多（后者读起来像「忘了实现」）。
+ *
+ * ⚠️ 只有**核实过**该家确实不存在模型级免费概念时才可以用它。判据是「产品/
+ * 兜底表里没有任何 `isFree: true`，且上游目录不返回 `is_free`」，不是「懒得查」。
+ */
+export const NO_FREE_MODEL = () => false;
 /**
  * 按 `enabled` + 模型限流筛出候选账号。
  *
@@ -161,7 +183,17 @@ export function createCredentialResolver(deps, config) {
             ? await config.readCredential(config.fallback.refName)
             : await config.fallback.resolve();
     };
-    return async (modelId) => {
+    return async (modelId, sessionId, selection) => {
+        /**
+         * 统一回报出口：既写 `selection`（本次请求私有，供 zcode 这类多账号并发
+         * 的适配器精确取「本笔实际账号」），也保留 `deps.reportAccount` 的既有
+         * 进程级副作用（账本 / activeZcodeAccountId 兼容）。
+         */
+        const report = (accountId) => {
+            if (selection !== undefined)
+                selection.accountId = accountId;
+            deps.reportAccount?.(accountId);
+        };
         /**
          * 分档编排排除掉的账号（**只有 buddy 协议会填**）—— 池兜底据此跳过它们，
          * 否则「档位最优但凭据损坏」的号会被 `getAvailableAccount` 立刻选回，
@@ -169,12 +201,15 @@ export function createCredentialResolver(deps, config) {
          */
         const tried = new Set();
         const plan = config.balance;
+        // 能力目录可能经账号池取凭据；必须先在选号串行锁外求值，避免嵌套同一锁。
+        const free = plan?.kind === 'buddy' ? await plan.isFreeModel(modelId) : false;
         const selectBalance = async () => {
             if (plan?.kind === 'buddy') {
                 // ⚠️ `isFreeModel` **先于**候选构造求值：与旧闭包「在 options 字面量里
                 //    await」的时序一致（它可能触发远端目录拉取，放到候选之后会把
                 //    「先拉目录、再筛候选」这个顺序反过来）。
-                const free = plan.isFreeModel === undefined ? false : await plan.isFreeModel(modelId);
+                // ⚠️ 字段现为**必填**（`NO_FREE_MODEL` 是「本家无免费模型」的显式表态），
+                //    故不再需要 `=== undefined` 兜底 —— 那种兜底正是 Qoder 漏接三周的遮掩。
                 const candidates = await candidatesOf(deps.pool, providerId, modelId);
                 // ① 免费模型（消耗 0 积分）不受「锁定永久积分」约束：锁定要保护的是
                 //    「别把永久积分烧掉」，而免费模型既不扣临时也不扣永久积分，却被那道门
@@ -190,7 +225,7 @@ export function createCredentialResolver(deps, config) {
                         const credential = await config.readCredential(candidate.credentialRef);
                         if (credential !== undefined) {
                             if (plan.reportPickedAccount !== false)
-                                deps.reportAccount?.(candidate.id);
+                                report(candidate.id);
                             deps.pool.rememberSelection?.(providerId, candidate.id);
                             return credential;
                         }
@@ -208,7 +243,7 @@ export function createCredentialResolver(deps, config) {
                 });
                 if (picked.kind === 'account') {
                     if (plan.reportPickedAccount !== false)
-                        deps.reportAccount?.(picked.account.id);
+                        report(picked.account.id);
                     deps.pool.rememberSelection?.(providerId, picked.account.id);
                     return picked.credential;
                 }
@@ -264,7 +299,7 @@ export function createCredentialResolver(deps, config) {
                     }
                     const credential = await config.readCredential(picked.account.credentialRef);
                     if (credential !== undefined) {
-                        deps.reportAccount?.(picked.account.id);
+                        report(picked.account.id);
                         deps.pool.rememberSelection?.(providerId, picked.account.id);
                         return credential;
                     }
@@ -288,9 +323,23 @@ export function createCredentialResolver(deps, config) {
             if (selected !== undefined || plan.kind === 'loomy')
                 return selected;
         }
-        const available = await deps.pool.getAvailableAccount(providerId, modelId ?? '', tried);
+        //    `'session-balance'` = zcode 的会话亲和 / 无 sessionId 随机分摊；
+        //    其余 provider 保持手动顺序优先（既有语义）。
+        //    ⚠️ 总开关是**池里的面板开关**（`sessionBalanceEnabled`，Jet Hub 页头
+        //    可切，落 `state.json`）：**每次现读**，关掉时连 `getAvailableAccountForSession`
+        //    都不进，与手动顺序路径逐字节同语义。池未实现该方法（单测替身）时
+        //    退回环境变量 `DSH_ZCODE_SESSION_BALANCE`（默认开）—— 两条判据只在
+        //    「结构化替身」这一条路径上并存，生产 `AccountPool` 恒走面板开关。
+        const poolSwitch = typeof deps.pool.sessionBalanceEnabled === 'function'
+            ? deps.pool.sessionBalanceEnabled()
+            : sessionBalanceEnabled();
+        const available = config.accountSelection === 'session-balance'
+            && poolSwitch
+            && deps.pool.getAvailableAccountForSession !== undefined
+            ? await deps.pool.getAvailableAccountForSession(providerId, modelId ?? '', sessionId, tried)
+            : await deps.pool.getAvailableAccount(providerId, modelId ?? '', tried);
         // ④ 回报「池的决策结果」——**未命中时也报 `undefined`**（见 `reportAccount` 契约）。
-        deps.reportAccount?.(available?.entry.id ?? undefined);
+        report(available?.entry.id ?? undefined);
         /**
          * ⚠️ **这里的 `as` 是刻意保留的、已知的取舍**（缺陷史见下），不是顺手写的。
          *

@@ -9,6 +9,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   classifyTraeError,
+  classifyTraeStreamCode,
+  isRotatableTraeStreamCode,
   isTraeTerminalError,
   recordsTraeRateLimit,
   shouldRotateTraeAccount,
@@ -72,6 +74,71 @@ describe('TRAE 错误分类', () => {
     // 若先按状态码判，400 会落到 client，于是反复重试一个永远不会成功的账号。
     expect(classifyTraeError(400, '4008')).toBe('quota-exceeded')
     expect(classifyTraeError(400, '1005 plan')).toBe('hard-plan')
+  })
+})
+
+/**
+ * ★ 流内 `event:error` 的**结构化码**入口（2026-10-24 真实报障）。
+ *
+ * 报障现场：上游用 HTTP 200 + SSE `event:error` 下发 `code=1005` 而 **`message`
+ * 为空**，两个账号同被同一模型（`kimi-k3.1-pro`）拒，用户只看到
+ * `trae:  (code=1005)`（冒号后**两个空格**）与徽章 `QUOTA_EXCEEDED`。
+ *
+ * 旧实现在换号循环里把 `{ code, message }` 序列化成 JSON 再喂**文案**表，
+ * 而文案表的 `hard-plan` 还要求 `plan` 关键词 ⇒ 判 `'none'` ⇒ 冷却 **0ms**
+ * ⇒ 限流标记写在失败那一瞬间、下次选号**立刻又选回同一个号**。
+ */
+describe('TRAE 流内结构化码分类（2026-10-24 真实报障回归）', () => {
+  it('1005 判 hard-plan（只查码表，不看 message）', () => {
+    expect(classifyTraeStreamCode(1005)).toBe('hard-plan')
+  })
+
+  it('★ 1005 的冷却必须是 12h，绝不是 0ms（换号形同虚设的根因）', () => {
+    // 旧实现：classifyTraeError(0, '{"code":1005,"message":""}') ⇒ 'none' ⇒ 0ms
+    expect(traeCooldownFor(classifyTraeStreamCode(1005)!)).toBe(12 * 3_600_000)
+  })
+
+  it('4008 / 4011 精确映射（与冷却表逐格对齐）', () => {
+    expect(classifyTraeStreamCode(4008)).toBe('quota-exceeded')
+    expect(traeCooldownFor(classifyTraeStreamCode(4008))).toBe(24 * 3_600_000)
+    expect(classifyTraeStreamCode(4011)).toBe('soft-rate')
+    expect(traeCooldownFor(classifyTraeStreamCode(4011))).toBe(60_000)
+  })
+
+  it('表外码**没有类别**（不得回落文案表，也不得凭空升级）', () => {
+    // ⚠️ 2026-10-25 审计 F-02：旧实现的「表外码回落文案表」在生成路径上
+    // **不可达**（唯一的调用点前已被同一张表过滤），而它恰恰把 `{code,message}`
+    // 序列化成 JSON 再喂**文案表** —— 那是本 PR 要消灭的形态（旧缺陷正是
+    // 「拿 JSON 喂文案表 ⇒ 判 none ⇒ 冷却 0ms」）。死代码 + 复活旧形态 ⇒ 删掉。
+    //
+    // 新契约：**只认表**。表外码返回 `undefined`，由调用方决定兜底冷却，
+    // 绝不尝试从 `message` 文案里猜类别。
+    expect(classifyTraeStreamCode(4006)).toBeUndefined()
+    expect(classifyTraeStreamCode(4001)).toBeUndefined()
+    expect(classifyTraeStreamCode(9999)).toBeUndefined()
+    // 反向对照：表内码仍然必须给出类别（删回落不得连带削掉正路）
+    expect(classifyTraeStreamCode(1005)).toBe('hard-plan')
+  })
+
+  it('isRotatableTraeStreamCode：表内 3 个换号，4001 / 4006 刻意不换号', () => {
+    expect(isRotatableTraeStreamCode(1005)).toBe(true)
+    expect(isRotatableTraeStreamCode(4008)).toBe(true)
+    expect(isRotatableTraeStreamCode(4011)).toBe(true)
+    // 4001（模型不可调用）：换账号也是同一个模型被拒
+    expect(isRotatableTraeStreamCode(4001)).toBe(false)
+    // 4006（体积超限）：另有专用出口 CONTEXT_WINDOW_EXCEEDED，换号无意义
+    expect(isRotatableTraeStreamCode(4006)).toBe(false)
+  })
+
+  it('换号判据与类别表是同一份（表内码都必须换号）', () => {
+    // 反向验证：把 isRotatableTraeStreamCode 改成查一张独立表，此用例仍可能绿 ⇒
+    // 故这里同时断言「表内码的类别都该换号」，两腿一起钉住。
+    for (const code of [1005, 4008, 4011]) {
+      const kind = classifyTraeStreamCode(code)
+      expect(kind, String(code)).toBeDefined()
+      expect(shouldRotateTraeAccount(kind!), String(code)).toBe(true)
+      expect(isRotatableTraeStreamCode(code), String(code)).toBe(true)
+    }
   })
 })
 

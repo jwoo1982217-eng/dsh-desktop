@@ -118,3 +118,18 @@
  .dsh-peer-badge{position:fixed;top:40px;right:8px;z-index:16;max-width:45vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:8px;background:#eef4ff;color:#2151a4;padding:3px 7px;font:11px system-ui}
  body.dsh-peer-remote .wSkVaW_titleRow{padding-right:0}
 }
+
+/* Remote phones own one viewport; desktop column sizing and wallpaper
+   sidebar positioning must not shrink the conversation or cover the drawer. */
+@media(max-width:700px){
+ html:has(body.dsh-peer-remote:not([data-we-wallpaper])){background-color:#151517!important;color-scheme:dark!important}
+ body.dsh-peer-remote:not([data-we-wallpaper]){--dsw-alias-bg-base:#151517!important;--dsw-alias-bg-layer-1:#1d1f24!important;--dsw-alias-bg-layer-2:#272a31!important;--dsw-specific-sidebar-fill:#1b1d22!important;--dsw-alias-label-primary:#f3f4f6!important;--dsw-alias-label-secondary:#cbd0da!important;background-color:transparent!important}
+ body.dsh-peer-remote{background-color:transparent!important}
+ body.dsh-peer-remote[data-we-wallpaper]{--dsw-alias-bg-base:transparent!important;--dsw-specific-sidebar-fill:transparent!important}
+ body.dsh-peer-remote[data-we-wallpaper] #root :is([class*="_frame"],[class*="_root"],.pI_x6G_centerCol,.pI_x6G_sidebarCol){background-color:transparent!important}
+ body.dsh-peer-remote #root :is(.pI_x6G_frame,.pI_x6G_centerCol,.wSkVaW_root){background-color:transparent!important}
+ body.dsh-peer-remote:not([data-we-wallpaper]) #root .pI_x6G_sidebarCol{background-color:#1b1d22!important}
+ body.dsh-peer-remote:not([data-we-wallpaper]) #root .uV2eYG_card{background-color:rgba(29,31,36,.94)!important}
+ body.dsh-peer-remote #root .pI_x6G_frame>.pI_x6G_centerCol{position:absolute!important;inset:0!important;box-sizing:border-box;width:100%!important;height:100%!important;max-width:none!important;min-width:0!important;min-height:0!important;grid-area:auto!important}
+ body.dsh-peer-remote #root .pI_x6G_sidebarCol{position:fixed!important;left:0!important;top:44px!important;bottom:0!important;z-index:14!important;height:calc(var(--dsh-phone-viewport-height,100dvh) - 44px)!important}
+}

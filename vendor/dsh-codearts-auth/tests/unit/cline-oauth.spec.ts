@@ -31,7 +31,7 @@ function registerResponse(): Response {
     success: true,
     data: {
       accessToken: 'workos:eyJhbGciOiJSUzI1NiIs',
-      refreshToken: 'tmgEeM2rd9ybYoWpXl8JqUfvK',
+      refreshToken: 'synthetic-cline-refresh-fixture-0000',
       expiresAt: '2026-09-25T05:23:47.000Z',
       tokenType: 'Bearer',
       userInfo: {

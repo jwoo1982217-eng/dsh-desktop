@@ -69,10 +69,89 @@
 import { type CheckinStatus, type ClaimOutcome, type CreditBalance } from './credits.js';
 import { type QoderCredential } from './qoder.js';
 import type { QoderProduct } from './qoder-product.js';
+import type { ProviderBalanceDetail } from './provider-runtime.js';
 /** 用量接口路径（挂 `openApiBase`）。 */
 export declare const QODER_USAGE_PATH = "/sash/api/v2/me/usage";
 /** 活动列表路径（挂 `openApiBase`）。 */
 export declare const QODER_CAMPAIGNS_PATH = "/sash/api/v1/me/campaigns";
+/**
+ * Qoder 对 `userQuota`（套餐额度）下发的 **永久哨兵** 到期时刻
+ * （毫秒）—— `253402214400000` = `9999-12-31T00:00:00.000Z`。
+ *
+ * ## 取证：**这不是任何东西的真实到期时刻**
+ *
+ * 2026-10-20，两个真实 qodercn 账号，`GET {openApiBase}/sash/api/v2/me/usage`
+ * （`openApiBase` = `https://openapi.qoder.com.cn`）：
+ *
+ * ```json
+ * { "displayMode": "qoder",
+ *   "qoderUsage": {
+ *     "userId": "…", "userType": "personal_standard", "usageType": "credits",
+ *     "totalUsagePercentage": 0, "isQuotaExceeded": false,
+ *     "expiresAt": 253402214400000,
+ *     "upgradeUrl": "https://qoder.cn/pricing?client=qoder",
+ *     "userQuota":  { "total": 0, "used": 0, "remaining": 0,
+ *                     "percentage": 0, "unit": "credits" },
+ *     "addOnQuota": { "total": 2000, "used": 0, "remaining": 2000,
+ *                     "percentage": 0, "unit": "credits",
+ *                     "detailUrl": "https://qoder.cn/account/usage" },
+ *     "isPlanQuotaProrated": false } }
+ * ```
+ *
+ * ⚠️ 三个必须分辨的事实（缺一就会把哨兵当到期时刻）：
+ * - `expiresAt` 的**语义归属是 `userQuota`（套餐额度）**，**不是** `addOnQuota`，
+ *   也**不是**任何一笔逐包到期；
+ * - `addOnQuota`（用户截图里「个人资源包 1,900」）**只给聚合标量**
+ *   （`total` / `used` / `remaining`）+ 一个 `detailUrl` 网页链接，
+ *   **没有任何日期字段**；
+ * - `dedicatedResourcePackages` 是**唯一**带真实逐包到期（`expiresAt` 字符串）
+ *   的字段，而本机账号实测为 `undefined`。
+ *
+ * ## 权威旁证（Qoder 官方客户端 asar，来源同一次审计）
+ *
+ * `D:\Qoder\resources\app.asar` 的 `/out/renderer/assets/index-DDa3WwIe.js`
+ * 与 `/out/main/index.js` 里客户端自己的用量面板 `buildUsageItemGroups()`：
+ * - 对 `addOnQuota` **只渲染 used/total/remaining，不给任何日期**；
+ * - 只有 `userQuota.expiresAt` 走 `renewson`（文案「将于 {{date}} 刷新」，
+ *   语义是**订阅刷新日**，不是积分到期）；
+ * - `dedicatedResourcePackages` 才走 `expiresOn`（文案「有效期至 {{date}}」）。
+ *
+ * ⇒ 官方客户端自己就不把 `expiresAt` 当作「这批积分何时作废」。
+ *
+ * ## ⚠️ 若把它写进 `deductionEndTime` 会发生什么（**可观测后果**）
+ *
+ * 客户端 `plugin-src/client/credit-expiry.js` 的 `formatPackageExpiry` 会把
+ * `253402214400000` 渲染成 **`9999-12-31（约 2900000 天后）`** ——
+ * 用户看到的是荒谬文案。反之，**不写** `deductionEndTime` 时
+ * `packageExpiryMs` 返回 `null` ⇒ 显示**「长期」**，正是三档分档里
+ * 「永久（未知到期）」那一档的展示形态。
+ *
+ * ⇒ 判据：`expiresAt >= 本常量`，**或**解析出的年份 `>= 9999`（兜住
+ *   `9999-01-01`~`9999-12-30` 这类小于常量、但同样是哨兵的取值——
+ *   它们落在 `253370764800000`~`253402214399999` 区间）。命中即
+ *   **不写** `deductionEndTime`（保守方向：未知到期 ⇒ 永久桶）。
+ */
+export declare const QODER_PERMANENT_EXPIRY_MS = 253402214400000;
+/**
+ * 该毫秒值是否是 Qoder 的**永久哨兵**（`9999-12-31` 那一族）。
+ *
+ * ⚠️ **两条支路共用本判据**（本仓库红线：同一语义只留一份实现）：
+ * - 支路 A（`userQuota` 的数字 `expiresAt`）—— `qoderUsage.expiresAt`；
+ * - 支路 B（`dedicatedResourcePackages[].expiresAt` 的 ISO 字符串，解析后）。
+ *
+ * 上一版只判了支路 A，于是支路 B 的哨兵会原样写进 `deductionEndTime` ⇒
+ * 客户端渲染「9999-12-31（约 290 万天后）」，且该包被判成 `longTerm`
+ * 而不是 `permanent`（锁定时**照样可选** ⇒ 锁定形同虚设）。
+ * 详见 `toPackage` 里 `expIsPermanent` 那一段的实测记录。
+ *
+ * 判据三条（任一命中即哨兵）：
+ * 1. `>= QODER_PERMANENT_EXPIRY_MS`（`9999-12-31T00:00:00Z` 及更晚）；
+ * 2. 解析出的 **UTC 年份 >= 9999**（兜住 `9999-01-01`~`9999-12-30`，
+ *    它们小于上面的常量但同样是哨兵）；
+ * 3. 非有限值 —— 返回 `false`（「解析失败」不是哨兵，由调用方按「未知到期」
+ *    处理；两者最终都落永久桶，但语义不同，不要混在一个判据里）。
+ */
+export declare function isPermanentSentinelMs(ms: number): boolean;
 /**
  * 每日活动**刷新时刻**（UTC+8 的小时）。来源是服务端自己下发的原文：
  * `description: "每日 10:00（UTC+8）刷新，领取后 30 天有效"`（见文件头）。
@@ -208,6 +287,49 @@ export declare const QODER_PLAN_PACKAGE = "\u5957\u9910\u989D\u5EA6";
  * 报 0 会误导用户以为没额度。
  */
 export declare function fetchQoderCreditBalance(credential: QoderCredential, product: QoderProduct, fetcher?: typeof fetch): Promise<CreditBalance | null>;
+/** {@link fetchQoderBalanceDetailed} 的可选项。 */
+export interface QoderBalanceOptions {
+    /** 注入 fetcher（测试用；生产用全局 `fetch`）。 */
+    fetcher?: typeof fetch;
+    /**
+     * 单次请求超时（毫秒）。默认 {@link QODER_CREDITS_TIMEOUT_MS}。
+     *
+     * ⚠️ 面板**并发**查询所有账号（2026-10-21 起），故 N 个账号的最坏总耗时
+     *    约等于**单账号**的耗时，不再线性叠加。但单账号本身仍可能耗满本值：
+     *    国际版被 SNI 阻断时实测 10.7s（undici 自己的 connect timeout 先于
+     *    本值触发）⇒ 调小本值**不会**让墙外的失败更快返回，只能调大。
+     */
+    timeoutMs?: number;
+}
+/**
+ * 查询 Qoder 账号积分余额，**失败时带上可读原因**（Jet Hub 面板用）。
+ *
+ * ## 为什么需要这个并列函数（而不是改造上面那个）
+ *
+ * `fetchQoderCreditBalance` 的契约是「查不到就 `null`」—— 它服务于
+ * `BuddyBalanceSelector`（选号/分档，只关心金额）与 `sharedPackageExpiry`
+ * （折算到期，只关心日期）。那两处**不需要**原因，硬塞原因会让 20 多处
+ * `balance!.total` 断言全破。
+ *
+ * 但**面板**需要原因：原实现的报障形态是「一直读取中」，最终只落到一句
+ * 「积分查询失败（凭据失效或响应异常）」—— 这句话把**网络不通**、**401**、
+ * **响应变形**、**企业版无数字**四种完全不同的处境压成同一句，用户无法据此
+ * 做任何事。实测本机 Qoder 国际版：`openapi.qoder.sh` 的 TCP 443 能连通
+ * （93ms），但 **TLS ClientHello 被丢**（12s 无响应），故 `fetch` 必在 10.7s
+ * 后报 `UND_ERR_CONNECT_TIMEOUT` —— 这是**环境问题**，不是凭据问题。
+ *
+ * ## 判据分层（与 `astudio-credits.ts` 的 `fetchAstudioBalanceDetailed` 同款）
+ *
+ * 1. **传输层**：`aborted` / 错误码命中「出不去」⇒ 点名实际主机 + 出路。
+ * 2. **HTTP 层**：401/403 = 凭据；其它非 2xx = 服务端（带状态码）。
+ * 3. **形状层**：非 JSON / 非对象 / 缺 `qoderUsage` / 一个包都没解析出来。
+ * 4. **企业版**：`displayMode === 'enterprise'` ⇒ 上游本就不给数字（不是故障）。
+ *
+ * @returns 成功时 `{ balance }`；失败时 `{ balance: null, error }`。
+ *   ⚠️ 永远返回 `balance` 字段（共享骨架靠 `balance` 判定成败，
+ *   `error` 只影响文案 —— 见 `provider-runtime.ts` 的 `ProviderBalanceDetail`）。
+ */
+export declare function fetchQoderBalanceDetailed(credential: QoderCredential, product: QoderProduct, options?: QoderBalanceOptions): Promise<ProviderBalanceDetail>;
 /** 把 `CreditBalance` 压成一行可读摘要（供探针与日志使用）。 */
 export declare function describeQoderBalance(balance: CreditBalance | null): string;
 /** 一个可领取的活动条目（`campaigns[]` 的一项，只保留实现需要的字段）。 */

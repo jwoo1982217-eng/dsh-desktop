@@ -1,11 +1,14 @@
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it } from 'vitest'
 import {
+  classifyToolArguments,
   hasUsableToolName,
   isTruncatedArguments,
   normalizeToolArguments,
   readWithIdleTimeout,
   resolveToolPairing,
+  TOOL_ARGS_INVALID_CODE,
+  toolArgsInvalidFailure,
 } from '../../src/sse.js'
 
 /** 构造一个永不产出数据的流（模拟半开的 SSE 连接）。 */
@@ -265,5 +268,159 @@ describe('normalizeToolArguments', () => {
     // 嵌套对象与数组值都应保留。
     expect(normalizeToolArguments('{"files": ["a.ts", "b.ts"], "opts": {"depth": 2}}'))
       .toBe('{"files": ["a.ts", "b.ts"], "opts": {"depth": 2}}')
+  })
+})
+
+/**
+ * 工具参数的**三态**分类（Gitee IKQ8Y1）。
+ *
+ * ## 真实缺陷
+ *
+ * `isTruncatedArguments` 只做 `JSON.parse`，把**两种完全不同的病理**混成一个
+ * `true`：流被掐断（参数半截）与模型语法写坏（结构闭合但非法）。四个适配器
+ * 都把它并进 `max-tokens` ⇒ DSH 客户端那句**固定 i18n**「已达到输出 token 上限」
+ * 把真实病因吞掉（实测受害轮次 `outputTokens` 只用了 2516/128000）。
+ *
+ * ## ⚠️ 本组用例的坏样本是**逐字真实报文**
+ *
+ * 采自会话 `session-e2199832` / `session-b61246db`（跨 2 天、两个不同工作区、
+ * 同一工具 `compress`、同一失败字符位）：`content` 漏了开引号、正文是裸文本
+ * 且含真实换行 ⇒ `JSON.parse` 在第 13 个字符失败，而末尾 `}` 配平、引号成对。
+ * **不要**为了好写而换成人工构造的样本 —— 那条判据正是从「结构闭合」推导出来的。
+ */
+describe('classifyToolArguments（三态：ok / truncated / invalid）', () => {
+  /**
+   * 真实坏样本（Gitee IKQ8Y1，逐字；含真实换行）。
+   *
+   * `{"content": 【m00055–m00067 · 撰写 vibe coding 指南与技能库查询】` —— `content`
+   * 的值**没有开引号**，正文是裸文本。
+   */
+  const REAL_BAD =
+    '{"content": 【m00055–m00067 · 撰写 vibe coding 指南与技能库查询】\n'
+    + '- memory_procedure_list 查询「vibe coding 研究 检索 报告」→ 技能库无匹配（共 8 条）。\n'
+    + '- 用 write 写出 `C:\\Users\\<user>\\Desktop\\dsh默认\\vibecoding-实践指南.md`…待用户决定。}'
+
+  it('★ 真实坏样本判 invalid（不是 truncated）', () => {
+    // 先自证样本确实是「结构闭合但非法」——否则下面的断言是恒真的。
+    expect(() => JSON.parse(REAL_BAD)).toThrow()
+    expect(REAL_BAD.trim().endsWith('}')).toBe(true)
+    expect(classifyToolArguments(REAL_BAD)).toBe('invalid')
+  })
+
+  it('同一内容的合法版本判 ok', () => {
+    expect(classifyToolArguments(JSON.stringify({ content: 'abc\ndef' }))).toBe('ok')
+    expect(classifyToolArguments('{"command":"ls -la"}')).toBe('ok')
+    expect(classifyToolArguments('{}')).toBe('ok')
+  })
+
+  it('空串判 ok（无参数工具只下发空分片，这是合法的）', () => {
+    expect(classifyToolArguments('')).toBe('ok')
+    expect(classifyToolArguments('   ')).toBe('ok')
+    // 与既有 `isTruncatedArguments` 的语义对齐（它也对空串返回 false）。
+    expect(isTruncatedArguments('')).toBe(false)
+  })
+
+  it('★ 从合法 JSON 的**任意位置**切断都判 truncated（分片丢失不得被误判成 invalid）', () => {
+    // 这是 issue 验收标准第 4 条的反向守卫：`session-23851745` 那种
+    // 「并行下发丢分片、只剩路径中段与尾部」必须仍判 truncated。
+    const full = '{"a":"b\\"c","d":["e",1,{"f":true}],"g":null}'
+    const classes = new Set<string>()
+    for (let i = 1; i < full.length; i += 1) {
+      const kind = classifyToolArguments(full.slice(0, i))
+      classes.add(kind)
+      // 任何前缀都不得被定罪成「模型写坏了」——那会给出错误的处置建议。
+      expect(kind, `前缀长度 ${i}: ${JSON.stringify(full.slice(0, i))}`).not.toBe('invalid')
+    }
+    // 且**确实**覆盖到 truncated 这一格（防「全部返回 ok」这种假绿）。
+    expect(classes.has('truncated')).toBe(true)
+  })
+
+  it('★ 分片丢失的真实形态（只剩路径中段与尾部）判 truncated', () => {
+    // 采自 `sse.ts` 注释记录的 session-23851745：两个并行 `read` 都丢了
+    // `{"file_path": "…` 前缀。
+    expect(classifyToolArguments('om/Desktop/x.md"}')).toBe('truncated')
+    expect(classifyToolArguments('\\deveco-code-rust\\crates\\deveco')).toBe('truncated')
+  })
+
+  it('末尾仍有 } 但引号奇数 ⇒ fail-safe 判 truncated（不给错误的定罪）', () => {
+    // 模型写坏但**没**以 `}` 收尾（多打一个引号）时无法与「截在字符串中间」
+    // 区分 ⇒ 宁可继续报 max-tokens。这是 issue 里明确要求的 fail-safe 方向。
+    expect(classifyToolArguments('{"a":"b}')).toBe('truncated')
+  })
+
+  it('括号深度转负 ⇒ 前面缺了开括号 ⇒ truncated', () => {
+    expect(classifyToolArguments('a"}')).toBe('truncated')
+    expect(classifyToolArguments('1]}')).toBe('truncated')
+  })
+
+  it('两个对象相连 {...}{...} ⇒ invalid（结构各自闭合，但整体非法）', () => {
+    // 这是 `openai-compat.ts` 记录过的真实形态：DSML 与上游下标撞车导致
+    // 参数被 `+=` 拼成两段相连的非法 JSON。判 invalid 而非 truncated 是**刻意的**：
+    // 它不是「被掐断」，重跑一次的形态大概率为同一份坏输出。
+    expect(classifyToolArguments('{"a":1}{"b":2}')).toBe('invalid')
+  })
+
+  it('字符串里含未转义换行 ⇒ invalid（模型把正文直接塞进字符串）', () => {
+    expect(classifyToolArguments('{"a":"line1\nline2"}')).toBe('invalid')
+  })
+
+  it('转义处理：`\\"` 与 `\\\\` 不得翻转字符串状态（否则括号统计错位）', () => {
+    // 合法样本：一个「转义引号」+ 一个「转义反斜杠」，都能正常解析 ⇒ ok。
+    expect(classifyToolArguments('{"a":"b\\"c"}')).toBe('ok')
+    expect(classifyToolArguments('{"a":"b\\\\"}')).toBe('ok')
+    // 坏样本：括号在字符串**外**不配平 —— 若转义腿写错（把 `\"` 当成字符串
+    // 边界），统计会错位而给出 ok/truncated 的反向结论。
+    expect(classifyToolArguments('{"a":"b\\"c"}')).toBe('ok')
+    expect(classifyToolArguments('{"a":"\\"}{')).toBe('truncated')
+  })
+})
+
+/**
+ * 「工具参数不是合法 JSON」的错误码与文案（Gitee IKQ8Y1）。
+ *
+ * ⚠️ 判据必须打在**文案与码的字面约定**上：DSH 客户端对除
+ * `AUTH` / `QUOTA` / `ACCOUNT_QUOTA` 外的码**原样透传 message**，故 message
+ * 是「把真实原因送到用户眼前」的唯一通道。
+ */
+describe('toolArgsInvalidFailure', () => {
+  it('★ 码必须是 TOOL_ARGS_INVALID（不是 max-tokens）', () => {
+    const failure = toolArgsInvalidFailure([{ name: 'compress', chars: 4757 }])
+    expect(failure.code).toBe(TOOL_ARGS_INVALID_CODE)
+    expect(failure.code).not.toBe('max-tokens')
+  })
+
+  it('★ 文案必须含工具名与字符数，且显式否认「token 上限」与「网络中断」', () => {
+    const failure = toolArgsInvalidFailure([{ name: 'compress', chars: 4757 }])
+    expect(failure.message).toContain('compress')
+    expect(failure.message).toContain('4757')
+    // 「不是输出 token 上限」这句是**要害**：用户最可能的错误猜想有两条，
+    // 一条来自 DSH 那句固定 i18n，一条来自常见的断流误判。
+    expect(failure.message).toContain('不是输出 token 上限')
+    expect(failure.message).toContain('不是网络中断')
+    // ⚠️ 错误 message 是**纯文本**渲染：Markdown 强调符会原样显示成星号。
+    expect(failure.message).not.toContain('**')
+  })
+
+  it('★ 文案**不得**出现「回答被截断」（那是 max-tokens 的固定 i18n 措辞）', () => {
+    const failure = toolArgsInvalidFailure([{ name: 'compress', chars: 10 }])
+    // issue 验收标准第 2 条：message 不含「回答被截断」字样。
+    expect(failure.message).not.toContain('回答被截断')
+    expect(failure.message).not.toContain('已达到输出 token 上限')
+  })
+
+  it('未命名工具回退成可读占位，不写 (undefined)', () => {
+    const failure = toolArgsInvalidFailure([{ name: undefined, chars: 3 }])
+    expect(failure.message).toContain('(未命名工具)')
+    // 「String(undefined)」是本仓库记录过的真实缺陷形态之一。
+    expect(failure.message).not.toContain('undefined')
+  })
+
+  it('多个坏块只列前 3 个并给总数（避免把提示刷成一面墙）', () => {
+    const blocks = Array.from({ length: 5 }, (_, i) => ({ name: `tool${i}`, chars: i }))
+    const failure = toolArgsInvalidFailure(blocks)
+    expect(failure.message).toContain('tool0')
+    expect(failure.message).toContain('tool2')
+    expect(failure.message).not.toContain('tool3')
+    expect(failure.message).toContain('5 个调用')
   })
 })

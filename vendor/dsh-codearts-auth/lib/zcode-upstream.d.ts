@@ -66,11 +66,96 @@ export declare const ZCODE_EVENT_REPORT_URL = "https://zcode.z.ai/api/v1/event/r
 /** 客户端配置端点（captcha 配置与模型池都从这里来）。 */
 export declare const ZCODE_CLIENT_CONFIGS_URL = "https://zcode.z.ai/api/v1/client/configs";
 /**
+ * 营销投放查询端点（**只读**）。
+ *
+ * ## 来源（逆向官方 `app.asar` 实证，2026-10-23）
+ *
+ * 官方 Electron 产物的 `createMarketingTouchService`（scoop 安装版
+ * `resources/app.asar` → `out/host/index.js`）：
+ *
+ * ```js
+ * GET  /api/v1/marketing/touch?seq=<n>          // 查投放（deliveries[]）
+ * POST /api/v1/marketing/touch/action           // 回执 {campaign_id, action_type}
+ * ```
+ *
+ * 请求头只有四个：`X-Device-Mid` / `X-Client-Language` /
+ * `X-ZCode-App-Version` /（可选）`Authorization`。
+ */
+export declare const ZCODE_MARKETING_TOUCH_URL = "https://zcode.z.ai/api/v1/marketing/touch";
+/** 营销动作回执端点（`action_type` 实测只有 `confirm` / `cancel`）。 */
+export declare const ZCODE_MARKETING_ACTION_URL = "https://zcode.z.ai/api/v1/marketing/touch/action";
+/**
+ * ★★ **受版本门控的功能**所需的**最低客户端版本**（实测，2026-10-23）。
+ *
+ * ## 门控在**两个端点上都成立**（两条独立实测）
+ *
+ * ### ① 营销投放（同一账号、同一套头，**只改这一个头**）
+ *
+ * | `X-ZCode-App-Version` | `GET /marketing/touch` 的 `data.deliveries` |
+ * |---|---|
+ * | `3.14.3`（本插件此前写入凭据的版本） | **`[]`（空）** |
+ * | `3.16.3`（用户装的官方版） | `[{campaign_id:"2113475573403824128", …}]` |
+ *
+ * ### ② **领取**（`POST /zcode-plan/billing/claim`，2026-10-23 真机一发定音）
+ *
+ * | `X-ZCode-App-Version`（**其余头完全相同**） | claim 返回 |
+ * |---|---|
+ * | `3.14.3` | **`400 / code 1004 "no permission"`**（官方文案 `manualClaimPlan.claim.failure.ineligible` = 「当前账号或**客户端版本**不满足领取条件」） |
+ * | `3.16.2` | **`200 / code 0`** + `data.plan.{user_plan_id, status:"active", entitlements:[3 亿 + 2 亿]}` ★ |
+ *
+ * ⇒ 只抬营销请求的版本**不够**：`1004` 会让「拿到了活动却领不到」，
+ *   而它**看起来像账号没资格**（极具误导性）。两个端点必须**同抬**。
+ *
+ * ⚠ 官方客户端的 claim 也报自己的版本（`app.asar` → `out/host/index.js` 的
+ *   `claimManualPlan`：`'X-ZCode-App-Version': Ir`；本机 `Ir` 即客户端版本
+ *   `3.16.2`，同文件 `var Vu="3.16.2"`）⇒ **我们报 3.14.3 才是那个异类**。
+ *
+ * ⚠ **只对这两条门控路径覆盖版本**（`zcodeVersionGatedAppVersion()`），
+ *   不改凭据里的 `app_version`、也**不**全局抬 `ZCODE_APP_VERSION_FALLBACK`：
+ *   推理路径的既有实测结论（含 `3012` 的消融矩阵）都是在 3.14.3 上取到的，
+ *   无证据地整体抬版本会把这些结论一起作废。
+ *
+ * ⚠ **下限未二分**：营销侧只测了 `3.14.3` 空 / `3.16.3` 有；领取侧测了
+ *   `3.14.3` 失败 / `3.16.2` 成功。取 `3.16.3` 是该区间内的保守上界，
+ *   **不声称它是最低下限**。
+ */
+export declare const ZCODE_VERSION_GATED_MIN_APP_VERSION = "3.16.3";
+/**
+ * 该宿主该发的平台三件套（三值同源，见上方注释）。
+ *
+ * ⚠ 两个形参都**必须入参化**（默认取真实宿主）：三件套的自洽性只在「非 win32
+ * 宿主」上才可能出问题，而 CI / 开发机大多是 win32 ⇒ 不注入就**永远测不到**那条
+ * 分支。2026-10-25 审计实测：在 Windows 上把 `X-Os-Version` 换回 `os.release()`
+ * 后，宿主机相关的断言**全绿** —— 因为本机的 `os.release()` 恰好就是
+ * `10.0.26100`，与伪装值逐字相同。故内核版本也必须能注入。
+ */
+export declare function zcodeClientPlatform(hostPlatform?: NodeJS.Platform, hostOsVersion?: string): {
+    platform: string;
+    osCategory: string;
+    osVersion: string;
+};
+/**
  * 构造 ZCode 的「来源标识」请求头。
  *
- * ⚠ 这些头是官方客户端在真实流量里发的。实测**它们不是 3012 的判据**
- * （判据是请求体里的 system 内容），但它们仍是「像官方客户端」的一部分，
- * 且 `X-Device-Mid` **是硬需求**（缺它 billing 全家桶回 400）。
+ * ## ★ 这些头的值以官方客户端的真实抓包为准（2026-10-25 逐字对齐）
+ *
+ * 官方 GUI 的一次 `/v1/messages` 带 **18 个头**。本函数此前只发 10 个，
+ * 且其中**两个的值与官方不符**：
+ *
+ * | 头 | 官方 | 本函数（改前） |
+ * |---|---|---|
+ * | `x-release-channel` | `production` | `stable` ✗ |
+ * | `x-platform` | `win32-x64` | `win32` ✗ |
+ *
+ * 并缺 7 个官方每次都带的头：`x-title` / `x-os-version` / `x-zcode-agent` /
+ * `x-session-id` / `x-zcode-session-type` / `x-request-id` / `x-zcode-trace-id`。
+ *
+ * ⚠ 旧注释写「实测它们不是 3012 的判据」—— 那是**旧版客户端**上取到的结论。
+ * 上游在 2026-10-23 升级到 `3.16.3` 之后，`405 + unusual activity` 开始在
+ * **所有**插件请求上稳定出现（跨账号、跨会话），而官方客户端同账号同网络正常
+ * ⇒ 头的形状重新成为首要嫌疑，故此处逐字对齐抓包。
+ *
+ * ⚠ `X-Device-Mid` **仍是硬需求**（缺它 billing 全家桶回 400）。
  */
 export declare function buildZcodeHeaders(credential: Pick<ZcodeCredential, 'device_mid' | 'app_version'>, options?: {
     authorization?: string;
@@ -78,6 +163,34 @@ export declare function buildZcodeHeaders(credential: Pick<ZcodeCredential, 'dev
     captcha?: {
         param: string;
         region: string;
+    };
+    /**
+     * 覆盖 `app_version`（默认取凭据里的）。
+     *
+     * ⚠ 使用者**只有两处**，且都是实测过版本门控的
+     * （见 {@link ZCODE_VERSION_GATED_MIN_APP_VERSION}）：
+     * ① 营销投放查询 `fetchZcodeMarketingPlans`（版本低 ⇒ 投放为空）；
+     * ② **领取** `claimZcodePlan`（版本低 ⇒ `1004 no permission`，真机一发定音）。
+     * 两者都必须按请求覆盖，**不得**改凭据本身。
+     *
+     * ★ 未显式覆盖时走 {@link zcodeVersionGatedAppVersion}（凭据版本与
+     * `3.16.3` 取较大者），**不再直接回落到凭据里的旧版本**。
+     *
+     * 依据（2026-10-25 真机取证）：官方客户端在 2026-10-23 升级到 `3.16.3`
+     * 之后，本插件发的**推理**请求开始稳定 `405 + request has been blocked
+     * due to unusual activity`（跨账号、跨会话；官方客户端同账号同网络正常）。
+     * 版本号是当时**唯一**与官方不一致的请求特征 —— 身份块已逐字对齐（2632
+     * 字符）、其余 11 个官方头（`Suc` 全量）也全部对齐 ⇒ 版本号成为首要嫌疑。
+     */
+    appVersion?: string;
+    /**
+     * 覆盖平台三件套（**仅供测试**：非 win32 分支无法在 Windows 主机上自然触发）。
+     * 生产调用一律不传 ⇒ 走 {@link zcodeClientPlatform}。
+     */
+    platform?: {
+        platform: string;
+        osCategory: string;
+        osVersion: string;
     };
 }): Record<string, string>;
 /** 一次额度桶（`balances[]` 的一项）。 */
@@ -183,6 +296,7 @@ export interface ZcodeBalanceResult {
     ownedPlanIds?: readonly string[];
     /** 已领取但尚未生效；不计入当前可用余额。 */
     pendingGrants?: readonly ZcodePendingGrant[];
+    pendingPlans: ZcodePendingPlan[];
 }
 export interface ZcodePendingGrant {
     planId: string;
@@ -192,6 +306,18 @@ export interface ZcodePendingGrant {
     effectiveAt: number;
 }
 export declare function describeZcodePendingGrants(grants?: readonly ZcodePendingGrant[]): string;
+/** 「已领但未生效」的计划（`status: active` 且 `effective_at` 未到）。 */
+export interface ZcodePendingPlan {
+    planId: string;
+    name?: string;
+    /** 合计额度（同 `unitType` 才相加，规则同营销投放那条）。 */
+    grantUnits?: number;
+    unitType?: string;
+    /** 生效时刻（Unix 秒）。 */
+    effectiveAt?: number;
+    /** 到期时刻（Unix 秒）。 */
+    endsAt?: number;
+}
 /** 一次可领活动。 */
 export interface ZcodeClaimablePlan {
     planId: string;
@@ -211,6 +337,18 @@ export interface ZcodeClaimablePlan {
      *   `formatUnits`/`unitLabel`（`plugin-src/client/credits-format.js`）。
      */
     unitType?: string;
+    /**
+     * ★ 若该 plan 来自**营销投放**（{@link fetchZcodeMarketingPlans}），
+     *   这里是它所属的 `campaign_id`。
+     *
+     * 用途只有一个：领取成功后回报
+     * `POST /marketing/touch/action {campaign_id, action_type:'confirm'}`，
+     * 让服务端不再重复投放同一个活动（否则每次签到都会为一个**已领过**的
+     * plan 再 mint 一次 captcha —— 那是设备级配额，见 `captcha-backoff.ts`）。
+     *
+     * ⚠ 来自 `billing/preview` 的 plan **没有**这个字段（preview 不走营销系统）。
+     */
+    marketingCampaignId?: string;
 }
 /** 领取结果。 */
 export interface ZcodeClaimOutcome {
@@ -243,6 +381,24 @@ export interface ZcodeClaimOutcome {
  * （0 是「已用光」的语义）。
  */
 export declare function fetchZcodeBalance(credential: ZcodeCredential, fetchImpl?: typeof fetch): Promise<ZcodeBalanceResult | undefined>;
+/**
+ * 从 `billing/balance` 的 `plans[]` 里挑出「**已领、但还没生效**」的计划。
+ *
+ * ## 判据（三条，缺一不可）
+ *
+ * | 条件 | 为什么 |
+ * |---|---|
+ * | `status === 'active'` | 只有 active 的计划是「已领到、未作废」 |
+ * | 有 `entitlements[].effective_at` | **生效时刻**；缺它就无法判断「还没生效」 |
+ * | `effective_at` **晚于现在** | 已生效的计划会变成 `balances` 里的桶 ⇒ 不该重复计入 |
+ *
+ * ⚠ **只统计 `effective_at` 未到的那部分 entitlement**（不是整个 plan）：
+ *   同一 plan 里可能混着已生效与未生效的条目。
+ * ⚠ **额度按同 `unit_type` 求和**（与营销投放那条同规则），单位不同不混加。
+ *
+ * @param nowUnixSeconds 「现在」（Unix 秒）。留成参数是为了可测。
+ */
+export declare function pendingPlansOf(rawPlans: unknown, nowUnixSeconds?: number): ZcodePendingPlan[];
 /** `ZcodeBalanceResult` 里由 `preview` 带出的可领活动。 */
 export interface ZcodeClaimablePlanSummary {
     planId: string;
@@ -260,6 +416,107 @@ export interface ZcodeClaimablePlanSummary {
 export declare function reportZcodeActivation(credential: ZcodeCredential, fetchImpl?: typeof fetch): Promise<void>;
 /** 查当前可领的活动。 */
 export declare function fetchZcodeClaimablePlans(credential: ZcodeCredential, fetchImpl?: typeof fetch): Promise<readonly ZcodeClaimablePlan[]>;
+/** 比较两个点分版本号（只看数字段，缺失段按 0；非数字段取前导数字）。 */
+export declare function compareZcodeAppVersion(a: string, b: string): number;
+/**
+ * **受版本门控的请求**该用的 `app_version`：**凭据里的版本与最低版本取较大者**。
+ *
+ * 使用者只有两处（都是实测门控过的）：{@link fetchZcodeMarketingPlans} 与
+ * {@link claimZcodePlan}。**其余请求一律用凭据里的版本**（见常量注释里的理由）。
+ *
+ * ⚠ 取较大者（而不是恒定 3.16.3）是为了**向前兼容**：用户若在更新的官方版上
+ * 登录（凭据里写着 3.17.x），就用它自己的版本号，而不是把它降级成 3.16.3。
+ * 依据与「为什么不能改凭据本身」见 {@link ZCODE_VERSION_GATED_MIN_APP_VERSION}。
+ */
+export declare function zcodeVersionGatedAppVersion(credential: Pick<ZcodeCredential, 'app_version'>): string;
+/**
+ * **不受门控**的请求（query / body 里的 `app_version`）该用的版本。
+ *
+ * ⚠ 与 {@link zcodeVersionGatedAppVersion} 的分工必须分清：
+ * - 本函数 = 「凭据里的版本，但必须是干净的 semver」⇒ 拿不到干净的就用兜底值；
+ * - 门控版 = 「与 `3.16.3` 取较大者」⇒ 只给**实测过门控**的路径（见常量注释）。
+ *
+ * ## 为什么必须存在（2026-10-25 审计打穿）
+ *
+ * 改前这些站点写的是 `credential.app_version ?? ZCODE_APP_VERSION_FALLBACK` ——
+ * `??` **只挡 `undefined`/`null`**，于是空串会发出 `app_version=`、脏值会原样
+ * 发出（换行注入会让 `Headers()` 抛 `TypeError`）。而同一请求的头走门控、
+ * query 走凭据 ⇒ 还会出现「同一请求里两个版本号」的自相矛盾。
+ */
+export declare function zcodeCredentialAppVersion(credential: Pick<ZcodeCredential, 'app_version'>): string;
+/**
+ * 从营销投送物里取出**可领 plan**（纯函数，便于单测）。
+ *
+ * 判据是按钮的 action：`{type:'claim_zcode_plan', args:{plan_id}}`
+ * —— 官方 renderer 里这条 action 被翻译成 `{type:'claim_plan', planId}` 交给
+ * 主进程的 `claimManualPlan()`，后者调的正是我们既有的
+ * `POST /zcode-plan/billing/claim`（**带 captcha**）。
+ *
+ * ⚠ 其余 action（`close` / `open_url` / `navigate` / `copy_text`）一律**不是**领取，
+ * 不得混进来（`close` 尤其危险：把它当领取会对着一个空 plan_id 发请求）。
+ */
+export declare function claimablePlansFromMarketingDeliveries(deliveries: unknown): ZcodeClaimablePlan[];
+/**
+ * 查**营销投放**里的可领 plan（只读）。
+ *
+ * ## 为什么必须有这条来源（真实缺口，用户报障 2026-10-23）
+ *
+ * 用户报障原文：「我在 scoop 中装了 zcode 最新版 3.16.3，其中有 1024 程序员节
+ * 送的 5 亿 token，把这个领取功能集成在每日签到中一并领取」。
+ *
+ * 本机**只读实测**（4 个账号、`scripts/probe-zcode-marketing-touch.mjs`）：
+ *
+ * | 端点 | 结果 |
+ * |---|---|
+ * | `billing/preview` | `data.plans = []`（**永远是空**） |
+ * | `billing/balance` | `data.balances = []` |
+ * | `marketing/touch`（`3.16.3`） | `deliveries[0].banner.buttons[1].action = claim_zcode_plan(zcode-v3-start-plan-1024)` |
+ *
+ * ⇒ **1024 活动根本不走 `preview`**，只在营销投放里。只领 preview 的签到
+ * 永远看不到它（而它在 wire 上与「今天没活动」同形 —— 没有任何报错）。
+ *
+ * ⚠ **版本门控**：见 {@link ZCODE_VERSION_GATED_MIN_APP_VERSION}
+ * （同一个账号、同一套头，只有版本号不同：`3.14.3` → `deliveries: []`）。
+ *
+ * ⚠ **失败一律降级为空数组**，绝不影响 preview 那条主路径（与
+ * `fetchClaimablePlans` 同规矩：营销是补充，不是主体）。
+ */
+export declare function fetchZcodeMarketingPlans(credential: ZcodeCredential, fetchImpl?: typeof fetch): Promise<readonly ZcodeClaimablePlan[]>;
+/**
+ * 回报一次营销动作（`confirm` / `cancel`）——**写操作，best-effort**。
+ *
+ * ## 为什么要回报（对应用户可见的代价）
+ *
+ * 官方 renderer 在动作**成功后**立刻 `p(delivery, 'confirm')`
+ * （`out/renderer/assets/styles-n-UNIiNg.js`）。不回报的后果不是「少了记账」，
+ * 而是**服务端会继续重复投放同一个 campaign** ⇒ 我们每轮签到都会为一个
+ * 已经领过的 plan 再 mint 一次 captcha。captcha 是**设备级**配额
+ * （阿里云同设备每小时 150 次，见 `captcha-backoff.ts` 的开头），
+ * 为一个已领的 plan 反复消耗它是净负面。
+ *
+ * ⚠ **只在领取成功/已领取（`code 0` / `1003`）后调用**：`confirm` 的语义是
+ *   「本次活动我已处理完」。若在**失败**时回报，就等于告诉服务端
+ *   「别再给我看了」—— 用户会**白丢一次领取机会**（`cancel` 语义更明确地
+ *   表示放弃，本实现**从不**发送）。
+ *
+ * ⚠ **不参与 `noteZcodeRequest*` 埋点**：那套是给 `3012` 风控画像统计
+ *   「去推理/领取端点的请求」的，营销端点不是风控对象，混进去会污染画像。
+ *
+ * @returns 只有 `{code:0}` 才算成功（与官方 `z.object({code:z.literal(0)})` 同口径）。
+ */
+export declare function reportZcodeMarketingAction(credential: ZcodeCredential, campaignId: string, actionType: 'confirm' | 'cancel', fetchImpl?: typeof fetch): Promise<boolean>;
+/**
+ * 合并两个来源的可领 plan（**按 `planId` 去重 + priority 降序**）。
+ *
+ * ⚠ **`preview` 优先**：同一 `planId` 同时出现在两边时保留 preview 那份
+ *   （它的额度口径是既有实测过的），只把 marketing 的 `campaign_id`
+ *   **补进去**（否则那份 plan 领完了却不会回报 confirm）。
+ *
+ * ⚠ 排序按 `priority` 降序与两个来源各自的约定一致 —— 1024 活动的
+ *   `priority` 是 **101**，实测高于每日赠送那条（`fetchZcodeClaimablePlans`
+ *   的注释：官方「先领高优先级」），故它会排在最前、先被领取。
+ */
+export declare function mergeZcodeClaimablePlans(preview: readonly ZcodeClaimablePlan[], marketing: readonly ZcodeClaimablePlan[]): ZcodeClaimablePlan[];
 /**
  * 领取一个 plan。
  *

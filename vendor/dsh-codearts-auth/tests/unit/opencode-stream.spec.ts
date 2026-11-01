@@ -5,6 +5,7 @@ import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { OpencodeAdapter } from '../../src/opencode-adapter.js'
 import { listIdentitySlots } from '../../src/opencode-auth.js'
 import { buildOpencodeRequest } from '../../src/opencode-messages.js'
+import { RESERVED_BUILTIN_TOOL_NAMES } from '../../src/opencode-official-tools.js'
 import { normalizeOpencodeResponse, createOpencodeFrameNormalizer } from '../../src/opencode-stream.js'
 
 const toolNames = ['read', 'shell', 'edit', 'write', 'glob', 'grep']
@@ -35,7 +36,7 @@ describe('OpenCode 专用响应归一', () => {
     expect(fetchSpy.mock.calls[0]![0]).toBe('https://opencode.ai/inference/v1/chat/completions')
     const init = fetchSpy.mock.calls[0]![1] as RequestInit
     const body = JSON.parse(String(init.body))
-    expect(body.tools.map((tool: { function: { name: string } }) => tool.function.name)).toEqual([...toolNames.map((name) => `dsh_${name}`), 'read'])
+    expect(body.tools.map((tool: { function: { name: string } }) => tool.function.name)).toEqual([...toolNames.map((name) => `dsh_${name}`), ...RESERVED_BUILTIN_TOOL_NAMES])
     const deltas = chunks.filter((chunk) => chunk.type === 'tool-call-delta')
     expect(deltas.map((chunk) => chunk.argumentsDelta).join('')).toBe('{"path":"文件"}')
     expect(deltas.every((chunk) => chunk.name === 'read')).toBe(true)
@@ -91,7 +92,7 @@ describe('OpenCode 专用响应归一', () => {
   // big-pickle 收到「读取 /tmp/a.txt」会**稳定**产出一条 `read{path}` 调用。
   // 这类名字必须**剔除该次调用**、本轮照常收尾 —— 原实现抛 PERMISSION_DENIED，
   // 用户连已经流出的正文都拿不到，是「一次模型行为打死整轮对话」。
-  it.each(['read', 'shell', 'unknown', 'dsh_unknown'])('剔除保留/未知名字 %s：不整轮报错、不换槽不标额度', async (name) => {
+  it.each(['read', 'shell', 'edit', 'execute', 'unknown', 'dsh_unknown'])('剔除保留/未知名字 %s：不整轮报错、不换槽不标额度', async (name) => {
     const fetchSpy = vi.fn(async () => new Response(sse([frame([call(name, '{}', { index: 0, id: 'A' })], 'tool_calls')])))
     const mark = vi.fn()
     const warn = vi.fn()

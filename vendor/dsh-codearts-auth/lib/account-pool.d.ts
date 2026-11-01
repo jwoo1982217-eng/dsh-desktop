@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis';
 import type { BuddyCredential } from './buddy.js';
 import type { BuddyProduct } from './product.js';
-import type { AggregateAllowedMap, AggregateOrderMap, AggregateOrderMode, AggregateRejectionMap, JetHubState, ModelDisableMap, PermanentLockMap } from './jet-hub-store.js';
+import type { AggregateAllowedMap, AggregateOrderMap, AggregateOrderMode, AggregateRejectionMap, JetHubState, ModelDisableMap, PanelEntry, PermanentLockMap } from './jet-hub-store.js';
 import type { CodeArtsCredential, ProviderAccountEntry, ProviderAccountStatus } from './types.js';
 export { JET_HUB_NS } from './jet-hub-store.js';
 export type { ModelDisableMap, ProviderClosedMap } from './jet-hub-store.js';
@@ -148,6 +148,29 @@ export declare function sinkAccountToProviderEnd(accounts: readonly ProviderAcco
  * @returns 字符串原值；非字符串（含 `undefined` / 数字 / 对象 / 数组）一律回退空串。
  */
 export declare function asProxyText(value: unknown): string;
+/**
+ * 写「代理已更新」日志时的**展示文本**（2026-10-25 审计 A2-02）。
+ *
+ * ## 为什么必须有它
+ *
+ * 四家 `set*Proxy` 原先都把**原始 URL** 拼进日志：
+ * `` `[jet-hub] 账号 ${id} Qoder 代理 → ${proxy}` `` —— 而代理 URL 常含
+ * `user:pass@host` ⇒ **口令明文进日志**，而日志是用户排障时会随手打包、
+ * 粘贴进 issue、上传给别人的东西。
+ *
+ * 对抗审计逐家实测：opencode / gemini / minimaxintl **早已同形**，
+ * qoder 只是第 4 个实例（不是本 PR 新增的机制）⇒ 四家一并修。
+ *
+ * ## ⚠️ 判据复用 `proxy-mask.ts`，不在这里再写一份
+ *
+ * 池**不能** import provider 实现（`opencode.ts` 在依赖图上层，会成环），
+ * 而复制一份正则到这里就正是本仓库的红线——**同一语义两套判据**。
+ * ⇒ 脱敏实现住在双方都能依赖的中立文件里。
+ *
+ * @param value 池字段原始值（可能是脏值 —— 备份文件原样透传）。
+ * @returns 空串 → `直连`；否则脱敏后的 label（保留 scheme/user/host/port）。
+ */
+export declare function proxyLogText(value: unknown): string;
 export declare class AccountPool {
     private readonly ctx;
     private readonly options;
@@ -236,6 +259,14 @@ export declare class AccountPool {
      */
     private gatewayEnabledCache;
     /**
+     * 「允许局域网访问」开关的进程内副本（2026-10-20）。
+     *
+     * 缺键语义为**关闭**（与 {@link gatewayEnabledCache} 的「缺键即启用」刻意
+     * 相反）：暴露面变大必须是用户的显式选择，任何读取失败/丢键都回到只绑回环。
+     * 丢失后果可逆（重开一次开关），不需要独立文档。
+     */
+    private gatewayAllowLanCache;
+    /**
      * 「渠道原生搜索」总开关的进程内副本（`false` = 全部搜索回官方 provider）。
      *
      * 缺键语义是**启用**（与 {@link gatewayEnabledCache} 同一方向）：老文档没有
@@ -246,6 +277,28 @@ export declare class AccountPool {
      * 唯一后果是回到原生搜索，用户再关一次即可。
      */
     private nativeWebSearchCache;
+    /**
+     * 「ZCode 会话负载均衡」开关的进程内副本。
+     *
+     * 缺键语义是**启用**（与 {@link nativeWebSearchCache} 同一方向）：老文档没有
+     * 本键时保持会话亲和，不会因读取失败而静默改回「手动顺序压一个号」
+     *（那正是 2026-10-30 用户要求修掉的形态）。
+     *
+     * ⚠️ 与 {@link nativeWebSearchCache} 同级、**不需要**独立文档：丢失本键的
+     * 唯一后果是回到手动顺序，用户再开一次即可。
+     */
+    private sessionBalanceCache;
+    /**
+     * 「面板入口」的进程内副本：Jet Hub 的唯一入口位置（两个取值互斥）。
+     *
+     * 缺键语义是 `'sidebar'`「仅侧栏」（与 {@link nativeWebSearchCache} 同一方向）：
+     * 老文档没有本键时保持主导航那一行可见，不会因一次读取失败而让用户以为
+     * 这是某个被删掉的功能。
+     *
+     * ⚠️ 与 {@link gatewayEnabledCache} 同级、**不需要**独立文档：丢失本键的
+     * 唯一后果是入口回到默认「仅侧栏」，用户再改一次即可（可逆）。
+     */
+    private panelEntryCache;
     /**
      * 供应商自定义显示顺序（「供应商开关」弹窗拖拽排序）的进程内副本。
      *
@@ -605,6 +658,21 @@ export declare class AccountPool {
      */
     setGatewayEnabled(enabled: boolean): Promise<void>;
     /**
+     * 「允许局域网访问」开关当前是否打开。
+     *
+     * 缺键语义为**关闭**（安全默认：暴露面变大必须是显式选择），见
+     * {@link gatewayAllowLanCache}。
+     */
+    gatewayAllowLan(): boolean;
+    /**
+     * 打开/关闭「允许局域网访问」并落盘。
+     *
+     * ⚠️ 与 {@link setGatewayEnabled} 同约定：只改状态，不重建 HTTP server ——
+     * 换绑（关旧实例 → 建新实例）由 `src/openai-gateway/runtime.ts` 在调用方
+     * 做完持久化后接手。
+     */
+    setGatewayAllowLan(allowLan: boolean): Promise<void>;
+    /**
      * 「渠道原生搜索」总开关当前是否启用。
      *
      * 缺键语义为**启用**（见 {@link nativeWebSearchCache}）。
@@ -620,6 +688,40 @@ export declare class AccountPool {
      *（需要 `DEEPSEEK_API_KEY`）—— 即所有渠道的搜索行为统一。
      */
     setNativeWebSearchEnabled(enabled: boolean): Promise<void>;
+    /**
+     * 「ZCode 会话负载均衡」开关当前是否启用。
+     *
+     * 缺键语义为**启用**（见 {@link sessionBalanceCache}）。
+     *
+     * ⚠️ 调用方（`credential-resolver.ts` 与 `zcode-adapter.ts` 的选号路径）
+     * **必须每次现读**，不能缓存返回值：用户随时可能在 Jet Hub 页头切换。
+     */
+    sessionBalanceEnabled(): boolean;
+    /**
+     * 打开/关闭「ZCode 会话负载均衡」并落盘。
+     *
+     * 关闭后 ZCode 回到「手动顺序首个可用账号」的既有语义 —— 与开关加入前
+     * 逐字节同路径（`getAvailableAccount`），不经过 session 排序。
+     */
+    setSessionBalanceEnabled(enabled: boolean): Promise<void>;
+    /**
+     * 「面板入口」的当前取值：Jet Hub 的唯一入口位置。
+     *
+     * 缺键语义为 `'sidebar'`「仅侧栏」（见 {@link panelEntryCache}）。
+     *
+     * ⚠️ 调用方（客户端在 `apply` 里注册两处入口前）**必须每次现读**，不能缓存
+     * 返回值：用户随时可能在插件详情页的卡片里改它，而客户端只在启动时读一次。
+     */
+    panelEntry(): PanelEntry;
+    /**
+     * 改「面板入口」并落盘。
+     *
+     * 两个取值**严格互斥**，任一时刻只有一个入口存在：
+     * - `'sidebar'`：主导航里多一行，`settings.section` 那一节注销；
+     * - `'settings'`：只剩「设置 → 插件 → Jet Hub」，主导航那一行注销。
+     * 两种情况下 Jet Hub 页面本身的功能完全不受影响（同一组件、同一份 rpcCall）。
+     */
+    setPanelEntry(entry: PanelEntry): Promise<void>;
     /**
      * 读取供应商自定义显示顺序（进程内权威副本）。
      *
@@ -1152,6 +1254,47 @@ export declare class AccountPool {
         credential: TCredential;
     } | null>;
     /**
+     * 按 **sessionId** 选号（ZCode 专用，2026-10-30 用户要求）。
+     *
+     * - `sessionId` 非空：用 rendezvous 哈希把同一会话**稳定映射**到同一个候选
+     *   账号（会话亲和），不同会话自动分散到不同账号；账号集合变化时只迁移
+     *   原本落在该账号上的会话。
+     * - `sessionId` 为空/未传：随机洗牌后取第一个可用账号（本地 OpenAI 网关等
+     *   不带 DSH 会话标识的请求，随机均衡）。
+     *
+     * ⚠️ 本方法**刻意覆盖手动顺序** —— 这是 ZCode 用户明确要求的负载均衡语义。
+     * 其余 provider 继续走 {@link getAvailableAccount}（手动顺序优先），不受影响。
+     *
+     * `excludeAccountIds` 与 {@link getAvailableAccount} 同义：请求级换号时
+     * 排除刚失败的账号，避免拿回同一个。
+     */
+    getAvailableAccountForSession<TCredential = CodeArtsCredential | BuddyCredential>(provider: string, modelId: string, sessionId?: string, excludeAccountIds?: ReadonlySet<string>): Promise<{
+        entry: ProviderAccountEntry;
+        credential: TCredential;
+    } | null>;
+    /**
+     * 今日账号负载索引（`provider` 维度）；任何读取异常都退化为**空表**。
+     *
+     * 抽成方法是为了让「失败兜底」只有一份实现（`getAvailableAccountForSession`
+     * 与将来的调用点共用），也让单测能单独验证兜底语义（见
+     * `tests/unit/session-balance.spec.ts` 的「账本读取抛错」用例）。
+     */
+    private sessionLoadIndex;
+    /**
+     * 选号候选：`provider` + `enabled` + 不在 `excludeAccountIds` + 目标模型未限流。
+     *
+     * 与 {@link getAvailableAccount} / {@link getAvailableAccountForSession} 共用，
+     * 避免同一判据出现两份实现（两份必然漂移）。
+     */
+    private candidateAccounts;
+    /**
+     * 按给定顺序逐个解析凭据，返回第一个可用账号；坏的跳过并记录原因。
+     *
+     * 抽成私有方法是为了让「手动顺序」与「sessionId / 随机顺序」共用**同一份**
+     * 凭据解析与日志语义 —— 否则两条选号路径对「凭据损坏」的处理会分叉。
+     */
+    private resolveFirstCredential;
+    /**
      * 取某 provider **全部启用账号**的凭据（按手动顺序）。
      *
      * ## ⚠️ 为什么需要它（真实缺陷，用户报障 2026-10-07）
@@ -1344,6 +1487,54 @@ export declare class AccountPool {
      * （症状与「代理配置坏了」同形，日志只有一句 TypeError）。
      */
     geminiProxyFor(accountId: string): string;
+    /**
+     * 设置/清除某 **qoder** 账号的出口代理（真实报障 2026-10-21）。
+     *
+     * ⚠️ **刻意与另外两份分开成三份实现**，理由与字段同款：三者语义不同。
+     * Qoder 这里补的是「国际版整站被 SNI 阻断」—— 在本字段之前，用户唯一出路
+     * 是启动 DSH 前导出环境变量，而那会让中国版（本来直连 160ms）也一起去挤代理。
+     *
+     * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+     * 早退（与另两份同款，见 `setOpencodeProxy` 的注释）。清除时删键而非写空串。
+     */
+    setQoderProxy(accountId: string, proxy: string): Promise<void>;
+    /**
+     * 设置/清除某 **minimaxintl**（MiniMax 国际站）账号的出口代理。
+     *
+     * ## 为什么它与 `setGeminiProxy` 形状逐字同构却不共用
+     *
+     * 三家的**存在理由各不相同**：
+     * - opencode = 多账号要**分份额度**（不设代理 = 共用一份配额）；
+     * - Gemini = 墙外**能不能连通**（不设代理 = 根本连不上）；
+     * - minimaxintl = 绕开**按出口 IP 国别的分流**（不设代理 = 被 307 到中国站）。
+     *
+     * 合成一份会让「清掉其中一家的代理」连带清掉别家的出口配置 —— 本仓库
+     * 已反复记录这类「同义判据两份实现」的漂移，故**字段与实现都分开**。
+     *
+     * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+     * 早退。清除时**删键**而非写空串（空串与「未设置」在 UI 上是两种状态）。
+     */
+    setMinimaxIntlProxy(accountId: string, proxy: string): Promise<void>;
+    /**
+     * 读取某 qoder 账号的代理（未设置时为空串 = 直连）。
+     *
+     * ⚠️ **必须过 `asProxyText`**（与 `geminiProxyFor` 同因）：该字段来自
+     * **用户可编辑的备份文件**，而 `sanitizeAccounts` 用 `{...candidate}`
+     * 原样透传、不校验形状 ⇒ 池里可能存在 `"qoderProxy": 12345`。下游
+     * `normalizeProxy` 第一句就是 `input.trim()` ⇒ 非字符串会在那里抛
+     * `TypeError: raw.trim is not a function`，该账号**永久不可用且无自愈**。
+     */
+    qoderProxyFor(accountId: string): string;
+    /**
+     * 读取某 minimaxintl 账号的代理（未设置时为空串 = 直连）。
+     *
+     * ⚠️ **必须过 `asProxyText`**（与 `geminiProxyFor` 同款实测缺陷）：该字段来自
+     * **用户可编辑的备份文件**，而 `sanitizeAccounts` 用 `{...candidate}` 原样透传、
+     * 不校验形状 ⇒ 池里可能存在 `"minimaxIntlProxy": 12345`。下游 `normalizeProxy`
+     * 第一句就是 `input.trim()` ⇒ 非字符串会在那里抛 `TypeError`，该账号
+     * **永久不可用且无自愈**（症状与「代理配置坏了」同形，日志只有一句 TypeError）。
+     */
+    minimaxIntlProxyFor(accountId: string): string;
     /**
      * 记录 opencode 指纹轮换代次。
      *

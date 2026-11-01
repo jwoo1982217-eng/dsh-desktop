@@ -18,6 +18,7 @@ import { createDsmlMarkerNormalizer } from './sse.js'
  * @module orcaterm-adapter
  */
 
+import type { AccountPool } from './account-pool.js'
 import type { Context } from '@deepseek-ai/cordis'
 import type { GenerateOptions, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
@@ -540,6 +541,7 @@ export class OrcaTermAdapter {
     /** 取该 provider 的可用账号（账号池 + 凭据解析）。 */
     resolveCredential: (modelId: string) => Promise<OrcaTermCredential | undefined>
     /** 记录一次用量（失败也要记），供面板展示。 */
+    accountPool?: AccountPool
     providerClosed?: () => boolean
     recordUsage?: (record: { at: number; model: string; ok: boolean; input: number; output: number }) => void
     /** 最近一次失败原因，面板展示。 */
@@ -579,8 +581,8 @@ export class OrcaTermAdapter {
   }
 
   async listModels(provider: string): Promise<Array<Record<string, unknown>>> {
-    if (this.deps.providerClosed?.()) return []
-    return ORCATerm_FALLBACK_MODELS.map((model) => ({
+    if (this.deps.providerClosed?.() || this.deps.accountPool?.providerClosedFor(ORCATerm.id)) return []
+    return ORCATerm_FALLBACK_MODELS.filter(model => !this.deps.accountPool?.disabledModelsFor(ORCATerm.id).has(model.id)).map((model) => ({
       provider,
       id: model.id,
       name: model.name,
@@ -761,6 +763,7 @@ export function registerOrcaTermLlm(
   ctx: Context,
   options: {
     resolveCredential: (modelId: string) => Promise<OrcaTermCredential | undefined>
+    accountPool?: AccountPool
     providerClosed?: () => boolean
     recordUsage?: (record: { at: number; model: string; ok: boolean; input: number; output: number }) => void
     warn?: (message: string) => void
@@ -768,6 +771,7 @@ export function registerOrcaTermLlm(
 ): OrcaTermAdapter {
   const adapter = new OrcaTermAdapter({
     resolveCredential: options.resolveCredential,
+    accountPool: options.accountPool,
     providerClosed: options.providerClosed,
     recordUsage: options.recordUsage,
     warn: options.warn ?? ((message: string) => ctx.logger?.warn?.(message)),

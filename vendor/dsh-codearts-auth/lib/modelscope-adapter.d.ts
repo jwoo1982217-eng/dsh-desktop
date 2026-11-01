@@ -120,21 +120,17 @@ export interface ModelscopeAdapterOptions {
      *   与「哪个账号此刻被限流」无关；传了会让被限流的账号把整个目录一起拖空。
      */
     slots: (modelId?: string) => Promise<readonly ModelscopeSlot[]>;
-    /** 用户模型黑名单。 */
-    disabledModels?: () => ReadonlySet<string>;
     /**
-     * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+     * 账号池（**黑名单、关闭意图、目录门控的唯一数据源**）。
      *
-     * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
-     * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
-     * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
-     * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+     * ⚠️⚠️ **2026-10-23 迁移**：本家此前手写 `listModels`，黑名单与关闭意图靠
+     * `disabledModels` / `providerClosed` 两个**选项回调**传进来。那两个字段
+     * 已随迁移删除 —— 现在统一由共享骨架（`model-catalog.ts`）从本池读取，
+     * 与其余实体 provider 同源。
      *
-     * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
-     * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+     * ⚠️ 省略时（单测 / 嵌入方）行为退回「不过滤、不判关闭意图」；
+     * **生产接线必须传**（`index.ts` 负责，且 `modelscope-wiring.spec.ts` 会点名）。
      */
-    providerClosed?: () => boolean;
-    /** 账号池（目录门控用）。 */
     accountPool?: AccountPool;
     /** 记录受限的副作用（切槽时由接线层提供）。 */
     markLimited?: (slotId: string, modelId: string, resetAtMs: number) => Promise<void>;
@@ -177,7 +173,29 @@ export declare class ModelscopeAdapter extends LlmAdapter {
      * 这里只是把「上一次的结果」留给 `listAllModels()` 那个**必须同步**的调用者。
      */
     private lastCatalog?;
+    /**
+     * 共享目录骨架（`model-catalog.ts`）——**黑名单 / 关闭意图 / 模态回填 / 映射**
+     * 的唯一实现处（2026-10-23 迁移，见 `listModels` 的注释）。
+     */
+    private readonly skeletonCatalog;
     constructor(options: ModelscopeAdapterOptions);
+    /**
+     * 异步读目录并转成骨架的中间结构（`CatalogEntry[]`）。
+     *
+     * ⚠️ **本家独有的门控放这里**：没有可用槽位时返回 `[]`
+     * （骨架把它当「目录为空」⇒ `listModels` 吐空数组 ⇒ 隐藏整个 provider 分组，
+     * 与本文件迁移前那条 `if (slots.length === 0) return []` 逐字等价）。
+     */
+    private loadCatalogEntries;
+    /**
+     * **同步**全量目录（`listAllModels()` 用）。
+     *
+     * ⚠️ 与 `loadCatalogEntries` 的差别只在「等不等远端」：这里读上一轮缓存，
+     * 缓存为空时用兜底表并**顺手**触发一次后台预热（同步契约见 `listAllModels`）。
+     */
+    private syncCatalogEntries;
+    /** 本家私有形状 → 骨架的 `CatalogEntry`（**唯一**转换点）。 */
+    private toCatalogEntry;
     providerInfo(provider: string): LlmProviderInfo;
     /**
      * 完整目录（**同步**返回数组）。
@@ -201,6 +219,22 @@ export declare class ModelscopeAdapter extends LlmAdapter {
     private warmCatalog;
     /** 当前生效的目录（远端优先，失败回退兜底）。 */
     private catalog;
+    /**
+     * 模型选择器的目录 —— **委托共享骨架**（`model-catalog.ts`）。
+     *
+     * ## ⚠️⚠️ 2026-10-23 迁移（用户要求：实体 provider 一律走共享骨架）
+     *
+     * 迁移前本方法是**手写**的，自己做了四件事：判 `providerClosed`、
+     * 判 `providerCatalogVisible`、过滤 `disabledModels`、手工 map 成
+     * `LlmModelInfo`。其中 ①③④ 与其余 13 家**逐字同义** —— 而「同义的两份实现」
+     * 正是本仓库红线（`docs/agent-notes/misc.md` 的「一文件两套同义判据」），
+     * 也是 Gitee IKP8OF 那类漂移缺陷的温床（各写一份 ⇒ 新入口漏接线就静默失效）。
+     *
+     * 现在四条全部由骨架承担，本方法只剩一行委托：
+     * - 关闭意图 / 黑名单 / 模态回填 / `provider` 回填 ⇒ `createModelCatalog`；
+     * - **本家独有的门控**（没有可用槽位时隐藏）⇒ 放进 `loadCatalog`
+     *   （返回 `[]` 即「目录为空」，与骨架的既有语义一致）。
+     */
     listModels(_provider: string): Promise<readonly LlmModelInfo[]>;
     resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
     prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<{

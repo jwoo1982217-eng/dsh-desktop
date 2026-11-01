@@ -121,14 +121,24 @@ describe('★★ IKP8OF：手写 listModels 的四家必须响应「供应商整
    * 只翻转 `providerClosed` 一个变量 —— 这样「返回 `[]`」只可能来自本判据，
    * 不会因为缺凭据/缺槽位而假绿（后者是**另一条**返回 `[]` 的路径）。
    */
-  it('★★ autoclaw：providerClosed 为真 ⇒ listModels 返回空（且对照：为假时有目录）', async () => {
+  /**
+   * ★★ **autoclaw**：2026-10-23 迁移后关闭意图由**共享骨架**提供。
+   *
+   * ⚠️ 迁移前本家手写 `listModels`、靠 `providerClosed` 选项回调判关闭；
+   * 用户定稿「实体 provider 一律走共享骨架」后那个字段**已删除**，
+   * 唯一入口是 `accountPool`。
+   */
+  it('★★ autoclaw：关闭意图由骨架从账号池读 ⇒ 关闭态下 listModels 为空', async () => {
     let closed = false
+    const pool = {
+      disabledModelsFor: () => new Set<string>(),
+      providerClosedFor: () => closed,
+    } as never
     const make = (): AutoclawAdapter => new AutoclawAdapter({
       resolveCredential: async () => ({ accessToken: 'stub-token' }) as never,
       refresh: async () => {},
       product: AUTOCLAW,
-      disabledModels: () => new Set<string>(),
-      providerClosed: () => closed,
+      accountPool: pool,
       // ⚠️ 远端探测一律失败 ⇒ 目录回落到**兜底表**（确定性、无网络）。
       fetchRemoteModelMeta: async () => undefined,
     } as never)
@@ -142,13 +152,24 @@ describe('★★ IKP8OF：手写 listModels 的四家必须响应「供应商整
     expect(shut, '★★ 关闭态下 autoclaw 仍播出模型 ⇒ 新模型可选（IKP8OF）').toEqual([])
   })
 
-  it('★★ modelscope：providerClosed 为真 ⇒ listModels 返回空（且对照：为假时有目录）', async () => {
+  /**
+   * ★★ **modelscope**：2026-10-23 迁移后关闭意图由**共享骨架**提供。
+   *
+   * ⚠️⚠️ 迁移前本家手写 `listModels`、靠 `providerClosed` **选项回调**判关闭；
+   * 用户定稿「实体 provider 一律走共享骨架」后，那个回调字段**已删除**，
+   * 唯一入口是 `accountPool`（骨架内部判 `providerClosedFor`）。
+   * ⇒ 本用例的形态随之改成「池里报关闭」，语义断言不变。
+   */
+  it('★★ modelscope：关闭意图由骨架从账号池读 ⇒ 关闭态下 listModels 为空', async () => {
     let closed = false
+    const pool = {
+      disabledModelsFor: () => new Set<string>(),
+      providerClosedFor: () => closed,
+    } as never
     const make = (): ModelscopeAdapter => new ModelscopeAdapter({
       slots: async () => [{ id: 'a1', apiKey: 'ms-0123456789abcdefghij' }],
       product: MODELSCOPE,
-      disabledModels: () => new Set<string>(),
-      providerClosed: () => closed,
+      accountPool: pool,
       // ⚠️ 不给 `fetchRemoteCatalog` ⇒ 走兜底表（确定性、无网络）。
     } as never)
 
@@ -176,8 +197,11 @@ describe('★★ IKP8OF：手写 listModels 的四家必须响应「供应商整
       // 「已经新鲜过」的时钟，避免真实网络）。
       probeCredential: async () => ({ accessToken: 'stub' }) as never,
       now: () => 1_000_000,
-      disabledModels: () => new Set<string>(),
-      providerClosed: () => closed,
+      // ⚠️ 2026-10-23 迁移：黑名单/关闭意图的唯一入口是账号池（骨架读取）。
+      accountPool: {
+        disabledModelsFor: () => new Set<string>(),
+        providerClosedFor: () => closed,
+      } as never,
       // ⚠️ `catalogAt` 初值是 0 ⇒ **首次** `listModels` 必然先探一次 `/v2/models`
       //（探活失败且 `catalogAt === 0` 时会返回 `[]`，那是「未登录」的既有形态）。
       // 故这里必须让探活**成功**，否则对照组恒空、本用例假绿。
@@ -240,13 +264,23 @@ describe('★★ IKP8OF：手写 listModels 的四家必须响应「供应商整
     expect(shut, '★★ 关闭态下 aggregate 仍播出虚拟模型 ⇒ 新模型可选（IKP8OF）').toEqual([])
   })
 
-  it('★★ opencode：providerClosed 为真 ⇒ listModels 返回空（且对照：为假时有目录）', async () => {
+  /**
+   * ★★ **opencode**：2026-10-23 迁移后关闭意图由**共享骨架**提供。
+   *
+   * ⚠️ 迁移前本家手写 `listModels`、靠 `providerClosed` 选项回调判关闭；
+   * 用户定稿「实体 provider 一律走共享骨架」后那个字段**已删除**，
+   * 唯一入口是 `accountPool`。⇒ 本用例形态随之改成「池里报关闭」。
+   */
+  it('★★ opencode：关闭意图由骨架从账号池读 ⇒ 关闭态下 listModels 为空', async () => {
     let closed = false
+    const pool = {
+      disabledModelsFor: () => new Set<string>(),
+      providerClosedFor: () => closed,
+    } as never
     const make = (): OpencodeAdapter => new OpencodeAdapter({
-      identitySlots: async () => [{ id: 'a1', apiKey: 'sk-stub' }],
+      identitySlots: async () => [{ id: 'a1', kind: 'account', apiKey: 'sk-stub' }],
       product: OPENCODE,
-      disabledModels: () => new Set<string>(),
-      providerClosed: () => closed,
+      accountPool: pool,
       markLimited: async () => {},
       warn: () => {},
       // ⚠️ 远端目录一律失败 ⇒ 回落到编译期兜底表（确定性、无网络）。
@@ -323,36 +357,81 @@ describe('★★ IKP8OF：手写 listModels 的四家必须响应「供应商整
     ).toEqual([])
   })
 
-  it('★ index.ts 里四家手写适配器的注册实参都带 providerClosed（剥注释后逐家点名）', () => {
+  /**
+   * ★★ **账户池接线普查（派生式）**：每个「实体 provider」的注册实参里都必须有
+   * **真 `accountPool`**。
+   *
+   * ## ⚠️⚠️ 2026-10-23：本用例**取代**了原来那张逐家点名的硬编码表
+   *
+   * 原表长这样（已删除）：
+   *
+   * ```ts
+   * const targets = [
+   *   { name: 'autoclaw（国内站）', register: /registerAutoclawLlm\(ctx, \{/g, … },
+   *   { name: 'modelscope', … }, { name: 'officeace', … }, { name: 'opencode', … },
+   * ]
+   * ```
+   *
+   * 它有两个真实缺陷（都实测过）：
+   * ① **新 provider 漏接是静默的** —— 往用户要求「实体 provider 一律走共享骨架」
+   *    之后，手写实现已全部迁移，**不再有任何一家需要 `providerClosed` 回调**；
+   *    而那张表若留着，加一家新 provider 时它不会自动进来，
+   *    漏接 ⇒ 关闭态下模型照样可选（本 issue 的原症状）；
+   * ② **判据失锚的报错极具误导性** —— 往表里加一个不存在的家，报的是
+   *    「注册调用未找到（判据失锚）」而不是「你漏接了一家」，
+   *    读起来像测试自己坏了。
+   *
+   * ## 现在的判据（派生式，不维护任何名单）
+   *
+   * 扫 `src/index.ts` 里**全部** `register*Llm(ctx, {` 调用点，对每一个：
+   * - 它的 provider 必须是虚拟的（`auto` / `aggregate`）**或**
+   * - 它的实参块里必须有 `accountPool: <真值>`（不是 `undefined` / `null`）。
+   *
+   * ⚠️ 「虚拟」的判据来自 `catalog-shared-skeleton.spec.ts` 的
+   *    `VIRTUAL_PROVIDERS`（同一份豁免表，`auto` / `jet-hub-auto` / `aggregate`）。
+   */
+  it('★★ 每个实体 provider 的注册实参都必须带真 accountPool（派生式普查，不维护名单）', () => {
     const code = strippedIndexSource()
-    // ⚠️ **逐家点名**（不是数总数）：数总数会在「多接一家、漏接另一家」时配平。
-    // ⚠️ `autoclaw` 有**两个实例**（国内站 + 国际站），故它按实例逐个断言。
-    const targets: Array<{ name: string; register: RegExp; provider: string }> = [
-      { name: 'autoclaw（国内站）', register: /registerAutoclawLlm\(ctx, \{/g, provider: 'AUTOCLAW.id' },
-      { name: 'autoclaw（国际站）', register: /registerAutoclawLlm\(ctx, \{/g, provider: 'AUTOCLAW_INTL.id' },
-      { name: 'modelscope', register: /registerModelscopeLlm\(ctx, \{/g, provider: 'MODELSCOPE.id' },
-      { name: 'officeace', register: /registerOfficeAceLlm\(ctx, \{/g, provider: 'OFFICEACE.id' },
-      { name: 'opencode', register: /new OpencodeLocalAdapter\(opencodeLocal, \{/g, provider: 'OPENCODE.id' },
-      // ⚠️ 聚合**没有** `providerClosed` 回调（它直接读 `accountPool.providerClosedFor`），
-      // 故不进这张接线表 —— 它的判据由上面那条行为用例覆盖。
-    ]
-    for (const target of targets) {
-      const starts = [...code.matchAll(target.register)].map((m) => m.index ?? 0)
-      expect(starts.length, `${target.name} 的注册调用未找到（接线判据失锚）`).toBeGreaterThan(0)
-      // 该 provider 的绑定必须**至少出现一次**（autoclaw 两个实例各绑自己那个）。
-      const bound = starts.some((start) => {
-        const bodyStart = code.indexOf('(', start)
-        const end = matchParenEnd(code, bodyStart)
-        expect(end, `${target.name} 的调用括号无法配对`).toBeGreaterThan(bodyStart)
-        const block = code.slice(bodyStart, end)
-        return block.includes('providerClosed:') && block.includes(`providerClosedFor(${target.provider})`)
-      })
-      expect(
-        bound,
-        `★ ${target.name} 的注册实参漏了 providerClosed（或绑错 provider）`
-        + ' ⇒ 关闭后新模型仍可选（IKP8OF，静默失效）',
-      ).toBe(true)
+    const calls = [...code.matchAll(/register([A-Za-z]+)Llm\(ctx, \{/g)]
+    expect(calls.length, '一个注册调用点都没找到 —— 判据失锚（源码形态变了？）')
+      .toBeGreaterThanOrEqual(10)
+
+    // ⚠️ 虚拟 provider：目录由别的 provider 推导，没有自己的上游，故不需要池。
+    const VIRTUAL = new Set(['AUTO', 'AGGREGATE'])
+    const offenders: string[] = []
+
+    for (const match of calls) {
+      const name = match[1] ?? ''
+      if (VIRTUAL.has(name)) continue
+      const from = match.index ?? 0
+      // 实参块 = 从本次调用的 `{` 起到括号配对结束。
+      const open = code.indexOf('{', from)
+      let depth = 0
+      let end = -1
+      for (let i = open; i < code.length; i += 1) {
+        const ch = code[i]
+        if (ch === '{') depth += 1
+        else if (ch === '}') {
+          depth -= 1
+          if (depth === 0) { end = i; break }
+        }
+      }
+      if (end < 0) {
+        offenders.push(`${name}: 实参块尾无法确定`)
+        continue
+      }
+      const block = code.slice(open, end)
+      const hasPool = /accountPool:\s*pool\b/.test(block)
+      const bogus = /accountPool\s*:\s*(undefined|null)\b/.test(block)
+      if (!hasPool || bogus) offenders.push(`register${name}Llm`)
     }
+
+    expect(
+      offenders,
+      '★★ 这些注册调用没有 `accountPool: pool` ⇒ 它们的模型黑名单与「关闭供应商」'
+      + '双双静默失效（`?.` 是 no-op，零报错零日志）。若是虚拟 provider，'
+      + '请把它的注册名加进本用例的 VIRTUAL 集合（并说明理由）。',
+    ).toEqual([])
   })
 
   /**

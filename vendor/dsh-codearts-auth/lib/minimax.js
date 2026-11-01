@@ -76,10 +76,54 @@ export function minimaxCredentialExpiresAtMs(credential) {
     }
     return decodeJwtExpMs(credential.access_token);
 }
-/** 凭据是否已过期（无过期信息时保守视为未过期）。 */
+/**
+ * 凭据是否**已过期**（无过期信息时保守视为未过期）。
+ *
+ * ⚠️⚠️ **生产代码里已无消费者**（2026-10-27 审计确认）：唯一的调用点
+ * （adapter 的请求前预判）已改为 {@link isMinimaxExpiringWithin}，因为
+ * 「过期了才续」会让用户的请求撞在**正在死掉**的 token 上（PR 描述的原始缺陷）。
+ *
+ * 保留它的两个理由，且都**不是**「以后可能用到」：
+ *
+ * 1. **它是旧判据的对照物**：`tests/unit/minimax-renew-mechanism.spec.ts` 用
+ *    「剩余 30s 时旧判据说不用续、新判据说该续」来锁住这次收紧**真的发生了** ——
+ *    删掉它，那条断言就失去对照组，退化成「只测新函数」的恒真式。
+ * 2. 语义纯粹、无副作用，删掉也不能证明任何东西被简化。
+ *
+ * ⚠️ 因此：**不要再把它接回请求路径**（那正是 2026-10-27 审计打穿的变异 W3：
+ *   把 `isMinimaxExpiringWithin` 换回它，全量测试原本全绿）。
+ *   现在由上面第 1 条用例守着。
+ */
 export function isMinimaxExpired(credential, nowMs = Date.now()) {
     const expiresAt = minimaxCredentialExpiresAtMs(credential);
     return expiresAt !== undefined && nowMs >= expiresAt;
+}
+/**
+ * 凭据剩余有效期是否不足 `minValidityMs`（请求前预判）。
+ *
+ * 与 {@link isMinimaxExpired} 的差别：过期前一小段窗口也算「该续了」——
+ * 让请求路径在 token **临死前**就续掉，而不是等 401 回来再补
+ *（官方 `oauth-core` 的 `getAccessToken({minValidityMs})` 同一语义）。
+ *
+ * ⚠️ **读不到过期时间（`undefined`/NaN）视为「该续」**：与 `shouldRefreshNow`
+ *（`src/expiry-sync.ts`）的 fail-open 口径一致；一次成功续期就会写上
+ * `expires_at`，不会持续触发。
+ *
+ * ⚠️⚠️ **但 fail-open 有一个真实代价**（2026-10-27 审计）：adapter 里
+ * `await this.options.refresh()` **没有 try/catch** ⇒ 对于「凭据缺 / 非法
+ * `expires_at`」的账号，一旦这次续期失败，**上游请求一次都不会发**，
+ * 而旧判据（`isMinimaxExpired`）会正常放行、让请求用掉最后那段时间。
+ * 生产写入点（`parseMinimaxTokenGrant` / `inheritMinimaxIdentity`）都会写
+ * `expires_at`，故正常路径不可达；可达面是「备份导入 / 第三方转换 / 手工编辑」。
+ * ⇒ 修法在 **adapter 侧**（续期失败时降级为「用现有凭据继续发」），
+ *   不放宽本函数的 fail-open（那会让「读不到死线」变成「永不预判」，
+ *   等于回到旧判据）。
+ */
+export function isMinimaxExpiringWithin(credential, minValidityMs, nowMs = Date.now()) {
+    const expiresAt = minimaxCredentialExpiresAtMs(credential);
+    if (expiresAt === undefined || !Number.isFinite(expiresAt))
+        return true;
+    return expiresAt - nowMs <= minValidityMs;
 }
 /** 凭据是否可续期（必须有 refresh_token）。 */
 export function isMinimaxRefreshable(credential) {
@@ -672,5 +716,50 @@ export function fallbackToEntry(model) {
 /** 默认产品下的兜底条目。 */
 export function minimaxFallbackEntries(product = MINIMAX) {
     return product.fallbackModels.map(fallbackToEntry);
+}
+/**
+ * 把**不属于令牌**的身份字段从旧凭据继承到新凭据上。
+ *
+ * ## 为什么需要它（2026-10-24，两个真实后果）
+ *
+ * `parseMinimaxTokenGrant` 只认识 OAuth 令牌五件套
+ *（`access_token` / `refresh_token` / `token_type` / `expires_at` / `scope`），
+ * 而续期结果会被 `ctx.credentials.set` **整体覆盖**旧凭据 ⇒ 每续期一次就丢一次：
+ *
+ * | 字段 | 丢失后的症状 |
+ * |---|---|
+ * | `nickname` | 账号卡片退回内部 id `minimax-xxxx`（IKP8UA 复发） |
+ * | `user_id` | **同账号去重失去唯一判据** ⇒ 同一个号可以无限建卡片、各持一份 token |
+ *
+ * 定时续期是 30 分钟一轮、`SELF_HEAL` 还会在积分查询前补一次 ⇒ 这个丢失
+ * **必然发生**，不是边角情况。（本机实测：`MINIMAX_ACCOUNT_*` 三份凭据里
+ * 只有一份带 `nickname`、**零份**带 `user_id`。）
+ *
+ * @param refreshed 续期响应构造出的新凭据（只有令牌字段）。
+ * @param previous 续期前的旧凭据（身份字段的来源）。
+ * @returns 合并后的凭据；新凭据**已有的字段一律以新凭据为准**。
+ *
+ * ## ⚠️⚠️ 为什么是「保留旧字段 + 新字段覆盖」而不是白名单两个字段
+ *
+ * 初版是白名单 `nickname` + `user_id` 两个字段 —— 那等于**每加一个非令牌字段
+ * 都要记得回来改这里**，忘了就静默丢弃（2026-10-25 合并审计登记的 P3）。
+ * 而本函数修的正是「静默丢字段」这一类缺陷，用同一类缺陷的形态去修它不合适。
+ *
+ * ⇒ 改为 `{ ...previous, ...refreshed }`：令牌五件套由 `refreshed` 覆盖，
+ *   其余字段沿用旧凭据。**令牌三件套再显式兜一次**（`?? previous`）——
+ *   上游若把某个令牌字段省掉（响应里显式 `undefined` 时展开会覆盖），
+ *   宁可留旧的也不要把凭据写成半残（半残 = 该账号直接不可用）。
+ */
+export function inheritMinimaxIdentity(refreshed, previous) {
+    const merged = { ...previous, ...refreshed };
+    // 令牌材料绝不退化成 undefined（展开一个显式 undefined 字段会覆盖旧值）。
+    merged.access_token = refreshed.access_token ?? previous.access_token;
+    if ((refreshed.refresh_token ?? previous.refresh_token) !== undefined) {
+        merged.refresh_token = refreshed.refresh_token ?? previous.refresh_token;
+    }
+    if ((refreshed.expires_at ?? previous.expires_at) !== undefined) {
+        merged.expires_at = refreshed.expires_at ?? previous.expires_at;
+    }
+    return merged;
 }
 //# sourceMappingURL=minimax.js.map

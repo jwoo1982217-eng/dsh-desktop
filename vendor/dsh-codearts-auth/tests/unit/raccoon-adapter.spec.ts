@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { RACCOON, raccoonSupportsImage } from '../../src/raccoon-product.js'
+import { RACCOON, RACCOON_TEXT_ONLY_MODELS, raccoonSupportsImageWith } from '../../src/raccoon-product.js'
 import { RaccoonAdapter, classifyRaccoonFailure, registerRaccoonLlm } from '../../src/raccoon-adapter.js'
 import type { RaccoonRemoteModel } from '../../src/raccoon-adapter.js'
 import type { RaccoonCredential } from '../../src/raccoon.js'
@@ -43,6 +43,13 @@ function makeAdapter(patch: {
   credential?: RaccoonCredential | undefined
   pool?: AccountPool
   fetcher?: typeof fetch
+  /**
+   * 注入的「纯文本模型」集合（默认用生产集合）。
+   *
+   * ⚠️ 必须可注入：生产集合当前为空，注入不了就**测不到**「纯文本模型被禁」
+   * 这条分支（与 `raccoonDefaultEffort` 的教训同型）。
+   */
+  textOnly?: ReadonlySet<string>
 } = {}): RaccoonAdapter {
   const models = patch.models ?? [remoteModel()]
   const adapter = new RaccoonAdapter({
@@ -70,10 +77,10 @@ function makeAdapter(patch: {
         maxTokens: Number(params.max_tokens ?? 0),
         // ⚠️ **必须调生产函数**，不要在测试里复刻一份镜像实现 —— 否则单测
         // 测的是「测试自己写的那份逻辑」，生产改了它不会变红。
-        // 真实实现在 `raccoonSupportsImage`（白名单 ∪ tags）。
-        supportsImage: raccoonSupportsImage(
+        // 真实实现在 `raccoonSupportsImage`（默认 image + 纯文本集合黑名单）。
+        supportsImage: raccoonSupportsImageWith(
+          patch.textOnly ?? RACCOON_TEXT_ONLY_MODELS,
           String(m.name),
-          Array.isArray(m.tags) ? (m.tags as string[]).map((t) => String(t).toLowerCase()) : [],
         ),
       }
     }),
@@ -257,13 +264,14 @@ describe('resolveModel', () => {
     }
   })
 
-  it('图片模态按 tags 含 vision 判定', async () => {
+  it('图片模态：默认声明 image（不再看远端 tags）', async () => {
+    // tags 含 / 不含 vision 都应是 image —— 远端 tags 是选模偏好，不是能力契约
     const withVision = makeAdapter({ models: [remoteModel({ tags: ['vision'] })] })
     expect((await withVision.resolveModel('raccoon', 'sn-glm-5-3')).inputModalities)
       .toEqual(['text', 'image'])
     const without = makeAdapter({ models: [remoteModel({ tags: ['general'] })] })
     expect((await without.resolveModel('raccoon', 'sn-glm-5-3')).inputModalities)
-      .toEqual(['text'])
+      .toEqual(['text', 'image'])
   })
 
   /**
@@ -295,12 +303,61 @@ describe('resolveModel', () => {
       .toEqual(['text', 'image'])
   })
 
-  it('⚠️ 未知模型不被白名单误放行（不得无条件声明 image）', async () => {
+  it('⚠️ 未知新模型默认声明 image（不再要求先登记白名单）', async () => {
     const adapter = makeAdapter({
       models: [remoteModel({ name: 'sn-not-a-real-model', tags: ['general'] })],
     })
     expect((await adapter.resolveModel('raccoon', 'sn-not-a-real-model')).inputModalities)
+      .toEqual(['text', 'image'])
+  })
+
+  /**
+   * ⚠️ **唯一的刹车**：真正的纯文本模型（登记在纯文本集合里）必须声明 `text`，
+   * 否则 DSH 会放行图片、上游则可能静默忽略 ⇒ 模型凭文字幻觉作答。
+   */
+  it('⚠️ 纯文本集合里的模型声明 text（同族版本后缀同样生效）', async () => {
+    const adapter = makeAdapter({
+      models: [
+        remoteModel({ name: 'sn-text-only-model' }),
+        remoteModel({ name: 'sn-text-only-model-1017' }),
+        remoteModel({ name: 'sn-deepseek-v4-1-flash' }),
+      ],
+      textOnly: new Set(['sn-text-only-model']),
+    })
+    expect((await adapter.resolveModel('raccoon', 'sn-text-only-model')).inputModalities)
       .toEqual(['text'])
+    expect((await adapter.resolveModel('raccoon', 'sn-text-only-model-1017')).inputModalities)
+      .toEqual(['text'])
+    // 集合外不受影响
+    expect((await adapter.resolveModel('raccoon', 'sn-deepseek-v4-1-flash')).inputModalities)
+      .toEqual(['text', 'image'])
+  })
+
+  /**
+   * ⚠️ **版本后缀回归（2026-10-21）**：远端新增 `sn-deepseek-v4-1-flash-1017`，
+   * `tags` 与无后缀版逐字相同（无 `vision`）⇒ 修复前声明 `['text']`，
+   * DSH 直接把图投影成占位符。实测该 id 带图 200 且四色全对。
+   *
+   * 本用例断言的是**生产路径**（`fetchRemoteModels` → `raccoonSupportsImage` →
+   * `inputModalities`），不是替身里另写一份判据。
+   */
+  it('⚠️ 同族版本后缀模型（-1017）也声明 image', async () => {
+    const adapter = makeAdapter({
+      models: [
+        remoteModel({
+          name: 'sn-deepseek-v4-1-flash-1017',
+          description: 'DeepSeek-V4.1-Flash-1017',
+          billing_effective_multiplier: 0,
+          tags: ['general', 'code', 'html', 'analysis', 'reasoning', 'auto'],
+        }),
+      ],
+    })
+    const resolved = await adapter.resolveModel('raccoon', 'sn-deepseek-v4-1-flash-1017')
+    expect(resolved.inputModalities).toEqual(['text', 'image'])
+
+    const listed = await adapter.listModels('raccoon')
+    expect(listed.find((m) => m.id === 'sn-deepseek-v4-1-flash-1017')?.inputModalities)
+      .toEqual(['text', 'image'])
   })
 })
 

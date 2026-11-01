@@ -56,11 +56,12 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import type { Context } from '@deepseek-ai/cordis'
 import type { AccountPool } from './account-pool.js'
-import { providerCatalogVisible } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import {
   MODELSCOPE,
   MODELSCOPE_FALLBACK_MODELS,
   classifyModelscopeError,
+  findModelscopeFallback,
   type ModelscopeErrorInfo,
   type ModelscopeErrorKind,
   type ModelscopeFallbackModel,
@@ -145,7 +146,12 @@ export function parseModelscopeCatalog(body: unknown): ModelscopeCatalogEntry[] 
     const id = typeof record.id === 'string' ? normalizeModelscopeModelId(record.id) : ''
     if (id.length === 0 || seen.has(id)) continue
     seen.add(id)
-    const fallback = MODELSCOPE_FALLBACK_MODELS.find((m) => m.id === id)
+    // ⚠️ **不能用 `find(m => m.id === id)`**（Issue #12）：魔搭会定期换日期快照
+    // id（`…-Flash` → `…-Flash-1017`），而兜底表登记的往往还是无后缀那个。
+    // 精确查找在这条缝里恒不命中 ⇒ 能力/窗口全部退化成「未知」⇒ 那个模型被判成
+    // 纯文本（真机实测它能收图）。改走 `findModelscopeFallback`（精确优先 +
+    // `-` 边界 + 最长前缀）。
+    const fallback = findModelscopeFallback(id)
     const name = typeof record.name === 'string' && record.name.trim().length > 0
       ? record.name.trim()
       : fallback?.name ?? id
@@ -237,21 +243,17 @@ export interface ModelscopeAdapterOptions {
    *   与「哪个账号此刻被限流」无关；传了会让被限流的账号把整个目录一起拖空。
    */
   slots: (modelId?: string) => Promise<readonly ModelscopeSlot[]>
-  /** 用户模型黑名单。 */
-  disabledModels?: () => ReadonlySet<string>
   /**
-   * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+   * 账号池（**黑名单、关闭意图、目录门控的唯一数据源**）。
    *
-   * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
-   * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
-   * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
-   * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+   * ⚠️⚠️ **2026-10-23 迁移**：本家此前手写 `listModels`，黑名单与关闭意图靠
+   * `disabledModels` / `providerClosed` 两个**选项回调**传进来。那两个字段
+   * 已随迁移删除 —— 现在统一由共享骨架（`model-catalog.ts`）从本池读取，
+   * 与其余实体 provider 同源。
    *
-   * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
-   * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+   * ⚠️ 省略时（单测 / 嵌入方）行为退回「不过滤、不判关闭意图」；
+   * **生产接线必须传**（`index.ts` 负责，且 `modelscope-wiring.spec.ts` 会点名）。
    */
-  providerClosed?: () => boolean
-  /** 账号池（目录门控用）。 */
   accountPool?: AccountPool
   /** 记录受限的副作用（切槽时由接线层提供）。 */
   markLimited?: (slotId: string, modelId: string, resetAtMs: number) => Promise<void>
@@ -318,9 +320,94 @@ export class ModelscopeAdapter extends LlmAdapter {
    */
   private lastCatalog?: readonly ModelscopeCatalogEntry[]
 
+  /**
+   * 共享目录骨架（`model-catalog.ts`）——**黑名单 / 关闭意图 / 模态回填 / 映射**
+   * 的唯一实现处（2026-10-23 迁移，见 `listModels` 的注释）。
+   */
+  private readonly skeletonCatalog: ModelCatalog
+
   constructor(private readonly options: ModelscopeAdapterOptions) {
     super()
     this.product = options.product ?? MODELSCOPE
+    // ⚠️⚠️ **`accountPool` 必须是真池**：骨架里 `deps.accountPool?.disabledModelsFor`
+    //    与 `providerClosedFor?.(...)` 全靠它；传 `{}` 或 `undefined` 会让
+    //    `?.` 变成静默 no-op（Gitee IKP8OF 实测过的形态：关掉的模型照样可选、
+    //    关整个供应商也无效，且零报错零日志）。
+    this.skeletonCatalog = createModelCatalog(
+      this.options.accountPool === undefined ? {} : { accountPool: this.options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        // ⚠️ 未知 id **保守报 `['text']`**：本家的能力来自远端能力表，
+        //    查不到时把「未知」当成「支持」会让 DSH 把图片投影成上游不接受的形态
+        //    （与本文件迁移前的手写口径逐字一致）。
+        unknownModelInputModalities: () => ['text'] as const,
+      },
+    )
+  }
+
+  /**
+   * 异步读目录并转成骨架的中间结构（`CatalogEntry[]`）。
+   *
+   * ⚠️ **本家独有的门控放这里**：没有可用槽位时返回 `[]`
+   * （骨架把它当「目录为空」⇒ `listModels` 吐空数组 ⇒ 隐藏整个 provider 分组，
+   * 与本文件迁移前那条 `if (slots.length === 0) return []` 逐字等价）。
+   */
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
+    const slots = await this.options.slots()
+    if (slots.length === 0) return []
+    return (await this.catalog()).map((m) => this.toCatalogEntry(m))
+  }
+
+  /**
+   * **同步**全量目录（`listAllModels()` 用）。
+   *
+   * ⚠️ 与 `loadCatalogEntries` 的差别只在「等不等远端」：这里读上一轮缓存，
+   * 缓存为空时用兜底表并**顺手**触发一次后台预热（同步契约见 `listAllModels`）。
+   */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    const remote = this.snapshotCatalog()
+    if (remote !== undefined) return remote.map((m) => this.toCatalogEntry(m))
+    void this.warmCatalog()
+    return MODELSCOPE_FALLBACK_MODELS.map((m) => this.toCatalogEntry({
+      id: m.id,
+      name: m.name,
+      contextWindow: m.contextWindow,
+      supportsImage: m.supportsImage,
+      ...m.efforts === undefined ? {} : { efforts: m.efforts },
+    }))
+  }
+
+  /** 本家私有形状 → 骨架的 `CatalogEntry`（**唯一**转换点）。 */
+  private toCatalogEntry(m: ModelscopeCatalogEntry): CatalogEntry {
+    return {
+      id: m.id,
+      name: m.name,
+      // ⚠️ 能力表缺失/未知时**一律回退 `['text']`**（硬约定：声明支持就必须
+      // 真支持）。把「查不到」当成「支持」会让 DSH 把图片投影成上游不接受的形态。
+      inputModalities: m.supportsImage
+        ? (['text', 'image'] as const)
+        : (['text'] as const),
+      // ⚠️ 窗口未知**不编造**（0 是「不知道」哨兵）⇒ 省略该字段。
+      ...(m.contextWindow ?? 0) > 0 ? { contextWindow: m.contextWindow } : {},
+      // ⚠️ 档位经 `modelscopeReasoningOf` 归一（`defaultEffort` 必须落在 `efforts` 内）。
+      ...(() => {
+        const efforts = m.efforts ?? []
+        if (efforts.length === 0) return {}
+        return {
+          reasoning: {
+            efforts: efforts.map((effort) => ({
+              // ⚠️ `id` 是**品牌类型**（`ReasoningEffortId`），必须经构造函数。
+              id: ReasoningEffortId(effort),
+              // ⚠️ 没有官方中文名时回退到 id 本身 —— 宁可显示英文原值，
+              // 也不猜一个可能错译的中文（与 opencode 同取向）。
+              name: effort === 'none' ? '关闭' : effort,
+            })),
+          },
+        }
+      })(),
+    }
   }
 
   providerInfo(provider: string): LlmProviderInfo {
@@ -394,31 +481,24 @@ export class ModelscopeAdapter extends LlmAdapter {
     return entries
   }
 
+  /**
+   * 模型选择器的目录 —— **委托共享骨架**（`model-catalog.ts`）。
+   *
+   * ## ⚠️⚠️ 2026-10-23 迁移（用户要求：实体 provider 一律走共享骨架）
+   *
+   * 迁移前本方法是**手写**的，自己做了四件事：判 `providerClosed`、
+   * 判 `providerCatalogVisible`、过滤 `disabledModels`、手工 map 成
+   * `LlmModelInfo`。其中 ①③④ 与其余 13 家**逐字同义** —— 而「同义的两份实现」
+   * 正是本仓库红线（`docs/agent-notes/misc.md` 的「一文件两套同义判据」），
+   * 也是 Gitee IKP8OF 那类漂移缺陷的温床（各写一份 ⇒ 新入口漏接线就静默失效）。
+   *
+   * 现在四条全部由骨架承担，本方法只剩一行委托：
+   * - 关闭意图 / 黑名单 / 模态回填 / `provider` 回填 ⇒ `createModelCatalog`；
+   * - **本家独有的门控**（没有可用槽位时隐藏）⇒ 放进 `loadCatalog`
+   *   （返回 `[]` 即「目录为空」，与骨架的既有语义一致）。
+   */
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️⚠️ 「供应商整体关闭」⇒ 一条都不播（Gitee issue IKP8OF）。
-    // 排在最前：它比「无账号门控」更强（用户明确要求关闭），且关闭态下
-    // 目录里可能有黑名单从未见过的 id（关闭之后才新增的）。
-    if (this.options.providerClosed?.() === true) return []
-    // ⚠️ 目录门控：没有已登录账号就返回空数组隐藏整个 provider（AGENTS.md 的
-    // 「没有已登录账号就隐藏整个 provider」）。**不抛错** —— 抛错会多一条
-    // provider 级报错，UI 表现为「供应商加载失败」。
-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
-    const slots = await this.options.slots()
-    if (slots.length === 0) return []
-    const all = await this.catalog()
-    const disabled = this.options.disabledModels?.() ?? new Set<string>()
-    return all
-      .filter((m) => !disabled.has(m.id))
-      .map((m) => ({
-        provider: this.product.id,
-        id: m.id,
-        name: m.name,
-        // ⚠️ 能力表缺失/未知时**一律回退 `['text']`**（硬约定：声明支持就必须
-        // 真支持）。把「查不到」当成「支持」会让 DSH 把图片投影成上游不接受的形态。
-        inputModalities: m.supportsImage
-          ? (['text', 'image'] as const)
-          : (['text'] as const),
-      }))
+    return await this.skeletonCatalog.listModels(_provider)
   }
 
   async resolveModel(

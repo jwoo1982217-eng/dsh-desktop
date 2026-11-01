@@ -35,12 +35,22 @@ describe('autoCheckinExcluded：宿主消费取决于 registry', () => {
 })
 
 describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry', () => {
-  it('恰好是 registry 里 usesExpiryWindow === true 的 7 家（officeace 2026-10-12、autoclaw 2026-10-17 加入）', () => {
+  it('恰好是 registry 里 usesExpiryWindow === true 的 12 家（officeace 2026-10-12、autoclaw 2026-10-17、qoder/qodercn/astudio/minimax/minimaxintl/codearts 2026-10-20 加入）', () => {
     const withWindow = PROVIDER_REGISTRY
       .filter((d) => d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
     // ⚠️ 2026-10-20 加 autoclawintl：与 autoclaw 同源（同一份 credits 实现）。
-    expect(withWindow).toEqual(['autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ qoder / qodercn 2026-10-20 加入：永久哨兵不写 `deductionEndTime`
+    //    ⇒ 落永久桶。与 codearts **不同**，本家同时开 `permanentLock`。
+    // ⚠️ astudio / minimax / minimaxintl 2026-10-20 加入（PR !119）。
+    // ⚠️ codearts 2026-10-20 加入（PR !123）：只有**基础积分包**能分档（随套餐
+    //    `end_date` 到期），赠送/按需包走 `expiringTotal`。它**不**开
+    //    `permanentLock` —— 下面那条「支持锁定的渠道」断言因此不受影响。
+    expect(withWindow).toEqual([
+      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts', 'lobsterai',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae',
+      'workbuddy',
+    ])
   })
 
   it('支持锁定的渠道 ⊆ usesExpiryWindow ∪ {loomy}（loomy 无窗口概念）', () => {
@@ -50,7 +60,18 @@ describe('usesExpiryWindow：永久积分锁定的 windowDays 取决于 registry
     const viaWindow = PROVIDER_REGISTRY
       .filter((d) => d.permanentLock === true && d.usesExpiryWindow === true)
       .map((d) => d.id).sort()
-    expect(viaWindow).toEqual(['buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ qoder / qodercn 2026-10-20 加入：两站都**同时**登记两个字段
+    //    （半残形态会让锁定按钮在、分档行却不渲染 —— AStudio 首次报障时踩过）。
+    // ⚠️ minimax / minimaxintl / astudio 2026-10-20 加入：与 astudio 同批，
+    //    两处同时登记（只加 permanentLock 不加 usesExpiryWindow ⇒ 分档行不渲染
+    //    但锁按钮在，是 AStudio 首次报障时踩过的半残形态）。
+    // ⚠️ autoclaw / autoclawintl 2026-10-21 加入（用户要求「补锁定开关」）：
+    //    两站**同日同时**登记两个字段（本家早有 `usesExpiryWindow`，本次补
+    //    `permanentLock` + `balance` 接线）。⚠️ 两站各占一项。
+    expect(viaWindow).toEqual([
+      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'lobsterai',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
+    ])
     expect(locked).toEqual([...viaWindow, 'loomy'].sort())
   })
 })

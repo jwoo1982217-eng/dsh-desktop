@@ -23,6 +23,10 @@ class FixtureBrowser extends EventEmitter {
   async stopFrames(id) { this.operations.push(['stop', id]); }
   async closeTab(id) { this.operations.push(['close', id]); this.tabs.delete(id); }
   async text(id, text) { this.operations.push(['text', id, text]); }
+  async resize(id, width, height) {
+    if (width < 320 || height < 240) throw Error('无效的网页尺寸');
+    Object.assign(this.tabs.get(id), { width, height });
+  }
   async close() { this.tabs.clear(); }
 }
 const setup = () => { const browser = new FixtureBrowser(); return { browser, service: new BrowserPanelService(browser) }; };
@@ -102,5 +106,23 @@ test('human login window inherits only its owner URL, remains owned, and reopens
   assert.deepEqual(browser.operations.at(-1), ['show', '3']);
   await call(service, 'own', 'release');
   assert.deepEqual(browser.list().map(t => t.id), ['2']);
+  await service.close();
+});
+
+test('尺寸通知和失败重试期间仍可交付最后有效画面，关闭后清除',async()=>{
+  const {browser,service}=setup();
+  await call(service,'pane','new');
+  browser.emit('frame',{id:'1',data:'last-valid-frame'});
+  await call(service,'pane','resize',{id:'1',width:1024,height:768});
+  assert.equal((await call(service,'pane','frame',{id:'1'})).frame?.data,'last-valid-frame');
+  await assert.rejects(call(service,'pane','resize',{id:'1',width:1,height:1}),/无效/);
+  assert.equal((await call(service,'pane','frame',{id:'1'})).frame?.data,'last-valid-frame');
+  await call(service,'pane','resize',{id:'1',width:800,height:600});
+  const cached=(await call(service,'pane','frame',{id:'1'})).frame;
+  assert.equal(cached.width,1024);assert.equal(cached.height,768);
+  browser.emit('frame',{id:'1',data:'resized-frame'});
+  assert.equal((await call(service,'pane','frame',{id:'1'})).frame.width,800);
+  await call(service,'pane','close',{id:'1'});
+  assert.equal((await call(service,'pane','frame',{id:'1'})).frame,null);
   await service.close();
 });

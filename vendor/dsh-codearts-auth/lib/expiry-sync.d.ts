@@ -184,6 +184,15 @@ export declare function refreshAccountWithReconcile<TCredential>(params: {
     refresh: (credential: TCredential) => Promise<TCredential>;
     /** 续期成功后写回凭据存储。 */
     save: (credential: TCredential) => Promise<void>;
+    /**
+     * 造出**本家**的「refresh_token 已失效」错误（见 `refreshAccountWithReconcile`
+     * 里落盘失败那一节）。
+     *
+     * ⚠️ **必填，且必须传自己那家的类**：各 provider 的 `refreshAll` 判的是自己
+     * 定义的同名类的 `instanceof`，共享模块借用任何一家的类都会让另外八家把
+     * 「凭据已死」当非终态 ⇒ 静默死号。必填是为了让漏接线在 `tsc` 就红。
+     */
+    makeTerminalError: (message: string) => Error;
     warn?: (message: string) => void;
     info?: (message: string) => void;
 }): Promise<boolean>;

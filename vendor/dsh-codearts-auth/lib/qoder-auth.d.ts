@@ -91,6 +91,19 @@ declare module '@deepseek-ai/cordis' {
 export interface QoderAuthOptions {
     /** 注入的 fetch（测试用）。 */
     fetcher?: typeof fetch;
+    /**
+     * **按账号**取出口代理的 fetcher（真实报障 2026-10-21）。
+     *
+     * ⚠️ 国际版 `openapi.qoder.sh` 在本机被 SNI 阻断（TLS ClientHello 被丢），
+     * 而**中国版**直连只要 160ms ⇒ 只能按账号配，不能用全局环境变量
+     * （那会让中国版也一起去挤代理）。
+     *
+     * ⚠️ 不传 ⇒ 恒直连（与既有行为逐字一致，所有单测不受影响）。
+     * ⚠️ 空账号 id（登录流程还没有账号）⇒ 由解析器去查
+     * `QODER_PENDING_PROXY_KEY`（见 `src/qoder-proxy.ts`），否则「墙外环境下
+     * 新建账号」是死锁：登录要代理，而代理要按已存在的账号配。
+     */
+    fetchFor?: (accountId: string) => typeof fetch;
     /** 产品配置；默认 {@link QODER}。 */
     product?: QoderProduct;
     /** 服务名覆盖（默认由产品 id 派生为 `qoderAuth`）。 */
@@ -112,8 +125,30 @@ export declare class QoderAuth extends Service {
     /** 登录会话是否仍处于活跃状态；logout()/stop() 置 false，防止在途刷新回写已登出凭据。 */
     private active;
     constructor(ctx: Context, options?: QoderAuthOptions);
-    /** 注入的 fetch（测试用）；默认为全局 fetch。 */
-    private get fetchImpl();
+    /**
+     * 按**账号**取出口 fetcher（真实报障 2026-10-21）。
+     *
+     * ⚠️ 优先级与 `GeminiAdapter` 同款：`fetcher`（单测替身）> `fetchFor`（生产代理）
+     * > 全局 `fetch`。单测想拦上游时只需传 `fetcher`，不必关心代理。
+     *
+     * ⚠️ **每次调用现取**而不是构造期固化：续期循环会在账号之间移动
+     * （`refreshAll` 逐个账号），出口必须跟着换。
+     *
+     * ⚠️ `accountId` 允许为 `undefined`（登录流程还没有账号）：此时解析器会去查
+     * `QODER_PENDING_PROXY_KEY`，那是墙外环境下「新建账号」的唯一出路。
+     */
+    private fetcherForAccount;
+    /**
+     * 同 {@link fetcherForAccount}，但**没有专门出口时返回 `undefined`**。
+     *
+     * 存在的理由：登录流程的两个 `runQoderLoginFlow` / `startQoderLoginFlow`
+     * 调用点要把 fetcher **作为可选字段透传**（它们的 `fetcher` 缺省即全局
+     * fetch）。若这里硬塞一个 `globalThis.fetch`，那些「未传即用默认」的
+     * 分支会被改成「显式传入」，虽然行为等价，但会让替身注入的优先级
+     * 与 `GeminiAdapter` 的写法不再对称，也让单测里「没传 fetcher」这件事
+     * 变得不可表达。
+     */
+    private fetcherForAccountOrUndefined;
     /** 标记 refresh_token 已失效：停止重试，并向 status() 暴露 refreshable: false。 */
     private markRefreshTokenInvalid;
     /**
@@ -193,6 +228,9 @@ export declare class QoderAuth extends Service {
      *
      * 抽出来供 `refresh()` 与 `refreshAll()` 共用，避免两处各写一遍
      * 「发请求 → 判终态 → 合并字段」的逻辑而逐渐分叉。
+     *
+     * @param accountId 该凭据所属的账号 id（**决定走哪条出口代理**）。
+     *   不传 ⇒ 登录预置那条（`QODER_PENDING_PROXY_KEY`）或直连。
      */
     private refreshCredential;
     /**

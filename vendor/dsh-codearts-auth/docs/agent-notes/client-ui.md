@@ -3055,3 +3055,193 @@ PR #102 合并后跑了对抗性审计，它用 **5 条 `if (false)` 型变异**
 **仍未覆盖（如实登记）**：`onDragEnd` 那类「保留方法名、函数体改成 no-op」的变异
 **无法用文本判据区分**（`onDragEnd: ` 后面接 `() => {}` 与接真实现，正则都命中）
 —— 要覆盖它需要 AST 或真 react 渲染，本期不做。
+
+---
+
+## 原生侧栏入口：一个入口要三处 id 同名（2026-10-21）
+
+Jet Hub 之前只有 `settings.section` 一个入口。加成主导航一行之后，**同一个页面**有
+两条入口路径（设置弹层 / 中央主面板），组件与 `rpcCall` 都只有一份。
+
+> **2026-10-24 更新**：两条入口已改为**互斥**，由插件详情页设置卡片的
+> 「面板入口」下拉（`仅侧栏` / `仅设置页`）决定保留哪一条。偏好键从布尔
+> `sidebarEntryEnabled` 换成枚举 `panelEntry`，RPC 换成 `panelEntry.get` /
+> `panelEntry.set`，客户端文件名相应改成 `panel-entry-store.js` /
+> `panel-entry.js`。**下面 1-3 条的结论全部仍然成立**，只把文件名与端点名更新了。
+
+### ⚠️ 1. `sidebar.panellist.id` == `main.key` == `settings.section.id`
+
+宿主按「侧栏行的 id」去 `main` 槽里查 key（`layout.selectPanel(id)`）。三者不一致时
+界面看起来**完全正常**，只有点下去才会发现「面板没换」—— 而且 `selectPanel` 对未注册
+的 key 是**抛错**，被兜底成「什么都不发生」。本实现统一用
+`JET_HUB_PANEL_KEY = 'jet-hub'`（`plugin-src/client/panel-entry-store.js`）。
+
+⚠️ 正因如此，`main` key **必须无条件注册**：入口切到「仅设置页」之后，用户仍可能
+把面板停在 Jet Hub 上，少了这个 key `selectPanel('jet-hub')` 就会抛错。
+
+### ⚠️ 2. 偏好必须落宿主，不能落浏览器存储
+
+Web 端 origin 是 `http://127.0.0.1:<随机端口>`（每次启动都变）⇒ 浏览器存储随旧
+origin 一起被抛弃，症状是「改掉的入口下次启动又变回来了」。故走
+`panelEntry.get` / `panelEntry.set` + `AccountPool` 的内存副本 + **两个**持久化
+后端。⚠️ `SettingsStore.save` 是**整体替换白名单**：漏掉本键时，任何一次账号/黑名单/
+顺序写入都会把它从文档里删掉（与拒绝表、原生搜索开关同型的历史缺陷）。
+
+⚠️⚠️ **schema 不许加 `.default()`**（2026-10-24 实测缺陷）：schemastery 的
+`.default()` 会在 `scope.get()` 返回的文档里**填入**默认值，于是
+`sanitizePanelEntry(value.panelEntry, value.sidebarEntryEnabled)` 第一层（新键合法
+即返回）直接命中，**老布尔迁移永远不执行** ⇒ 老用户明确关掉的入口升级后静默变回
+「仅侧栏」，且此后每次 save 都把 `'sidebar'` 写死，原设置永久丢失。
+缺键由 sanitize 自己兜底，schema 不需要再给默认值。
+
+### ⚠️ 3. 关掉入口时若面板正停在本插件上，要主动 `selectPanel(null)`
+
+否则布局里留着一个再也没有入口的 `activePanelId`。`layout` **不在**插件的 `inject`
+声明里（那是硬依赖，缺了整个插件不激活），用 `ctx.inject(['layout'], scoped => …)`
+拿作用域副本。
+
+### ⚠️⚠️ 4. 单账号卡片不占满：`column flex + align-items: flex-start` 的收缩
+
+`.dim-jh-panelHead` 原是 `display:flex; flex-direction:column; align-items:flex-start`，
+账号列表容器是它的 flex item ⇒ 宽度 = **max-content**。多账号时那句排序提示把容器撑宽，
+所以缺陷**只在单账号**暴露成 ~257px 窄条。
+
+⚠️ **那提示的实际长度**（2026-10-21 实测）：它是 `jet-hub.js` 里**两段拼接**的文案、
+共 **100 字符**，而 `.dim-jh-orderHint` 是 `font-size:12px` ⇒ max-content **约 1200px**
+（初版注释写的「654px」**是错的**，已订正）。⇒「只有单账号暴露」是**有条件**的：
+列表宽 = `min(约1200px, 面板可用宽)`，面板宽超过约 1200px 时多账号同样是窄条（只是没那么夸张）。
+
+修复**不是**给卡片加 `width:100%` —— 那只是等于父容器的 max-content，量出来仍是 257。
+先给容器拉伸（原 PR 的点补丁）：
+
+```css
+.dim-jh-accountList { align-self: stretch; min-width: 0; }
+```
+
+⇒ 教训：flex item 上的 `width:100%` 不是万能药，**先量「谁决定了宽度」**（用
+`document.title`/DOM 覆层把 `offsetWidth` 打出来比猜 CSS 快得多）。
+
+### 5. 客户端状态模块必须无 React
+
+客户端单测是 `environment: 'node'` 且 devDependencies **没有 react** ⇒ 任何 import
+react 的客户端模块都**无法单测**。故把偏好状态拆成 `panel-entry-store.js`
+（无 React，可单测），React 组件与槽注册留在 `panel-entry.js`；插件详情页的设置卡片
+（`settings-card.js`）也只 import store。顺带避免了
+`panel-entry.js → jet-hub.js → panel-entry.js` 的循环。
+
+
+## ⚠️⚠️ `notice` 类状态必须是对象形状；**接线层的守卫只能靠行为级**（2026-10-22 报障 + 2026-10-25 审计）
+
+### 事故
+
+用户报障：**「魔搭社区的令牌我一保存，页面直接清空，切换页面无效，只能重启 dsh」**。
+
+根因（`ProviderPanel`）：渲染端按**对象**读三个字段
+
+```js
+'data-tone': probeNotice.tone,
+React.createElement('div', null, probeNotice.text),
+probeNotice.details.length > 0 ? … : null
+```
+
+而两处调用把 `probeNotice` 写成了**裸字符串**（`submitModelscopeKeyEdit` 的三元、
+`submitOpencodeEntry` 的 `res.existed` 分支）。字符串没有 `.details` ⇒
+`undefined.length` 抛 `TypeError` ⇒ React 卸载整棵设置页子树。
+
+修法是**三层**（真正的修复在源头，后两层是纵深）：
+
+1. 源头：两处调用改成 `{ tone, text, details: [] }`；
+2. 渲染端：`details` 过 `safeNoticeDetails()`（`Array.isArray` 保护）；
+3. 写入端：`setProbeNotice` 包装成经 `normalizeProbeNotice()` 归一。
+
+⚠️ 第 3 层**不能**用来解释「所以源头可以写错」：它防的是回归，不是免责。
+
+### ⚠️⚠️ 三条源码文本断言**各有真实旁路**（实测，别再重复）
+
+新增的 `tests/unit/notice-shape.spec.ts` C1/C2/D1 是源码文本断言。审计用**完整白屏
+回归态**实测：
+
+| 旁路 | 形态 | 为什么逃得掉 |
+|---|---|---|
+| 三元字面量 | `setProbeNotice(x ? 'a' : 'b')` | C1 正则要求 `(` 后**紧跟**引号 |
+| 下标读取 | `probeNotice.details['length']` | D1 只匹配 `.details.length` |
+| 死分支包装 | `if (false) { setState(normalize(x)) }` | C2 的 `toMatch` 在死分支里照样命中 |
+
+三者**同时**注入时，41 条相关用例**全绿**，而同一份代码执行时**确实抛**
+`TypeError: Cannot read properties of undefined (reading 'length')`（可执行证明）。
+
+⚠️ 还发现**反向伤害**：D1 抓不住 `['length']`，却会把**完全正确的等价重构**
+（内联 `Array.isArray(…) ? … : []`）判成**假红** ⇒ 既漏检又误伤。
+
+### ⚠️⚠️ 那个「无法行为级测试」的前提是**错的**（本次最贵的单条缺陷）
+
+三条断言曾经声称：「单测环境是 `node`，`react` 是宿主注入的 external，
+`jet-hub.js` **根本 import 不了**，组件无法渲染」。
+
+**这是假的** —— 仓库自己的 `tests/unit/jet-hub-tdz.spec.ts:99` 早就用
+`vi.mock('react', …)` 注入替身 + 真实 `await import('../../plugin-src/client/jet-hub.js')`
+跑过运行时渲染。那个错误前提**正当化**了「接线层不用行为级测试」，并让三条无牙断言
+看起来足够。
+
+⇒ 真正的守卫是 `tests/unit/jet-hub-panel-wiring.spec.ts`（**行为级**）：
+真渲染 `ProviderPanel`、把渲染时传进 `useCallback` 的每个回调**真调用**、喂一个
+裸字符串，然后断言 **state 里不得留下字符串**。实测：
+
+| 状态 | 本文件 | `jet-hub-panel-wiring.spec.ts` |
+|---|---|---|
+| 现实现 | 15 passed | 4 passed |
+| M22（三旁路同时注入） | **全绿** | **1 failed**（「有回调把裸字符串原样写进 state」） |
+
+**教训可推广**：用一个**未经验证的「无法测试」断言**去正当化弱判据，比没有判据更危险
+—— 它会让人停止寻找真正可行的测法。要断言「测不了」之前，先 grep 仓库里有没有
+**已经在测**的先例。
+
+### ⚠️ React 错误边界的能力边界（`plugin-src/client/error-boundary.js`）
+
+2026-10-24 真机实测（`window.onerror` 触发、容器内容不变、边界零介入）：错误边界
+**只捕获渲染期**（子组件渲染 / constructor / 生命周期）。以下四类**完全不受保护**：
+
+1. **事件回调里的异常**（`onClick` / `onChange`）—— React 不把它们算渲染期；
+2. **异步回调 / `await` 之后**（Promise、`setTimeout`、订阅回调）；
+3. **模块求值期（import 时）**—— 那时 React 还没开始渲染；
+4. **渲染进程级崩溃**。
+
+⇒ 反向推论同样重要：**不要把取数/解析逻辑挪进渲染路径**、**不要依赖边界去接住异步
+错误**。加边界只是把「一次失误 = 白屏」降级成「一次失误 = 一块报错」，**不是修复**。
+
+⚠️ fallback 自身**必须永不抛错**（否则 React 再卸一次树，边界与没有边界等价）：
+`error.message` 可能是**抛错的 getter**、`String(Object.create(null))` 会抛
+⇒ 文案计算全部收进 `describeThrown()`，三级降级各自包 `try`。
+⚠️ 判据不能用 `null` 当「没出错」的哨兵：`null` 是**合法抛出值**，
+`getDerivedStateFromError(null)` 返回 `{error:null}` ⇒ 边界**不产出 fallback**、
+容器被清空（真机实测，与没有边界同形）⇒ 用 `Symbol` 哨兵。
+
+### ⚠️⚠️ 宿主**本来就为每个 slot entry 自带错误边界**（别把归因写错）
+
+`@deepseek-ai/dsh-client-ui-renderer` 的 `SlotErrorBoundary` **从该包最早版本
+`0.1.0-rc.8`（2026-08-19）起**就为每个 slot entry 包裹（审计拉了 5 个历史版本实测：
+`0.1.0-rc.8` / `0.1.1-rc.1` / `0.1.2-rc.1` / `0.1.7-rc.2` / `0.2.0-rc.1` 全部有）。
+它渲染 `<div data-slot-error>` 并 `reportEntryError` 到插件运行状态页。
+
+⇒ **「插件内没有 ErrorBoundary ⇒ 整页清空」这条归因不成立**，写文档/复盘时不要这么写。
+
+那本插件的边界还有什么用？**三样**（都不是「防白屏」）：
+
+1. **可读的报错文案** —— 宿主的 crash face 是空元素 + 无文案，用户什么也看不到；
+2. ⚠️ **可恢复** —— 宿主对**非 chain** 槽会**abdicate**（`reportEntryError(…, {abdicate: kind !== 'chain'})`），
+   而失败记录只在**插件重载/卸载**时清除（`dsh-cordis-client-runner` 的 `this.failures.delete(...)`
+   分别发生在「装载成功」「teardown」「编排计划」三处，**视图切换路径上没有**）⇒
+   **切页不会恢复**；而插件内边界只覆盖**子树** ⇒ 重挂载即可恢复；
+3. **非 slot 路径**（例如 `JetHubMainPanel` 自己那层）。
+
+⚠️ 用户报障里的「切页无效」正是 abdicate 永久性造成的，**不需要**假设「宿主缺边界」。
+
+### ⚠️ fallback 的恢复路径：**「不必重启」是成立的**，但不要写成「已修好」
+
+宿主 `SettingsPanel` 在 `open === false` 时**整棵不挂载**（`open && <SettingsPanel>`），
+`main` 是 **keyed** 槽、靠 `entryKey` 切 key ⇒ 「关掉设置再打开」与「切走再切回」
+**都能恢复**。故 fallback 文案里的「不必重启」**不是虚假陈述**。
+
+⚠️ 但真实缺陷仍在（P2 级）：**恢复路径不可发现**。fallback 只写「已拦住，其余页面
+仍可正常使用」，没告诉用户「关掉这一节再打开就恢复」。⇒ 若要改，改的是**可发现性**
+（加一句「关掉再打开这一节即可恢复」或加重试按钮），**不是**「文案在撒谎」。

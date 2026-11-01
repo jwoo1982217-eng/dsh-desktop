@@ -1218,13 +1218,25 @@ describe('边缘 HTML 页：判据侧必须一并豁免（2026-10-07 端到端�
       expect(isZcodeConcurrencyLimited(429, with3007)).toBe(false)
     })
 
-    it('★ 错误码映射：HTML 页一律 `SERVER`（可退避重试，契合「稍后重试」）', () => {
+    it('★ 错误码映射：HTML 页一律 `SERVER`（可退避重试，契合「稍后重试）—— 405 除外', () => {
       /**
        * ⚠ 最严重的一格是 `500`：修复前 `httpErrorCodeForZcode(500, 含1005的页)`
        * 返回 `QUOTA_EXCEEDED`（**不在** `DEFAULT_RETRYABLE_CODES` 里），
        * 于是一个本该自动退避重试 5 次的**瞬断 5xx** 只报一次错。
+       *
+       * ★ **`405` 已从这里摘出**（2026-10-25，issue IKQ4B4 + 本机实测）：
+       * 405 在 zcode 从不是「方法不允许」，它是**风控拦截的专属状态码**
+       * （`docs/agent-notes/providers-zcode.md` 的消融矩阵：裸请求 /
+       * 无身份块都是「405 + 3012」）。把它留在 `SERVER` ⇒ 进 harness 的
+       * `DEFAULT_RETRYABLE_CODES` ⇒ 白重试 5 轮，而 `3012` 有账号冷却惩罚
+       * ⇒ 重试有害。实测见同文件下方「405 恒不可重试」那节。
+       *
+       * ⚠ 这与本节的初衷**不冲突**：那次要解决的是「5xx 瞬断被误判成
+       * 不可重试」，本格解决的是「405 风控被误判成可重试」——
+       * 方向相反、各管一段。且下面的 `兜底到不了` 断言里原本就写着
+       * 「405 去掉短路后仍相同 ⇒ 从未被真正锁住」。
        */
-      for (const status of [400, 401, 403, 404, 405, 429, 500, 502, 503]) {
+      for (const status of [400, 401, 403, 404, 429, 500, 502, 503]) {
         expect(httpErrorCodeForZcode(status, ESA_1005), `status=${status}`).toBe('SERVER')
       }
 
@@ -1295,6 +1307,117 @@ describe('边缘 HTML 页：判据侧必须一并豁免（2026-10-07 端到端�
       const msg = describeUpstreamError(500, `<html><head><title>${longTitle}</title></head></html>`)
       expect(msg).not.toContain(longTitle)
       expect(msg.length).toBeLessThan(300)
+    })
+  })
+
+  /**
+   * ★★ **`405` 恒不可重试**（2026-10-25，Gitee issue IKQ4B4 + 本机实测）。
+   *
+   * ## 修它之前的真实缺陷（用户报障，本机复现）
+   *
+   * `405` 在 ZCode **从不是**「HTTP 方法不允许」—— 它是**风控拦截的专属
+   * 状态码**（`docs/agent-notes/providers-zcode.md` 的消融矩阵：裸请求 /
+   * 无身份块都是「405 + 3012」）。而上游有时把拦截包成**边缘 HTML 页**
+   * （`<title>405</title>`，无业务码、无风控语义）⇒ 走到上面的 HTML 短路
+   * ⇒ `SERVER` ⇒ **在 harness 的 `DEFAULT_RETRYABLE_CODES` 里**
+   * ⇒ 白重试 5 轮，每轮都真实打到上游。
+   *
+   * 本机实测（会话 `3acf2ebd` turn 16 的 `llm/retry` 事件，逐字）：
+   *
+   * ```
+   * policyKey: ["normal",5,["EMPTY_RESPONSE","RATE_LIMIT","SERVER","TIMEOUT","TRANSPORT"],…]
+   * retry 1/5 code SERVER delay 476ms   status 405
+   * retry 2/5 code SERVER delay 950ms
+   * retry 3/5 code SERVER delay 1928ms
+   * retry 4/5 code SERVER delay 4107ms
+   * retry 5/5 code SERVER delay 7237ms
+   * ```
+   *
+   * ⇒ 用户原话「405 html 重试了 3 个 5 次都没用」。而 `3012` 有账号冷却惩罚
+   *   （30 分钟起，反复触发升级到 24 小时乃至停用）⇒ 重试不只是无用，是**有害**的。
+   *
+   * ## 修法的三个邻位（都是实测打出来的，缺一个就红）
+   *
+   * 1. 必须在 HTML 短路**之前** —— 405 最常见的形态就是 HTML 页，
+   *    放后面则永不可达；
+   * 2. 必须在「有权威业务码」**之后** —— `{"code":1005}` + 405 若被吞
+   *    就回归成 `PERMISSION_DENIED`，而它本该是 `QUOTA_EXCEEDED`
+   *    （真实回归，实测 1 条红）；
+   * 3. 码不能取 `PERMISSION` —— 上面那条等价守卫钉住
+   *    「`PERMISSION` ⟺ `hasZcodeUnusualActivity`」，而 405 页没有风控语义。
+   */
+  describe('★★ 405 恒不可重试（IKQ4B4：白重试 5 轮会加重冷却惩罚）', () => {
+    /** 与 harness `dsh-llm/lib/types/retry-policy.js` 的集合逐字一致。 */
+    const RETRYABLE = ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']
+
+    it('★ 405 + 无语义 HTML 页 ⇒ 不可重试（用户本机实测形态）', () => {
+      const code = httpErrorCodeForZcode(405, '<!DOCTYPE html><html><head><title>405</title></head><body>x</body></html>')
+      expect(code).toBe('PERMISSION_DENIED')
+      expect(RETRYABLE).not.toContain(code)
+    })
+
+    it('★ 405 + 空 body / 纯文本同样不可重试', () => {
+      for (const body of ['', 'Method Not Allowed']) {
+        const code = httpErrorCodeForZcode(405, body)
+        expect(code, body).toBe('PERMISSION_DENIED')
+        expect(RETRYABLE).not.toContain(code)
+      }
+    })
+
+    it('★ 405 的 JSON 3012 形态保持 PERMISSION（既有语义不变）', () => {
+      expect(httpErrorCodeForZcode(405, '{"code":3012,"msg":"request has been blocked due to unusual activity."}'))
+        .toBe('PERMISSION')
+    })
+
+    it('★★ 邻位②：有权威业务码时 405 不得吞掉它（防只改一半）', () => {
+      // 这三个都是「405 + 带码」，必须各归其位，不能一律 PERMISSION_DENIED。
+      expect(httpErrorCodeForZcode(405, '{"code":1005,"msg":"exceed quota limit"}'))
+        .toBe('QUOTA_EXCEEDED')
+      expect(httpErrorCodeForZcode(405, '{"code":3012,"msg":"blocked"}'))
+        .toBe('PERMISSION')
+      expect(httpErrorCodeForZcode(405, '{"code":1002,"msg":"invalid"}'))
+        .toBe('AUTH')
+    })
+
+    it('★★ 邻位③：不得与「PERMISSION ⟺ 风控语义」的等价守卫冲突', () => {
+      // 405 页没有风控语义 ⇒ 不能归 PERMISSION（那会让上面的等价守卫红）。
+      for (const body of [
+        '<!DOCTYPE html><html><head><title>405</title></head><body>x</body></html>',
+        '',
+        'Method Not Allowed',
+      ]) {
+        expect(hasZcodeUnusualActivity(body), body).toBe(false)
+        expect(httpErrorCodeForZcode(405, body), body).not.toBe('PERMISSION')
+      }
+    })
+
+    it('★ 真瞬断（5xx / 429）仍可重试 —— 修 405 不影响它们', () => {
+      for (const [status, body] of [
+        [500, '{"error":"internal"}'],
+        [502, '<html><body>Bad Gateway</body></html>'],
+        [503, '<!DOCTYPE html><html><title>503</title><body>x</body></html>'],
+        [429, '{"code":3009,"msg":"model concurrency limit exceeded"}'],
+      ] as const) {
+        const code = httpErrorCodeForZcode(status, body)
+        expect(RETRYABLE, `status=${status}`).toContain(code)
+      }
+    })
+
+    it('★★ 文案必须说「不会重试」且不得再说「建议稍后重试」', () => {
+      const msg = describeUpstreamError(405, '<!DOCTYPE html><html><head><title>405</title></head><body>x</body></html>')
+      expect(msg).toContain('不会自动重试')
+      expect(msg).not.toContain('建议稍后重试')
+      // 方向性：不得把链路拦截说成额度/凭据问题
+      expect(msg).not.toContain('额度')
+      expect(msg).not.toContain('凭据失效')
+    })
+
+    it('★ ESA 页仍走 ESA 专属措辞（405 分支让位）', () => {
+      // 守卫「ESA 分支与通用分支必须可区分」钉住：普通 405 页不得含「边缘CDN」。
+      expect(describeUpstreamError(405, ESA)).toContain('边缘CDN')
+      const generic = describeUpstreamError(405, '<html><body>502</body></html>')
+      expect(generic).not.toContain('边缘CDN')
+      expect(generic).toContain('不会自动重试')
     })
   })
 
@@ -1377,11 +1500,17 @@ describe('边缘 HTML 页：判据侧必须一并豁免（2026-10-07 端到端�
        *
        * ⚠ 举例刻意**避开** `<Error><Code>Blocked</Code><Message>unusual activity…`
        * ——它带风控语义，归业务分支（见上面那条）。
+       *
+       * ★ **`405` 现在归 `PERMISSION`**（2026-10-25，issue IKQ4B4）：
+       * 该状态码在 zcode 是风控拦截的专属码 ⇒ 恒不可重试。
+       * 用 `500` 做对照，证明「页面优先」这条分工仍然成立
+       * （改的只是 405 这一格，不是把页面分支整体关掉）。
        */
       const page = '<Error><Code>AccessDenied</Code><Message>Forbidden</Message></Error>'
       expect(readZcodeBusinessCodeFromBody(page)).toBeUndefined()
       expect(looksLikeZcodeHtmlPage(page)).toBe(true)
-      expect(httpErrorCodeForZcode(405, page)).toBe('SERVER')
+      expect(httpErrorCodeForZcode(500, page)).toBe('SERVER')
+      expect(httpErrorCodeForZcode(405, page)).toBe('PERMISSION_DENIED')
     })
 
     /**

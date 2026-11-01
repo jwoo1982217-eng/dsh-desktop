@@ -46,7 +46,7 @@ const PRODUCT = {
   endpoint: 'https://copilot.tencent.com',
   apiDomain: 'copilot.tencent.com',
   claimBase: 'https://www.workbuddy.cn',
-  userAgent: 'CodeBuddyIDE/1.106.1',
+  userAgent: 'CodeBuddyIDE/4.12.2',
 } as unknown as BuddyProduct
 const CRED: BuddyCredential = {
   access_token: 'test-token',

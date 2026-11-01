@@ -80,6 +80,69 @@ function readAstudioLocalTime(source: Record<string, unknown>, key: string): str
   return typeof value === 'string' ? value : ''
 }
 
+/**
+ * 把 `*NextExpireTime` 的**不带时区本地时间串**折算成毫秒时间戳。
+ *
+ * ## 为什么先 `replace(' ', 'T')` 再 `Date.parse`（⚠️ 已按实测订正 2026-10-21）
+ *
+ * 实测上游下发的是 `"2026-11-20T01:50:14"`（无 `Z`、无 `+08:00`）。ES 规范对这种
+ * **仅日期时间**形式（`date-time`，无偏移）的解析是「按**本地时区**解释」。
+ * 而空格分隔的 `"2026-11-20 01:50:14"` **不在**规范保证的三种格式内
+ *（ISO / `toString` / `toUTCString`）⇒ 属**实现自定义**，`Date.parse` **允许**
+ * 返回 `NaN`（规范明确写了「鼓励但不要求」支持其它格式）。
+ *
+ * ⇒ 先 `replace(' ', 'T')` 把它收进**有保证**的形式，两条输入形态走同一条判据。
+ *
+ * ⚠️⚠️ **但必须如实说明：这行在当前 V8 上是「冗余」的**（2026-10-21 审计实测）。
+ *    本机 Node 26 / V8 对空格形态**非常宽容**，甚至多空格也认：
+ *    ```
+ *    Date.parse('2026-11-20 01:50:14')  === Date.parse('2026-11-20T01:50:14')  // true
+ *    Date.parse('2026-11-20  01:50:14') === 同上                              // true
+ *    ```
+ *    ⇒ 把它删掉，**本机全部 109 条相关用例仍然全绿** —— 这是**实测无牙**，
+ *    已如实登记，**不为它编一条恒真的用例**（本仓库红线）。
+ *    保留这行的理由是**规范保证**而非「当前引擎会坏」：换引擎（JSC / SpiderMonkey）
+ *    或 V8 收紧解析时，空格形态会静默变 `NaN` ⇒ 该包**静默落永久桶** ⇒
+ *    永久锁对它失效。这是一条**前向防御**，不是现存缺陷的修复。
+ *
+ *    ⇒ 守卫只能是「两形态给出**相同毫秒**」这个**契约**断言
+ *    （`astudio-lock-wiring.spec.ts` 的「空格形态与 T 形态给出相同的毫秒」），
+ *    它锁的是「两条形态必须等价」这件事，**不锁 `replace` 这一行本身**。
+ *
+ * ⚠️ **解析不出来就返回 `undefined`，绝不编造一个时刻**（本仓库红线）。
+ *   上游若改成带偏移的 ISO（`...Z`），`Date.parse` 同样能认，无需改动。
+ *
+ * ## ⚠️⚠️ **未验证项（如实登记，2026-10-21 合并审计）**：服务端到底是哪个时区
+ *
+ * 上面「按本地时区解释」那条**只对了一半**：它决定了**我们**怎么解释这个串，
+ * 但**没有**证明「本机时区 == 服务端时区」。而这两者不必然相同：
+ *
+ * - 实测样本 `"2026-11-20T01:50:14"` 是**在哪台机器、哪个时区**采的 ——
+ *   `aggregate-expiry.ts` / `aggregate-adapter.ts` / `src/index.ts` 三处注释
+ *   都只抄了这个串，**没有任何一处记录采集时的机器时区**；
+ * - `tests/e2e/astudio-popups-probe.e2e.spec.ts` 只 `console.log` 原始报文，
+ *   **不校验**时区，也没有拿官方客户端显示的到期日做对照。
+ *
+ * ⇒ 如果服务端固定按 **UTC+8** 下发本地时间，而用户机器在 UTC+0，那么这里
+ *   算出的时刻会**整体偏移 8 小时**。后果是「临期 / 长期」的分档边界移动
+ *   （15 天窗口的判据在整天粒度上仍然成立，但**倒计时显示**会差 8 小时）。
+ *
+ * **为什么现在不改**：没有任何一条实测证据能确定服务端时区。三种候选做法
+ *（按本机 / 固定 +08:00 / 要求上游带偏移）**都是猜**，而本仓库红线是
+ *「绝不编造」。故**保持既有行为（按本机时区）并把未验证如实登记在这里**，
+ * 由后续真机取证决定（取证方式：同一账号同时看官方客户端面板显示的到期日
+ * 与本函数算出的日期，且**在两台不同时区的机器上各做一次**）。
+ *
+ * ⚠️ 不要因为「看起来对」就把这条注释删掉 —— 它记录的是**证据强度**，
+ *   不是实现细节。本仓库对「结构上可达、零实测」的项一律这样标注。
+ */
+function astudioLocalTimeMs(source: Record<string, unknown>, key: string): number | undefined {
+  const raw = readAstudioLocalTime(source, key)
+  if (raw.length === 0) return undefined
+  const ms = Date.parse(raw.replace(' ', 'T'))
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined
+}
+
 /** 上游文案可能不在 `message` 而在 `desc` —— 由 parseAstudioEnvelope 归一，这里只兜底。 */
 function failDetail(error: string): ProviderBalanceDetail {
   return { balance: null, error }
@@ -124,6 +187,10 @@ export function buildAstudioBalance(data: Record<string, unknown>): CreditBalanc
     if (remaining === undefined) return // 该池不下发 ⇒ 不臆造条目
     const poolTotal = readAstudioInt(data, totalKey) ?? remaining
     const expiredTime = readAstudioLocalTime(data, expireKey)
+    // ⚠️ `expiredTime` 是**字符串**，而客户端的 `splitCreditsByExpiry` 只认
+    //    `deductionEndTime`（毫秒数）—— 缺它就会把整个池算成「永久积分」。
+    //    两者都给：`expiredTime` 供 tooltip 原样显示，`deductionEndTime` 供分档。
+    const deductionEndTime = astudioLocalTimeMs(data, expireKey)
     packages.push({
       name,
       unit: ASTUDIO_CREDIT_UNIT,
@@ -135,8 +202,10 @@ export function buildAstudioBalance(data: Record<string, unknown>): CreditBalanc
       cycleStartTime: '',
       cycleEndTime: '',
       // ⚠️ `*NextExpireTime` **不在官方 Schema 内**（Effect.Struct 会裁未知字段），
-      // 且是**不带时区的本地时间串** ⇒ 原样透出、不 Date.parse、不做数学比较。
+      // 且是**不带时区的本地时间串** ⇒ `expiredTime` 原样透出（展示用），
+      // 数学比较统一走 `deductionEndTime`（上面的归一化值）。
       expiredTime,
+      ...(deductionEndTime === undefined ? {} : { deductionEndTime }),
     })
   }
 
@@ -147,6 +216,7 @@ export function buildAstudioBalance(data: Record<string, unknown>): CreditBalanc
   const sparkBalance = readAstudioInt(data, 'sparkTotalBalance')
   if (sparkBalance !== undefined) {
     const sparkTotal = readAstudioInt(data, 'sparkTotalAmount') ?? sparkBalance
+    const sparkDeductionEndTime = astudioLocalTimeMs(data, 'sparkNextExpireTime')
     packages.push({
       name: '星火积分（独立池，不参与主池合计）',
       unit: ASTUDIO_CREDIT_UNIT,
@@ -157,6 +227,7 @@ export function buildAstudioBalance(data: Record<string, unknown>): CreditBalanc
       cycleStartTime: '',
       cycleEndTime: '',
       expiredTime: readAstudioLocalTime(data, 'sparkNextExpireTime'),
+      ...(sparkDeductionEndTime === undefined ? {} : { deductionEndTime: sparkDeductionEndTime }),
     })
   }
 
@@ -265,6 +336,36 @@ export async function fetchAstudioBalanceDetailed(
     return failDetail('积分查询失败：响应未包含余额字段')
   }
   return { balance }
+}
+
+/**
+ * 供 `BuddyBalanceSelector` 用的 `fetchBalance`（**丢失原因**的薄封装）。
+ *
+ * ## 为什么需要它
+ *
+ * `BuddyBalanceSelector` 的 `deps.fetchBalance` 契约是
+ * `(credential, product) => Promise<CreditBalance | null>` —— 只回余额、不回原因
+ * （分档逻辑对「为什么查不到」不感兴趣，一律归入最后一档）。
+ * 而本文件的权威入口 {@link fetchAstudioBalanceDetailed} 回的是
+ * `{ balance, error? }`，故这里把它**压平成 null**。
+ *
+ * ⚠️ **失败原因不要在这里丢掉就完事**：`fetchAstudioBalanceDetailed` 的三条失败
+ * 路径（会话失效 / 服务不可用 / 形状不认识）对用户动作完全不同。选号器这条路上
+ * 确实只需要 null（它会把该号归入「查不到」档，其他号继续用）；但面板上
+ * 直接展示余额时走的仍是 `fetchAstudioBalanceDetailed`，原因在那里保留。
+ *
+ * ⚠️ **不要在本函数里再写一份失败分类**：那是 `fetchAstudioBalanceDetailed` 的职责，
+ * 两处各写一遍必然漂移（本仓库红线）。
+ */
+export async function fetchAstudioCreditBalance(
+  credential: AstudioCredential,
+  product?: AstudioProduct,
+): Promise<CreditBalance | null> {
+  const result = await fetchAstudioBalanceDetailed(
+    credential,
+    product === undefined ? {} : { product },
+  )
+  return result.balance
 }
 
 // ── 每日奖励 / 签到能力 ──

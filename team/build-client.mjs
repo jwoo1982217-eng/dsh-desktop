@@ -5,7 +5,7 @@ import {fileURLToPath, pathToFileURL} from 'node:url';
 export function adaptClient(source, bridge) {
   const replace = (before, after) => {
     if (source.split(before).length !== 2) throw Error('DS Bot 客户端基线变化：' + before.slice(0, 75));
-    source = source.replace(before, after);
+    source = source.replace(before, () => after);
   };
   replace("id: 'ds-bot',", "id: 'dsh-team',");
   if (source.split('ctx.uiWorkspace.openSession(target);').length !== 3) throw Error('DS Bot 导航客户端基线变化');

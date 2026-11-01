@@ -29,8 +29,14 @@
  * @property {boolean} enabled 用户在设置页里的选择
  * @property {boolean} running 当前是否真的在监听端口
  * @property {boolean} blockedByEnv 是否被环境变量显式停用
+ * @property {boolean} allowLan 「允许局域网访问」开关（用户的选择，持久化）
+ * @property {boolean} hostFromEnv env 是否显式给了 DSH_OPENAI_GATEWAY_HOST
+ *   （此时局域网开关不生效，UI 必须禁用并说明）
  * @property {{ host: string, port: number } | null} address 实际监听地址
  * @property {ApiKeyInfo | null} [apiKey] 正在使用的凭据
+ * @property {{ kind: 'start-failed' | 'factory-missing', reason: string, at: number } | null} [lastError]
+ *   「期望运行但未监听」的结构化原因（Issue #11）。⚠️ 可选：老版本宿主不返回它，
+ *   所有读取点都必须容忍 `undefined`（统一走 `gatewayFailureReason()`）。
  */
 
 /**
@@ -62,15 +68,216 @@ import { isFilterActive, matchesModelQuery } from './model-filter.js';
 // 「已对外暴露」，面板于是输出它自己声称要消除的那种**错误安全陈述**
 // （两轮独立审计各自实测到，2026-10-13）。
 // ⚠️ 该模块必须**零 node import**（它同时被 esbuild 打进浏览器 bundle）。
-import { formatGatewayHost, gatewayHttpUrl, isLoopbackHost } from '../../src/openai-gateway/config.js';
+import { formatGatewayHost, gatewayHttpUrl, isLoopbackHost, isWildcardHost } from '../../src/openai-gateway/config.js';
 
 export async function copyToClipboard(value) {
+  // 1) 首选 Clipboard API（安全上下文 / 有权限时）。
+  //    ⚠️ 捕获后**必须继续降级**，不能直接 return false —— 见下方 legacyCopy 的说明。
   try {
-    if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return false;
-    await navigator.clipboard.writeText(value);
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    // 权限被拒 / 非用户手势调用 → 落到 legacyCopy
+  }
+  // 2) 降级：execCommand('copy')
+  if (legacyCopy(value)) return true;
+  // 3) 兜底：自动复制用不了就把文本摊出来让用户自己 Ctrl+C。
+  //    ⚠️ 返回 false（自动复制确实失败，调用方该展开列表/提示），但**同时**弹窗，
+  //    保证用户在任何环境下都能拿到文本 —— 「点了没反应」比「丑一点的弹窗」糟得多。
+  showManualCopy(value);
+  return false;
+}
+
+/**
+ * 手动复制兜底面板：把文本摊进一个自动全选的 textarea。
+ *
+ * ## 为什么必须有这一层（2026-10-23 二次报障）
+ *
+ * 前两层都失效的环境是真实存在的：
+ *
+ * - 非安全上下文（`http://<内网 IP>`）→ 无 `navigator.clipboard`
+ * - iframe 未授予 `allow="clipboard-write"` → `execCommand('copy')` 静默返回 false
+ * - 浏览器隐私策略 / 企业策略禁用剪贴板写入
+ *
+ * 这些情况下前端能做的最后一件事就是**把文本交给用户**。`window.prompt` 也能做到，
+ * 但它对「复制全部 605 个 ID」这种长文本会被截断（各浏览器上限约 2000 字符），
+ * 所以这里自己搭一个小面板。
+ *
+ * ⚠️ 用原生 DOM 而不是 React 状态：`copyToClipboard` 是被 `jet-hub.js` 里多个
+ * 非组件函数调用的纯工具，为了一个罕见的兜底路径把整个调用链改成受控组件不值得。
+ * z-index 取 `2147483647` —— DSH 的浮层栈很深，兜底面板必须压在最上面才有意义。
+ *
+ * @param {string} value
+ * @returns {boolean} 是否成功渲染出面板
+ */
+function showManualCopy(value) {
+  if (typeof document === 'undefined' || !document.body) return false;
+  try {
+    // ⚠️ 2026-10-31 审计（P3）：失败环境下连点 N 次「复制」会叠 N 个遮罩面板
+    //    （每个都要单独点关闭）。已有面板在场时直接复用它：更新 textarea 内容、
+    //    重新全选 —— 语义仍是「用户拿到了文本」，且不叠加。
+    //    用 data 属性标记而不是保存全局引用：本函数无状态，重复弹守卫靠 DOM 自身。
+    const existing = document.body.querySelector('[data-dsh-manual-copy]');
+    if (existing) {
+      const again = existing.querySelector('textarea');
+      if (again) {
+        again.value = value;
+        again.focus();
+        again.select();
+        again.setSelectionRange(0, value.length);
+        return true;
+      }
+      existing.remove();
+    }
+
+    const overlay = document.createElement('div');
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    // ⚠️ 给查询选择器留钩子（见上面的重复弹守卫）。
+    overlay.setAttribute('data-dsh-manual-copy', '');
+    overlay.style.cssText = [
+      'position:fixed', 'inset:0', 'z-index:2147483647',
+      'display:flex', 'align-items:center', 'justify-content:center', 'padding:24px',
+      'background:rgba(0,0,0,.45)', 'font-family:inherit',
+      // ⚠️ 2026-10-31 审计（P2）：宿主可能跑深色主题（DSH Web 常见形态），
+      //    硬编码浅色会在深色界面里糊一块高亮白。用 color-scheme 声明跟随宿主
+      //    （textarea 的 UA 默认色/滚动条随之适配），其余颜色尽量走系统语义色，
+      //    实在写死的（边框/阴影）选中性灰，深浅两版都不刺眼。
+      'color-scheme:dark light',
+    ].join(';');
+
+    const box = document.createElement('div');
+    box.style.cssText = [
+      'background:Canvas', 'color:CanvasText',
+      'border-radius:12px', 'box-shadow:0 12px 40px rgba(0,0,0,.28)',
+      'border:1px solid rgba(128,128,128,.35)',
+      'width:min(720px,100%)', 'max-height:80vh', 'display:flex',
+      'flex-direction:column', 'padding:16px', 'gap:12px',
+    ].join(';');
+
+    const title = document.createElement('div');
+    title.textContent = '浏览器阻止了自动复制，请按 Ctrl+C 复制（内容已全选）';
+    title.style.cssText = 'font-size:13px;font-weight:600;color:CanvasText';
+
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    // ⚠️ 审计（P2）：密钥/模型 ID 不是人类语言，别让浏览器给它画拼写红线。
+    textarea.setAttribute('spellcheck', 'false');
+    textarea.style.cssText = [
+      'flex:1', 'min-height:220px', 'box-sizing:border-box',
+      'font-family:ui-monospace,Consolas,monospace', 'font-size:12px', 'line-height:1.5',
+      'border:1px solid rgba(128,128,128,.35)', 'border-radius:8px',
+      'padding:8px', 'resize:vertical', 'color-scheme:dark light',
+    ].join(';');
+
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = '关闭';
+    close.title = '关闭（Esc）';
+    close.style.cssText = [
+      'align-self:flex-end', 'padding:6px 16px', 'border-radius:6px',
+      'border:1px solid rgba(128,128,128,.35)', 'background:transparent',
+      'color:inherit', 'cursor:pointer', 'font-size:13px', 'font-family:inherit',
+    ].join(';');
+
+    // ⚠️ 2026-10-31 审计（P1）：面板声明了 aria-modal 却没有 Escape 处理，而
+    //    宿主在 document 级注册了 `Escape → 关闭网关 modal`（jet-hub.js 的
+    //    onKeyDown）。用户按 Esc 想关这个小面板，结果**先关掉底层大模态**，
+    //    小面板挂在 body 上残留（不随 React 卸载）。⇒ 面板自己接 Escape 并在
+    //    **capture 阶段**拦下（stopPropagation 阻断后宿主的 document 冒泡监听
+    //    收不到该事件），关闭时移除监听。textarea 初始持焦点，keydown 必经这里。
+    const dismissAndCleanup = () => {
+      document.removeEventListener('keydown', onKeyDown, { capture: true });
+      overlay.remove();
+    };
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        event.preventDefault();
+        dismissAndCleanup();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown, { capture: true });
+    close.addEventListener('click', dismissAndCleanup);
+    overlay.addEventListener('click', (event) => { if (event.target === overlay) dismissAndCleanup(); });
+
+    box.append(title, textarea, close);
+    overlay.append(box);
+    document.body.appendChild(overlay);
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, value.length);
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * `document.execCommand('copy')` 降级实现。
+ *
+ * ## ⚠️ 这个降级不是可选项（2026-10-23 报障：本地用户复制不了，服务器端正常）
+ *
+ * `navigator.clipboard` **只在安全上下文存在**：
+ *
+ * | 打开方式 | 安全上下文 | `navigator.clipboard` |
+ * |---|---|---|
+ * | `https://host/...` | 是 | 有 |
+ * | `http://localhost:3000`、`http://127.0.0.1:3000` | 是 | 有 |
+ * | **`http://192.168.1.20:3000`**（局域网地址） | **否** | **`undefined`** |
+ *
+ * 所以同一份产物，在服务器本机用 `localhost` 打开时复制正常，同事从局域网用
+ * `http://<内网 IP>` 打开时「复制本组 / 复制全部 ID / 复制对照表」全部静默失效 ——
+ * 现象就是"服务端能复制、本地不能"，极易被误判成权限或后端问题。
+ *
+ * `execCommand('copy')` 已废弃但**所有浏览器仍支持**，且**不要求安全上下文**，
+ * 是这条路径上唯一的出路。
+ *
+ * ## 几个必须的细节
+ *
+ * - 隐藏用 `opacity: 0` 而**不是** `display: none`：后者不在渲染树里，选不中，复制必失败。
+ * - `position: fixed` + 1px：避免插入元素把页面顶出滚动条或抖动。
+ * - `readonly`：否则移动端弹出软键盘。
+ * - `setSelectionRange(0, len)`：iOS Safari 上 `select()` 对 textarea 有时选不全。
+ * - **还原焦点**：`select()` 会把焦点抢到 textarea，不还回去会让键盘用户的操作位置丢失
+ *   （例如 Tab 到复制按钮、按回车、焦点跳到页面顶部）。
+ *
+ * @param {string} value
+ * @returns {boolean} 是否成功
+ */
+function legacyCopy(value) {
+  if (typeof document === 'undefined' || typeof document.body === 'undefined') return false;
+  const previousFocus = typeof document.activeElement !== 'undefined' ? document.activeElement : null;
+  let textarea = null;
+  try {
+    textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '0';
+    textarea.style.left = '0';
+    textarea.style.width = '1px';
+    textarea.style.height = '1px';
+    textarea.style.padding = '0';
+    textarea.style.border = 'none';
+    textarea.style.outline = 'none';
+    textarea.style.boxShadow = 'none';
+    textarea.style.background = 'transparent';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    textarea.setSelectionRange(0, value.length);
+    return document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
+    if (textarea && textarea.parentNode) textarea.parentNode.removeChild(textarea);
+    if (previousFocus && typeof previousFocus.focus === 'function') {
+      try { previousFocus.focus(); } catch { /* 元素可能已被卸载 */ }
+    }
   }
 }
 
@@ -579,6 +786,22 @@ export function gatewayEffortsCurl(endpoint) {
  * @param {GatewayStatus | null | undefined} status
  * @returns {string}
  */
+/**
+ * 从 `status.lastError` 取出**可展示的失败原因**（空串 = 没有失败原因）。
+ *
+ * ⚠️ 存在的理由（Issue #11 审计 P1-1）：本文件有**四条**文案都在描述「已选择
+ * 开启但没在监听」，而 PR 起初只给其中两条接了 `lastError` ⇒ 同一语义两套判据，
+ * 另两条仍在印「通常是端口被占用」这个**猜测**（`gatewayButtonTitle` 是真实渲染
+ * 的页头 tooltip）。抽成一个函数，四条路径共用，避免将来再加文案时又漏。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {string} 非空 = 有真实原因；空串 = 无（调用方可回落到通用提示）
+ */
+export function gatewayFailureReason(status) {
+  const reason = status?.lastError?.reason
+  return typeof reason === 'string' && reason.length > 0 ? reason : ''
+}
+
 export function gatewayButtonTitle(status) {
   if (!status) return '本机 OpenAI 网关：读取状态中。'
   if (status.blockedByEnv) {
@@ -586,7 +809,13 @@ export function gatewayButtonTitle(status) {
       + '在这里改开关不会让它监听端口。'
   }
   if (status.running) return `本机 OpenAI 网关：运行中（${gatewayEndpoint(status)}）。`
-  if (status.enabled) return '本机 OpenAI 网关：已选择开启，但当前未在监听（通常是端口被占用）。'
+  if (status.enabled) {
+    // ⚠️ 页头 tooltip 也必须转述真实原因（Issue #11 审计 P1-1）：原先无条件说
+    // 「通常是端口被占用」—— 那是**猜的**，真实原因可能是配置/密钥初始化失败。
+    const reason = gatewayFailureReason(status)
+    if (reason !== '') return `本机 OpenAI 网关：已选择开启，但启动失败（${reason}）。`
+    return '本机 OpenAI 网关：已选择开启，但当前未在监听（通常是端口被占用）。'
+  }
   return '本机 OpenAI 网关：已关闭。'
 }
 
@@ -634,6 +863,28 @@ export function gatewayLoopbackOnly(status) {
 }
 
 /**
+ * `running: true` 但 `address === null`。
+ *
+ * ⚠️ **这是合法组合**（2026-10-22 对抗审计 m-1）：宿主侧 `running`（`isGatewayRunning()`）
+ * 与 `address`（`gatewayAddress()`）是**两次独立 `degrade`**，任一次抛错都会让对应字段为空
+ * ⇒「在跑」与「拿不到地址」可以同时成立。
+ *
+ * 旧实现在这种情况下会：
+ * - `isWildcardHost(undefined)` 抛 `TypeError` ⇒ **整个状态面板崩**（已修：
+ *   `normalizeHostForCompare` 对非字符串返回空串）；
+ * - 修了不崩之后仍会输出「只绑定 127.0.0.1」—— 而开关可能是**开着的**
+ *   ⇒ 又一条与事实相反的安全声明（IKL7UN 那条纪律：暴露面变了就必须明说）。
+ *
+ * ⇒ 判据：**地址未知时不得声称任何暴露面**，只能如实说「拿不到地址」。
+ */
+function gatewayAddressUnknown(status) {
+  if (status?.running !== true) return false;
+  const address = status?.address;
+  return address === null || address === undefined
+    || typeof (address).host !== 'string' || (address).host.trim() === '';
+}
+
+/**
  * 绑了**非回环**地址时的提示行（issue IKL7UN）。
  *
  * ## 为什么这条必须存在
@@ -664,9 +915,9 @@ export function gatewayLoopbackOnly(status) {
 export function nonLoopbackNotice(status) {
   const address = status?.address;
   const host = typeof address?.host === 'string' && address.host.trim() !== '' ? address.host : '非回环地址';
-  return `监听地址是 ${host}（不再是本机回环）：只应在容器/端口映射场景使用，`
-    + '此时同一容器网络内的其它容器与宿主都能连到这个端口。仅本机使用时把 '
-    + 'DSH_OPENAI_GATEWAY_HOST 改回 127.0.0.1（或删除该环境变量）并重启。';
+  return `监听地址是 ${host}（不再是本机回环）：只应在容器/端口映射或局域网共享场景使用，`
+    + '此时同一网络内的其它设备与宿主都能连到这个端口。仅本机使用时关掉「允许局域网访问」'
+    + '开关即可立即恢复；若地址来自 DSH_OPENAI_GATEWAY_HOST，把它改回 127.0.0.1 并重启。';
 }
 
 /**
@@ -691,11 +942,18 @@ export function nonLoopbackNotice(status) {
  * @returns {string}
  */
 export function gatewayFootnote(status) {
+  // ⚠️ **地址未知时不得声称任何暴露面**（2026-10-22 m-1）：
+  //    旧实现会落到最后那句「只绑定 127.0.0.1」，而开关可能开着 ⇒
+  //   与事实相反的安全声明。
+  if (gatewayAddressUnknown(status)) {
+    return '网关正在运行，但本次读不到它的监听地址 —— 无法确认它只绑了回环。'
+      + '若你打开了「允许局域网访问」，请按已开启对待（隔离只靠密钥）。';
+  }
   if (status?.running && !gatewayLoopbackOnly(status)) {
     const host = typeof status.address?.host === 'string' ? status.address.host : '非回环地址';
-    return `网关绑定在 ${host}，同一容器网络内的其它容器与宿主都能连到该端口 —— 隔离只靠密钥，`
-      + '不要把它配置进任何浏览器端工具或扩展。仅本机使用时把 DSH_OPENAI_GATEWAY_HOST '
-      + '改回 127.0.0.1（或删除该环境变量）并重启。';
+    return `网关绑定在 ${host}，同一网络内的其它设备与宿主都能连到该端口 —— 隔离只靠密钥，`
+      + '不要把它配置进任何浏览器端工具或扩展。仅本机使用时关掉「允许局域网访问」'
+      + '开关即可恢复；若地址来自 DSH_OPENAI_GATEWAY_HOST，把它改回 127.0.0.1 并重启。';
   }
   return '网关只绑定 127.0.0.1，但这挡不住同机的其它用户或进程 —— 真正的隔离靠密钥，'
     + '不要把它配置进任何浏览器端工具或扩展。';
@@ -727,6 +985,12 @@ export function gatewayStatusLines(status) {
       '协议支持：OpenAI Chat Completions 与 OpenAI Responses API。',
       // 地址单列一行（带端口），它是用户要抄走的东西。
       endpoint ? `API 请求地址：${endpoint}` : '',
+      // ⚠️ 绑 0.0.0.0（局域网开关）时，抄走的字面量在任何设备上都连不上
+      // （0.0.0.0 不是一台具体设备的地址）——必须当场说明要换成什么。
+      // 判据复用宿主侧 isWildcardHost（与本文件其它 host 判据同源）。
+      isWildcardHost(status.address?.host)
+        ? '其它设备请把地址里的 0.0.0.0 换成本机的局域网 IP（ipconfig 可查）。'
+        : '',
       // ⚠️ 暴露面变了必须**明说**（issue IKL7UN）。原先「只绑定 127.0.0.1」是
       // 常量文案，host 可配之后它就是错误陈述 —— 用户会以为「外面连不上是
       // 设计如此」而放弃排查。反之，回环部署下**不加这句**，避免把刚精简过的
@@ -737,7 +1001,13 @@ export function gatewayStatusLines(status) {
   if (status.enabled) {
     return [
       '已选择开启，但网关当前没有在监听。',
-      '最常见的原因是端口被其它程序占用 —— 换 DSH_OPENAI_GATEWAY_PORT 后重启即可。',
+      // ⚠️ 有真实原因时**如实转述**（Issue #11 建议 ②）。原先这句「最常见的原因
+      // 是端口被其它程序占用」是**猜的**：当真实原因是「配置/密钥初始化失败」或
+      // 「插件没注册工厂」时，用户会照着它去查端口，永远查不出问题 —— 报障者正是
+      // 因此把它误读成 API-key 问题。宿主侧现在回传 `lastError`。
+      ...(gatewayFailureReason(status) !== ''
+        ? [`启动失败的原因：${gatewayFailureReason(status)}`]
+        : ['最常见的原因是端口被其它程序占用 —— 换 DSH_OPENAI_GATEWAY_PORT 后重启即可。']),
     ]
   }
   return ['网关已关闭，不会监听任何端口。']
@@ -758,6 +1028,100 @@ export function gatewaySwitchDisabled(status) {
 }
 
 /**
+ * 「允许局域网访问」开关是否可点。
+ *
+ * ⚠️ **只在 env 显式给了 `DSH_OPENAI_GATEWAY_HOST` 时禁用**：那一刻开关翻成
+ * 什么都改变不了监听地址（env 是运维口径，优先级更高），「打开了却没生效」比
+ * 「禁用并解释」更让人困惑 —— 与主开关被 `blockedByEnv` 禁用的同一取舍。
+ * 网关总开关关闭时**不禁用**：用户可以先选好，打开总开关时立即生效。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {boolean}
+ */
+export function gatewayAllowLanSwitchDisabled(status) {
+  if (!status) return true
+  return status.hostFromEnv === true
+}
+
+/**
+ * 「允许局域网访问」开关行下的说明文案。
+ *
+ * ⚠️ 两件事必须说清，否则用户要么不知道暴露面变了多大，要么不知道隔离靠什么：
+ * 1. 打开 = 绑 **0.0.0.0**（全部网卡），同一局域网的设备都能连到网关；
+ * 2. 隔离**只靠 API Key** —— 浏览器端工具/扩展不要配（面板脚注同款警告）。
+ *
+ * ⚠️ 纯文本，不得出现 `**`（会原样显示星号，见 `nonLoopbackNotice` 的同条理由）。
+ *
+ * @param {GatewayStatus | null | undefined} status
+ * @returns {string}
+ */
+export function gatewayAllowLanHint(status) {
+  if (!status) return ''
+  if (status.hostFromEnv) {
+    return '已由环境变量 DSH_OPENAI_GATEWAY_HOST 显式指定监听地址，本开关此刻不生效；'
+      + '删除该环境变量并重启 DSH 后才能用这里的选择。'
+  }
+  // ⚠️⚠️ **必须同时判 `running`**（2026-10-22 对抗审计 P2）。
+  //
+  // 只判 `allowLan` 会在「用户打开了开关、但网关总开关关着 / 端口被占 / env 停用」时
+  // 输出「**已监听**全部网卡」—— 而那是**错误的安全陈述**（谎报暴露），并把它与同一
+  // 弹窗里另外两条文案直接矛盾起来：
+  //   - `gatewayStatusLines` 说「网关已关闭，不会监听任何端口」；
+  //   - `gatewayFootnote` 说「网关只绑定 127.0.0.1」。
+  // ⇒ 三条文案对「现在到底在不在监听」给出三种答案。
+  //
+  // ⚠️ 这正是本仓 IKL7UN 反复记的那种「面板输出它自己声称要消除的错误安全陈述」，
+  //   只是方向反了（这次是**谎报暴露**而不是谎报安全）。
+  // ⚠️ 同一文件里 `gatewayAllowLanToggleNotice` **已经**判了 `running` ⇒ 这是
+  //   「同一语义两套判据」的实例，本次把 hint 这条补齐到同口径。
+  if (status.allowLan && status.running) {
+    return '已监听全部网卡（0.0.0.0）：同一局域网内的设备都能连到网关，隔离只靠 API Key'
+      + '——不要把它配置进任何浏览器端工具或扩展。'
+  }
+  if (status.allowLan) {
+    // 已选择但**没在监听** ⇒ 如实说「还没生效」，绝不谎报「已监听」。
+    return '已选择允许局域网访问（0.0.0.0），但网关当前没有在监听：'
+      + '打开网关总开关后才会真正绑定全部网卡。'
+  }
+  return '默认只绑定 127.0.0.1，仅本机能访问。打开后网关改绑 0.0.0.0，'
+    + '同一局域网内的设备可凭 API Key 连到网关。'
+}
+
+/**
+ * 局域网开关切换成功后的一句提示。
+ *
+ * @param {GatewayStatus | null | undefined} status 切换后的状态
+ * @param {boolean} nextAllowLan 用户想要的状态
+ * @returns {string}
+ */
+export function gatewayAllowLanToggleNotice(status, nextAllowLan) {
+  if (status?.hostFromEnv) {
+    return '选择已保存，但 DSH_OPENAI_GATEWAY_HOST 已显式指定监听地址，本开关此刻不生效。'
+  }
+  if (!nextAllowLan) {
+    if (status?.running) return `已恢复默认监听：${gatewayEndpoint(status)}`
+    return '已恢复只绑定 127.0.0.1（网关当前未在监听）。'
+  }
+  if (status?.running) {
+    // ⚠️ 端口不能写死 8326：它可被 `DSH_OPENAI_GATEWAY_PORT` 改过。写死会让用户
+    //    照抄一个连不上的地址（与本文件 `gatewayEndpoint` 立的纪律同源 —— 那边
+    //    也是因为这个原因才从状态里取端口，而不是拼常量）。
+    const port = status?.address?.port
+    return Number.isInteger(port)
+      ? `已改绑 0.0.0.0：其它设备用「这台电脑的局域网 IP:${port}/v1」+ API Key 访问。`
+      : '已改绑 0.0.0.0：其它设备用「这台电脑的局域网 IP + 网关状态页显示的端口」+ API Key 访问。'
+  }
+  // ⚠️ 翻 LAN 开关**自己就可能失败**（Issue #11 的真实场景：换绑要关旧实例再重建，
+  // 而 close() 曾挂在在途连接上）。原先这里一律说「先打开网关总开关」—— 但总开关
+  // **本来就是开的**（用户刚点的是 LAN 开关），于是这条提示把用户指向一个已经满足
+  // 的条件，真正的失败原因被藏起来。与 `gatewayToggleNotice` 同轴。
+  if (gatewayFailureReason(status) !== '') {
+    return `已保存选择，但网关换绑失败：${gatewayFailureReason(status)}`
+  }
+  return '已选择允许局域网访问，但网关当前没有在监听（先打开网关总开关）。'
+}
+
+/**
  * 切换成功后给出的一句提示。
  *
  * @param {GatewayStatus | null | undefined} status 切换后的状态
@@ -770,5 +1134,10 @@ export function gatewayToggleNotice(status, nextEnabled) {
   }
   if (!nextEnabled) return '网关已关闭，不再监听端口。'
   if (status?.running) return `网关已启动：${gatewayEndpoint(status)}`
+  // ⚠️ 同样如实转述真实原因（Issue #11 建议 ②）：只说「请检查端口」会把
+  // 「密钥/配置初始化失败」这类原因藏起来，用户永远查不到。
+  if (gatewayFailureReason(status) !== '') {
+    return `已选择开启，但网关启动失败：${gatewayFailureReason(status)}`
+  }
   return '已选择开启，但网关没有在监听，请检查端口是否被占用。'
 }

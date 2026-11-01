@@ -181,7 +181,35 @@ describe('★ 另外两家（lobsterai / trae）同样接线（同族不得分�
 })
 
 describe('★★ 接线的**透传**腿（`provider-expiry.ts` 的 `context.cachedBalance`）', () => {
-  it('★★ buddy 系四家都必须把 `context.cachedBalance` 透给原语', async () => {
+  /**
+   * ★★ **本表即清单**：所有在 `createProviderExpiry()` 里把
+   * `context.cachedBalance` 透给折算原语的渠道。
+   *
+   * ⚠️⚠️ **新增一家接了透传的渠道时，必须把它加进本表** —— 漏加 ⇒ 该家
+   *    零守卫（2026-10-20 实测：本表原只列 buddy 系四家，那时
+   *    `modelscope` / `autoclaw` / `autoclawintl` / `qoder` / `qodercn`
+   *    早已接了透传却全都不在表内；把 `qoderFamilyExpiry` 的透传整段改成
+   *    恒 `true`（= 关掉透传）后，本文件仍然**全绿、无牙**）。
+   *
+   * ⚠️ 断言用**集合相等**而不是「包含」：多一家（改了生产、忘了收表）与
+   *    少一家（漏接线）都必须是红灯。这就是本表存在的意义。
+   */
+  const CACHED_BALANCE_PROVIDERS = [
+    'buddy', 'workbuddy', 'lobsterai', 'trae', 'modelscope',
+    'autoclaw', 'autoclawintl', 'qoder', 'qodercn',
+    // ⚠️ PR !119（2026-10-20）新增的三家：astudio 走 `astudioExpiry`、
+    //    minimax / minimaxintl 走 `minimaxFamilyExpiry`，三者在
+    //    `provider-expiry.ts` 里都接了 `context.cachedBalance` 透传。
+    //    ⚠️ 它们**正是被本用例「遍历整张表」那条腿点名报出来的** ——
+    //    那是 PR131 把本表从「四家硬编码」改成「整表比对」的直接收益
+    //    （旧形态下这三家零守卫）。
+    'astudio', 'minimax', 'minimaxintl',
+    // ⚠️ 2026-10-29：magicrew 的 `provider-expiry.ts` 条目也接了 `context.cachedBalance`
+    //    透传（`magicrewExpiry` 的取数腿契约要求它）。漏登记 ⇒ 本表与生产漂移。
+    'magicrew',
+  ] as const
+
+  it('★★ 所有接了 `cachedBalance` 透传的渠道都必须真的透传（本表即清单）', async () => {
     // ⚠️⚠️ **这条是本任务唯一能抓「透传漏了」的判据**（变异验证实测）：
     //    上面那些用例直接调 `buddyExpiry(product, credential, cached)` —— 它们证明
     //    原语**支持**共享读数，但**完全绕过了** `provider-expiry.ts` 的透传。
@@ -190,20 +218,46 @@ describe('★★ 接线的**透传**腿（`provider-expiry.ts` 的 `context.cach
     //    正是本功能要消除的浪费。⇒ 必须**经真实表**驱动一次。
     const { createProviderExpiry } = await import('../../src/provider-expiry.js')
     const table = createProviderExpiry()
-    const seen: string[] = []
-    for (const id of ['buddy', 'workbuddy', 'lobsterai', 'trae']) {
-      const impl = table[id]
-      expect(impl, `${id} 必须在表里`).toBeDefined()
+    // 本表里的 id 必须在生产表里存在（漏接线 ⇒ 该家整体消失）。
+    for (const id of CACHED_BALANCE_PROVIDERS) {
+      expect(table[id], `★ ${id} 必须在 createProviderExpiry() 的表里`).toBeDefined()
+    }
+    // ⚠️ 遍历**整张表**（不是只遍历本表）：这样「生产里新接了一家透传、却忘了
+    //    收进本表」也能被下面的集合比对抓到 —— 只遍历本表就看不见多出来的那家。
+    const unregistered: string[] = []
+    const registered = CACHED_BALANCE_PROVIDERS as readonly string[]
+    for (const [id, impl] of Object.entries(table)) {
       // ⚠️ 凭据给一个**会解析失败**的形状：原语随后会走「回落取数」并失败，
       //    但**透传是否发生**在失败之前就已经可观测（`cachedBalance` 被调用）。
       let called = 0
-      await impl!.credentialExpiry({ access_token: 't' } as never, {
-        accountId: 'a1',
-        cachedBalance: async () => { called += 1; seen.push(id); return null },
-      }).catch(() => undefined)
-      expect(called, `★ ${id} 必须透传 cachedBalance（漏了 ⇒ 它永远自己打上游）`).toBe(1)
+      // ⚠️ **必须有界**：漏透传时原语会真的去打上游（本机 `openapi.qoder.sh`
+      //    不可达，实测 ~10.7s）⇒ 不加闸的话本用例会以 vitest 的
+      //    「Test timed out in 5000ms」收场 —— 虽然同样是红，但报的是超时而不是
+      //    「qoder 必须透传 cachedBalance」，排查时看不出真正原因。
+      //    实测（2026-10-20）：把 `qoderFamilyExpiry` 的判据改成恒 `true` 后，
+      //    加闸版本给出的是**带渠道名字的断言失败**。
+      let done = false
+      await Promise.race([
+        impl.credentialExpiry({ access_token: 't' } as never, {
+          accountId: 'a1',
+          cachedBalance: async () => { called += 1; return null },
+        }).catch(() => undefined).then(() => { done = true }),
+        new Promise((r) => setTimeout(r, 2000)),
+      ])
+      if (registered.includes(id)) {
+        expect(called, `★ ${id} 必须透传 cachedBalance（漏了 ⇒ 它永远自己打上游）`).toBe(1)
+        // 闸门本身不得掩盖结论：透传正确时原语应当**立刻**返回（共享读数为
+        // null ⇒ 无需再去上游），故这里必须已经结束。
+        expect(done, `★ ${id} 透传之后原语应当立刻返回（不应再去上游）`).toBe(true)
+      } else if (called > 0) {
+        unregistered.push(id)
+      }
     }
-    expect(seen.sort()).toEqual(['buddy', 'lobsterai', 'trae', 'workbuddy'])
+    // ⚠️ 反向：生产里接了透传却不在本表的，必须点名 —— 否则那一家从此零守卫
+    //    （2026-10-20 实测的原始缺口正是这个形态：`modelscope` / `autoclaw` /
+    //    `autoclawintl` / `qoder` / `qodercn` 五家都在生产里接了透传，
+    //    但本表只列了 buddy 系四家，于是它们全都没被这条判据覆盖）。
+    expect(unregistered, '这些渠道在生产里接了 cachedBalance 透传，必须收进本表').toEqual([])
   })
 
   it('★ 反向：不传 `cachedBalance` 时不得凭空调用它（未接线 = 行为不变）', async () => {

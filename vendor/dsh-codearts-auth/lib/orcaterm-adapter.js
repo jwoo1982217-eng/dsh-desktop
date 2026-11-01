@@ -561,9 +561,9 @@ export class OrcaTermAdapter {
         return ORCATerm_FALLBACK_MODELS.map((model) => ({ id: model.id, name: model.name }));
     }
     async listModels(provider) {
-        if (this.deps.providerClosed?.())
+        if (this.deps.providerClosed?.() || this.deps.accountPool?.providerClosedFor(ORCATerm.id))
             return [];
-        return ORCATerm_FALLBACK_MODELS.map((model) => ({
+        return ORCATerm_FALLBACK_MODELS.filter(model => !this.deps.accountPool?.disabledModelsFor(ORCATerm.id).has(model.id)).map((model) => ({
             provider,
             id: model.id,
             name: model.name,
@@ -758,6 +758,7 @@ export class OrcaTermAdapter {
 export function registerOrcaTermLlm(ctx, options) {
     const adapter = new OrcaTermAdapter({
         resolveCredential: options.resolveCredential,
+        accountPool: options.accountPool,
         providerClosed: options.providerClosed,
         recordUsage: options.recordUsage,
         warn: options.warn ?? ((message) => ctx.logger?.warn?.(message)),

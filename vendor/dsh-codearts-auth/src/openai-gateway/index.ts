@@ -5,7 +5,9 @@ import type { AttachmentBridge } from './images.js'
 import {
   applyGatewayDesiredState,
   disposeGatewayRuntime,
+  gatewayDesiredAllowLan,
   registerGatewayFactory,
+  setGatewayDesiredAllowLan,
   setGatewayDesiredEnabled,
 } from './runtime.js'
 import { createOpenAiGateway, type LlmRuntimeLike, type GatewayLogger } from './server.js'
@@ -13,6 +15,11 @@ import { createOpenAiGateway, type LlmRuntimeLike, type GatewayLogger } from './
 /** 账号池里读网关开关的最小接口（避免为此把整个 pool 类型拖进来）。 */
 interface GatewaySwitchSource {
   gatewayEnabled(): boolean
+  /**
+   * 「允许局域网访问」开关（可选：旧测试桩只给 enabled）。
+   * 缺失按 `false` 处理 —— 与持久化的缺键语义一致（安全默认）。
+   */
+  gatewayAllowLan?(): boolean
 }
 
 /**
@@ -60,6 +67,8 @@ export function mountOpenAiGateway(ctx: Context, pool?: GatewaySwitchSource): vo
     // 设置页里的开关是**期望状态**：缺键 / 读取失败一律按启用（老用户行为不变），
     // 真正的判定（含 env 的更高优先级）在 runtime 里做。
     setGatewayDesiredEnabled(pool?.gatewayEnabled() !== false)
+    // 「允许局域网访问」同理：缺键 / 缺方法 / 读取失败一律按关闭（安全默认）。
+    setGatewayDesiredAllowLan(pool?.gatewayAllowLan?.() === true)
     registerGatewayFactory(() => {
       // 工厂在**收敛时**才被调用（可能是设置页在运行期触发的启动），
       // 故同步异常必须在这里就地消化 —— 见 `GatewayFactory` 的契约。
@@ -72,6 +81,13 @@ export function mountOpenAiGateway(ctx: Context, pool?: GatewaySwitchSource): vo
           attachments: makeGatewayAttachmentBridge(ctx),
           home: resolveJetHubHome(ctx),
           logger,
+          // ⚠️⚠️ 必须读 **runtime 的当前期望状态**（`gatewayDesiredAllowLan()`），
+          // 不能读 pool 的持久化副本：收敛判据用的是前者，两处不同源时会出现
+          // 「收敛判 allowLan=true、工厂却拿 false 重建」⇒ 地址不变 ⇒ 收敛判
+          // 永远失配 ⇒ **每次收敛都反复重建**（运行期翻开关的必现死循环）。
+          // 单一来源 = 期望状态本身；pool 只在 mount 时镜像进期望状态，
+          // RPC 翻转时两侧一起写。
+          allowLan: gatewayDesiredAllowLan(),
         })
       } catch (error) {
         logger.error(`[openai-gateway] 初始化失败，本机网关未启动：${describe(error)}`)

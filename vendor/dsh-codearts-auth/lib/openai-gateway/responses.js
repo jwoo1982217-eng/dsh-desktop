@@ -67,7 +67,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { DEFAULT_IMAGE_LIMITS } from './images.js';
-import { OpenAiGatewayError, convertTools, createGatewayMessage, parseModelRoute, partsFromContent, textFromContent, tokenValue, } from './messages.js';
+import { OpenAiGatewayError, convertTools, createGatewayMessage, createGatewayToolMessage, parseModelRoute, partsFromContent, textFromContent, tokenValue, } from './messages.js';
 import { normalizeUpstreamFailure, upstreamStatusOrFallback } from './model-errors.js';
 // ⚠️ 复用 `src/sse.ts` 的**同一份**「工具名是否可用」判据（各适配器的
 // `resolveToolPairing` 用的是它）。自己再写一条 `name.length > 0` 必然漂移：
@@ -524,7 +524,7 @@ async function toMessages(input, provider, model, bridge, limits) {
                 throw new OpenAiGatewayError('function_call_output requires call_id');
             if (!callIds.kept.has(callId) && callIds.dropped.has(callId))
                 continue;
-            messages.push(createGatewayMessage('tool', await outputParts(raw.output, bridge, limits), { kind: 'tool', callId: callId }));
+            messages.push(createGatewayToolMessage(callId, await outputParts(raw.output, bridge, limits)));
             continue;
         }
         if (type === 'reasoning') {

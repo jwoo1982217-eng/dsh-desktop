@@ -278,11 +278,11 @@ describe('⚠️ 同源不变式（dispatcher 与 fetch 必须来自同一份 un
     // 这是不变式的**总闸**：任何人把 dispatcher 塞进请求选项都要变红，
     // 逼后来者改用 proxyFetch（或明确论证为何例外）。
     // ⚠️ 扫真目录而非写死清单 —— 新增文件也必须被覆盖（实测 src/ 下 169 个 .ts）。
-    // ⚠️ proxyFetch 自身是唯一合法落点，故整体豁免该文件。
+    // Android专用签名通道也使用包内undici与独占Agent；真实签名字节/全局污染/释放由scripts/codearts-signed-transport.test.mjs覆盖。
     // ⚠️ 用最严的 MENTION（连 ['dispatcher'] 方括号键、[k] 模板键都拦住）；
     //    测试文件不能用它（那里有正当措辞），见上面的分层说明。
     const offenders = listSrcFiles()
-      .filter((file) => !file.endsWith('opencode-proxy.ts') && !file.endsWith('opencode-local-native.ts'))
+      .filter((file) => !file.endsWith('opencode-proxy.ts') && !file.endsWith('opencode-local-native.ts') && !file.endsWith('channel-fetch.ts') && !file.endsWith('direct-fetch.ts'))
       .filter((file) => DISPATCHER_MENTION.test(stripComments(readFileSync(file, 'utf8'))))
       .map((file) => file.slice(join(here, '../..').length + 1))
     expect(offenders).toEqual([])

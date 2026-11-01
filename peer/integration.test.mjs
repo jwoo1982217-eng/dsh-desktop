@@ -15,6 +15,7 @@ import { apply } from './index.mjs';
 import { createOpenAiGateway } from '../vendor/dsh-codearts-auth/lib/openai-gateway/server.js';
 import { installDesktopPeer } from '../scripts/install-desktop-peer.mjs';
 import { startHomeRelay } from '../scripts/start-home-relay.mjs';
+import { McpManager } from './mcp-manager/manager.mjs';
 
 const listen = s => new Promise((r, j) => { s.once('error', j); s.listen(0, '127.0.0.1', () => r(s.address().port)); });
 const freePort = async () => { const s = createServer(), port = await listen(s); await new Promise(r => s.close(r)); return port; };
@@ -52,25 +53,47 @@ test('configuration sync uses current DSH volatile forms and protects revisions'
 });
 
 function pluginContext(t, llm) {
-  const store = credentials(), disposers = [], hooks = new Map(); let rpc;
+  const store = credentials(), disposers = [], hooks = new Map(), services = new Map(); let rpc;
   const ctx = { llm, credentials: store, settings: { describe: () => [] }, systemPrompt: { variable() {}, context() {} },
-    connection: { rpc: { handle(path, handler, guard) { assert.equal(guard.authority, 'loopback'); rpc = handler; } } },
-    webServer: { register() { return () => {}; } }, get() { return undefined; },
+    connection: { rpc: { handle(path, handler, guard) { assert.equal(guard.authority, 'loopback'); if (path === '/phone-peer') rpc = handler; } } },
+    webServer: { register() { return () => {}; } },
+    get(name) { return services.get(name) ?? this[name]; }, provide(name, value) { services.set(name, value); },
+    inject(names, fn) { if (names.every(name => this.get(name) !== undefined)) return fn(this); },
     effect(fn) { const disposer = fn(); if (typeof disposer === 'function') disposers.push(disposer); },
     on(name, fn) { hooks.set(name, fn); },
   };
   t.after(async () => { await hooks.get('dispose')?.(); for (const fn of disposers.reverse()) await fn(); });
-  return { ctx, store, async manage(action, extra = {}) { const result = await rpc('manage', { action, ...extra }); assert.equal(result.ok, true, result.error?.message); return result.value; } };
+  return { ctx, store, peerRouteRegistered: () => typeof rpc === 'function', async manage(action, extra = {}) { const result = await rpc('manage', { action, ...extra }); assert.equal(result.ok, true, result.error?.message); return result.value; } };
 }
 
+test('a slow external MCP does not block the paired-device entry from starting', async t => {
+  const home = await temp(t), previous = process.env.DSH_HOME; process.env.DSH_HOME = home;
+  t.after(() => previous === undefined ? delete process.env.DSH_HOME : process.env.DSH_HOME = previous);
+  const original = McpManager.prototype.init; let entered = false, release;
+  // Only the external initialization boundary is held; apply and its RPC registration are real.
+  McpManager.prototype.init = function () { entered = true; return new Promise(resolve => { release = resolve; }); };
+  const p = pluginContext(t, {}); p.ctx.tools = { register: () => () => {}, guard: () => () => {} };
+  const starting = apply(p.ctx, { role: 'phone', proxyPort: await freePort() }); starting.catch(() => {});
+  try {
+    const until = Date.now() + 3000;
+    while (!entered) { if (Date.now() > until) throw Error('Fixture MCP did not enter initialization'); await new Promise(resolve => setTimeout(resolve, 10)); }
+    assert.equal(p.peerRouteRegistered(), true, 'Connection startup must not await unrelated MCP discovery');
+    assert.equal((await p.manage('status')).paired, false);
+  } finally {
+    McpManager.prototype.init = original; release?.(); await starting;
+  }
+});
+
 test('actual phone gateway → encrypted relay → registered desktop DSH adapter handles models, text, tools and limits', async t => {
+  const fixtureHome = await temp(t), previousHome = process.env.DSH_HOME; process.env.DSH_HOME = fixtureHome;
+  t.after(() => previousHome === undefined ? delete process.env.DSH_HOME : process.env.DSH_HOME = previousHome);
   const phoneCtx = new Context(), desktopCtx = new Context(); await phoneCtx.plugin(LlmRuntime); await desktopCtx.plugin(LlmRuntime);
   t.after(async () => { await phoneCtx.fiber.dispose(); await desktopCtx.fiber.dispose(); });
-  let toolMode = false, failure, lateFailure = false, received;
+  let toolMode = false, failure, lateFailure = false, received, phoneModelLookups = 0;
   class FixtureAdapter extends LlmAdapter {
     providerInfo(id) { return { id, name: 'fixture' }; }
     async listModels(provider) { return [{ provider, id: 'fixture-model', name: 'GPT-5.6-Sol · ChatGPT 会员', contextWindow: 4096, maxTokens: 128, inputModalities: ['text'] }]; }
-    async resolveModel(provider, id) { return { ...((await this.listModels(provider))[0]), id, context: { contextWindow: 4096 }, defaultMaxTokens: 128 }; }
+    async resolveModel(provider, id) { phoneModelLookups++; return { ...((await this.listModels(provider))[0]), id, context: { contextWindow: 4096 }, defaultMaxTokens: 128 }; }
     async *stream(options) { received = options;
       if (failure && !lateFailure) { yield { type: 'finish', reason: { kind: 'error', failure } }; return; }
       if (toolMode) { yield { type: 'tool-call-delta', index: 0, id: 'fixture-call', name: 'inspect', argumentsDelta: '{"path":"fixture"}' }; yield { type: 'finish', reason: { kind: 'tool-calls' } }; }
@@ -96,12 +119,23 @@ test('actual phone gateway → encrypted relay → registered desktop DSH adapte
   const deadline = Date.now() + 5000;
   while (!(await phone.manage('status')).connected) { if (Date.now() > deadline) throw Error('Pairing timeout'); await new Promise(r => setTimeout(r, 10)); }
   assert.ok(!JSON.stringify(await phone.manage('status')).includes('secret'));
-  const models = await desktopCtx.llm.listModels('phone-gateway'); assert.equal(models[0].id, 'fixture/fixture-model');
+  const [models, repeatedModels] = await Promise.all([desktopCtx.llm.listModels('phone-gateway'), desktopCtx.llm.listModels('phone-gateway'), desktopCtx.llm.listModels('phone-gateway')]);
+  assert.deepEqual(repeatedModels, models);
+  assert.equal(phoneModelLookups, 1, 'concurrent directory readers must share one phone request');
+  assert.equal(models[0].id, 'fixture/fixture-model');
   const localModels = await desktopCtx.llm.listModels('local-fixture');
   assert.equal(localModels[0].name, 'GPT-5.6-Sol · ChatGPT 会员');
   assert.equal(models[0].name, '手机网关 · GPT-5.6-Sol · ChatGPT 会员');
+  const beforeMetadataLookups = phoneModelLookups;
   const info = await desktopCtx.llm.resolveModelInfo('phone-gateway', models[0].id); assert.equal(info.defaultMaxTokens, 128); assert.equal(info.reasoning, undefined);
   assert.equal(info.name, models[0].name);
+  await Promise.all(Array.from({ length: 256 }, () => desktopCtx.llm.resolveModelInfo('phone-gateway', models[0].id)));
+  assert.equal(phoneModelLookups, beforeMetadataLookups, 'listed model metadata must not generate per-model peer RPC bursts');
+  assert.equal((await phone.manage('status')).connected, true);
+  const unlisted = await desktopCtx.llm.resolveModelInfo('phone-gateway', 'fixture/unlisted-model');
+  assert.equal(unlisted.id, 'fixture/unlisted-model');
+  assert.equal(unlisted.defaultMaxTokens, 128);
+  assert.equal(phoneModelLookups, beforeMetadataLookups + 1, 'unlisted exact routes still resolve on the phone');
   const options = { provider: 'phone-gateway', model: models[0].id, maxTokens: 64, messages: [{ role: 'user', content: [{ type: 'text', text: '请检查电脑代码' }] }] };
   const text = []; for await (const chunk of desktopCtx.llm.stream(options)) text.push(chunk);
   assert.equal(text.find(c => c.type === 'text-delta').text, '手机网关完成'); assert.equal(received.provider, 'fixture'); assert.equal(received.model, 'fixture-model');
@@ -140,6 +174,8 @@ test('desktop installer preserves existing bundles, creates resolvable plugin an
   const manifest = JSON.parse(await readFile(join(profile, 'package.json')));
   assert.deepEqual(manifest.dsh.profile.bundles, ['@deepseek-ai/dsh-base', 'existing', 'dsh-peer']); assert.equal(manifest.dependencies.existing, '1.0.0');
   const imported = await import(join(profile, 'node_modules/dsh-peer/index.mjs')); assert.equal(imported.name, 'dsh-peer');
+  for (const file of ['remote-service.mjs', 'transport-proxy.mjs', 'tunnel.mjs']) assert.deepEqual(await readFile(join(profile, 'node_modules/dsh-peer', file)), await readFile(new URL('./' + file, import.meta.url)));
+  assert.equal((await import(join(profile, 'node_modules/dsh-peer/remote-service.mjs'))).RemoteService.name, 'RemoteService');
 });
 
 test('home relay helper publishes only local relay and parses split quick-tunnel output', async t => {
@@ -147,6 +183,6 @@ test('home relay helper publishes only local relay and parses split quick-tunnel
   await writeFile(executable, '#!/bin/sh\nprintf "https://fixture-" >&2\nsleep 0.05\nprintf "peer.trycloudflare.com\\n" >&2\nsleep 2\n', { mode: 0o700 });
   let publicUrl;
   const service = await startHomeRelay({ cloudflared: executable, port: 0, onUrl: url => publicUrl = url }); t.after(() => service.close());
-  const deadline = Date.now() + 2000; while (!publicUrl) { if (Date.now() > deadline) throw Error('No relay URL'); await new Promise(r => setTimeout(r, 10)); }
+  const deadline = Date.now() + 5000; while (!publicUrl) { if (Date.now() > deadline) throw Error('No relay URL'); await new Promise(r => setTimeout(r, 10)); }
   assert.equal(publicUrl, 'wss://fixture-peer.trycloudflare.com/relay'); assert.equal(service.relay.server.address().address, '127.0.0.1');
 });

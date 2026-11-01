@@ -1,0 +1,920 @@
+import { withQueueAccountRotation } from './queue-rotation.js'
+import { checkQueuedResponse } from './model-queue.js'
+/**
+ * Gemini（Cloud Code Assist）模型适配器。
+ *
+ * 协议实现（信封构造、SSE 消费）在 `gemini-messages.ts`，
+ * 认证在 `gemini-auth.ts`，配额在 `gemini-credits.ts`。
+ *
+ * ## ⚠️ 本适配器独有的四件事（照 `docs/GEMINI-PORT-PLAN.md` §3.1/§3.2）
+ *
+ * 1. **两层救场**：先换端点（廉价兜底），再换账号（主救场）。
+ *    ⚠️ 端点差异**未获实验支持**（404 / project 两类错误两端点行为完全一致），
+ *    换端点零成本无害，但**不能当 quota 的有效解法**。
+ * 2. **签名回填 + 去签重试**：`functionCall` 上的 `thoughtSignature` 由
+ *    `gemini-sigstore.ts` 落盘缓存，下一轮按「工具名 + 规范化参数」回填；
+ *    上游仍拒签名时**去签重试一次**。
+ * 3. **图片两跳**：先 `projectRequestImage`（插件侧缩放，640,000 px），
+ *    拿不到才 `readImage`（原图）。两者都拿不到**抛错**，绝不静默丢图。
+ * 4. **`toolChoice` 恒 AUTO**：`@deepseek-ai/dsh-llm` 的 `GenerateOptions`
+ *    **没有** `toolChoice` 字段（实测 `lib/types/types.d.ts`），
+ *    故不传；`translateGeminiRequest` 内部默认走 `AUTO`。
+ */
+
+import {
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  isContextWindowExceededError,
+  LlmAdapter,
+  LlmError,
+  ReasoningEffortId,
+} from '@deepseek-ai/dsh-llm'
+import type {
+  GenerateOptions,
+  LlmModelInfo,
+  LlmProviderInfo,
+  LlmResolvedModelInfo,
+  StreamChunk,
+} from '@deepseek-ai/dsh-llm'
+import type { Context } from '@deepseek-ai/cordis'
+import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+import { type AccountPool } from './account-pool.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { collectImages, httpErrorCode } from './openai-compat.js'
+import { projectRequestImage } from './image-budget.js'
+import { registerAdapterIdempotent } from './llm-register-compat.js'
+import { reportLedgerAccount } from './token-ledger.js'
+import {
+  GEMINI,
+  GEMINI_ENDPOINTS,
+  GEMINI_IDLE_TIMEOUT_MS,
+  GEMINI_MAX_IMAGE_BYTES_INLINE,
+  GEMINI_MAX_REQUEST_BODY_BYTES,
+  GEMINI_SESSION_LANE_INFER,
+  GEMINI_STREAM_PATH,
+  GEMINI_UPSTREAM_FLASH,
+  geminiCanonicalModelId,
+  geminiFallbackEntries,
+  geminiHeaders,
+  geminiModelSpec,
+  geminiReasoningInfo,
+  isGeminiExpired,
+  marshalAlphabetical,
+  newGeminiRequestId,
+  normalizeBase64,
+  type GeminiCredential,
+  type GeminiModelEntry,
+  type GeminiProduct,
+} from './gemini.js'
+import { consumeGeminiSse, translateGeminiRequest } from './gemini-messages.js'
+import { planSessionTitleThinking } from './session-title.js'
+import { persistGeminiProject, resolveGeminiProject } from './gemini-project.js'
+import { geminiNetworkHint } from './gemini-proxy.js'
+import type { GeminiSigStore } from './gemini-sigstore.js'
+
+/** 最多换几个账号（含起始账号）。 */
+const GEMINI_MAX_ROTATE = 3
+/** 429 命中后原账号的冷却时长（计划 §3.1）。 */
+const GEMINI_RATE_LIMIT_COOLDOWN_MS = 60_000
+/** 401 命中后原账号的冷却时长（计划 §3.1）。 */
+const GEMINI_AUTH_COOLDOWN_MS = 300_000
+
+/**
+ * 判定「签名被上游拒绝」（原版 `IsSignatureError` 的口径）。
+ *
+ * ⚠️ 必须**宽**：上游对签名问题的报错文案不统一（`thought_signature`、
+ * `Invalid signature`、`signature is required`…），而漏判的后果是
+ * 用户看到一次莫名其妙的 400；误判的后果只是多发一次不带签名的请求
+ * （那条路径本来就要试）。
+ */
+export function isGeminiSignatureError(text: string): boolean {
+  const lower = text.toLowerCase()
+  if (lower.includes('signature')) return true
+  return lower.includes('thought') && lower.includes('invalid')
+}
+
+/** 400 的正文是否指向配额/权限类问题（决定「先换端点再换账号」）。 */
+function isGeminiSwitchableText(text: string): boolean {
+  const lower = text.toLowerCase()
+  return ['quota', 'permission', 'unsupported', 'project'].some((word) => lower.includes(word))
+}
+
+/** 400 的正文是否明确是配额耗尽（归类 `QUOTA_EXCEEDED`）。 */
+function isGeminiQuotaText(text: string): boolean {
+  const lower = text.toLowerCase()
+  return ['quota', 'resource_exhausted', 'resource exhausted', 'rate limit', 'exceeded']
+    .some((word) => lower.includes(word))
+}
+
+/**
+ * 判定「上游的**服务端会话**累计输入超过 1M」。
+ *
+ * ## 为什么单独成一类
+ *
+ * 上游按 `sessionId` 在服务端累计对话输入；长工具循环会把累计推过 1M，
+ * 此后该 sessionId 的**每个**请求都 400
+ * `The input token count exceeds the maximum number of tokens allowed 1048576`，
+ * 直到该服务端会话过期。**削本地历史没用**（累计在服务端、按 sessionId 计），
+ * 原地重试/换端点也没用 —— 唯一出路是**升代换一个全新 sessionId**。
+ *
+ * ⚠️ 判据逐字抄自 `Antigravity-Manager` 的 `[FIX session-1M]`
+ * （`proxy/handlers/gemini.rs:983`）：`status == 400 && 正文含
+ * "exceeds the maximum number of tokens"`。这是三家唯一给出**具体触发条件**的
+ * 实现，且 wb 独立撞上同一现象（`SessionOverflowBump`）。
+ *
+ * ⚠️ 必须**先于** {@link isGeminiQuotaText} 判定：该文案里的 "exceeds" 不含
+ * `isGeminiQuotaText` 的关键词 `"exceeded"`，但真出现 `exceeded` 变体时不能被
+ * 误判成「配额耗尽」而触发换号 —— 换号解决不了服务端会话累计。
+ */
+export function isGeminiSessionOverflow(text: string): boolean {
+  return text.toLowerCase().includes('exceeds the maximum number of tokens')
+}
+
+/**
+ * 一次请求内最多升几代。
+ *
+ * ⚠️ 必须有界：若上游对**新** sessionId 也回同一条 400（例如真被按账号限死），
+ * 无界升代会变成死循环。一代失败后如实透传错误，让用户看到上游原文。
+ */
+const GEMINI_MAX_SESSION_BUMPS = 1
+
+/**
+ * Gemini 的上下文超限措辞。
+ *
+ * 实测报文：
+ * ```
+ * {"error":{"code":400,"message":"The input token count (1200000) exceeds
+ *  the maximum number of tokens allowed (1048576).","status":"INVALID_ARGUMENT"}}
+ * ```
+ *
+ * ⚠️ **harness 的 `isContextWindowExceededError` 认不出这句话** —— 实测其五个
+ * 分支里最接近的 `EXCEEDS_MODEL_CONTEXT` 要求 `exceed...` 与 `context` 同时
+ * 出现（`\b(?:input|prompt|request)\b.{0,40}\bexceed\b.{0,40}\bcontext\b`），
+ * 而这句话里**一个 `context` 都没有**。这与 `buddy-adapter.ts` 当年漏判
+ * 「prompt is too long: N tokens > M maximum」是**同一类缺陷**，修法也相同：
+ * 本仓库补一条专属判据。
+ *
+ * ⚠️ 判据要求「token count」+「exceeds the maximum」两个特征同时出现，
+ * 避免把别的内容类 400 误判成溢出（宽泛措辞会误判，代价见上）。
+ */
+const GEMINI_TOKEN_COUNT_OVERFLOW =
+  /\btoken\s+count\b[\s\S]{0,60}?\bexceeds?\s+the\s+maximum\b/i
+
+/**
+ * 判定 400 是否表示**上下文超限**（应归 `CONTEXT_WINDOW_EXCEEDED`）。
+ *
+ * ## 为什么必须单独判（与 {@link isGeminiSessionOverflow} 是**两条不同的路**）
+ *
+ * | 情形 | 病因 | 处置 |
+ * |---|---|---|
+ * | 服务端**按 sessionId 累计**超 1M | 上游会话记账 | **升代**换新 sessionId |
+ * | 本地历史把**单次请求**撑过窗口 | 本请求太大 | **压缩上下文**后重发 |
+ *
+ * 前者升代就够（新会话记账归零）；后者升代**没用** —— 请求体本身还是那么大。
+ * 所以两条判据不能互相替代。
+ *
+ * ⚠️ 上游对这两种情形回的是**同一句话**（都是「input token count exceeds …
+ * 1048576」），无法从报文区分。因此实际处置是**升级式**的：
+ * 先升代（便宜），升过仍失败就归 `CONTEXT_WINDOW_EXCEEDED` 交给 harness 压缩
+ * （贵但能根治）。见 `gemini-adapter.ts` 里两个判据的**先后顺序**。
+ *
+ * ## 归错码的代价是**不对称**的
+ *
+ * `dsh-compaction-basic` 的 request-error listener 第一行是
+ * `if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE) return next()` —— 归成
+ * `INVALID_REQUEST`（`httpErrorCode` 的 400 兜底）就**连一次压缩的机会都没有**，
+ * 长会话越过窗口后每轮都报废、用户只能开新会话。
+ * 归成溢出的最坏结果只是一次无效的压缩尝试。方向取「宁可多判一次溢出」。
+ *
+ * 判定口径与 `buddy-adapter.ts` / `llm-adapter.ts` 的 `httpErrorCode` 一致：
+ * 用**完整报文**（不先用 `errorDetail` 归一化 —— 那会丢掉 `extError` /
+ * `displayMsg` 等结构化字段，实测会漏判）。
+ */
+function isGeminiContextOverflow(text: string): boolean {
+  return isContextWindowExceededError(text) || GEMINI_TOKEN_COUNT_OVERFLOW.test(text)
+}
+
+/** {@link GeminiAdapter} 的构造选项。 */
+export interface GeminiAdapterOptions {
+  /** 与登录、续期共用的渠道出网能力。 */
+  fetchImpl?: typeof fetch
+  /** 单凭据回退 ref（无账号池时）。 */
+  credentialRef: CredentialRef
+  /** 解析当前可用凭据。 */
+  resolveCredential: (modelId?: string) => Promise<GeminiCredential | undefined>
+  /** 凭据失效时的处理（续期或换号，由接线侧决定）。 */
+  refresh: (accountId?: string, reason?: 'auth') => Promise<void>
+  /** 账号池（目录门控、黑名单、限流切号）。 */
+  accountPool?: AccountPool
+  /**
+   * 内联一张图片为**原始字节**（由调用方桥接 `ctx.attachments.readImage`）。
+   *
+   * ⚠️ 契约与 `buddy-adapter.ts` 一致：**读不到必须抛错**，不得返回空。
+   * 静默丢图会让用户以为图片被模型看到了（与 cline / lobsterai 同口径）。
+   */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string }>
+  /**
+   * 取**请求版本**图片（附件服务按目标尺寸缩放）。
+   *
+   * ⚠️ 契约与 `readImage` **相反**：不可用时返回 `undefined`（不是抛错）——
+   * 缩放是优化，拿不到就发原图（见 `image-budget.ts`）。
+   */
+  readImageRequest?: (
+    attachment: unknown,
+    target: { width: number; height: number; maxBytes: number },
+  ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  /** `thoughtSignature` 缓存（未提供则每轮都不带签名）。 */
+  sigStore?: GeminiSigStore
+  /**
+   * 覆盖上行会话 id。
+   *
+   * ⚠️ 缺省**不传**（走内容派生：`project` + 首条 user 文本 + `sessionLane`）。
+   * 只有复刻历史抓包/联调才钉固定值 —— 恒定值会让所有对话共用一个会话。
+   */
+  sessionId?: string
+  /**
+   * 会话派生标签。推理路径用 {@link GEMINI_SESSION_LANE_INFER}（缺省），
+   * 冒烟/探测路径用 {@link GEMINI_SESSION_LANE_SMOKE}。
+   */
+  sessionLane?: string
+  /**
+   * 覆盖信封里的 `project`（缺省**自动探测**，见 `gemini-project.ts`）。
+   *
+   * ⚠️ 缺省不是「恒为 `aicode-consumers`」—— 那是探测为空时的兜底。
+   * 只有联调/复刻历史抓包才显式钉值。
+   */
+  project?: string
+  /**
+   * 项目号探测结果缓存（键 = 凭据身份）。
+   *
+   * ⚠️ 由接线侧**长期持有并复用**（不要每次调用现造）—— 现造等于没有跨请求缓存，
+   * 每轮推理都会多打一次 `loadCodeAssist`。不传则退化为单次请求内缓存。
+   */
+  projectCache?: Map<string, string>
+  /** 探测用的 fetch（测试注入；缺省全局 `fetch`）。 */
+  projectFetcher?: typeof fetch
+  /**
+   * 推理请求用的 fetch（Gitee issue IKLTZ2）。
+   *
+   * ⚠️ **这一处此前连 seam 都没有**：`stream()` 里的 `streamGenerateContent`
+   * 直接写死裸 `fetch`，因此 issue 建议里「接上已有的 seam」若照字面实现，
+   * **推理主路径会漏掉**（而它恰恰是用户唯一会卡住的那条路）。
+   *
+   * ⚠️ 与 `projectFetcher` **分成两个字段**：项目探测与推理是两次独立请求，
+   * 测试替身通常只想拦其中一条；合成一个字段会让「只拦探测」的用例意外拦到推理。
+   */
+  /**
+   * 按**账号 id** 取 fetcher（代理支持，Gitee issue IKLTZ2）。
+   *
+   * ⚠️ 必须是**函数**而不是一份定好的 fetcher：本适配器在一轮请求内会**换号**
+   * （限流 / 401 时 `getAvailableAccount` 换人），出口必须跟着换。
+   */
+  fetchFor?: (accountId: string) => typeof fetch
+  /**
+   * **显式**指定本适配器代表的账号池条目 id（Gitee issue IKLTZ2 审计 P1-1）。
+   *
+   * ## ⚠️ 为什么必须有它（真实缺陷，独立审计实测）
+   *
+   * 出口代理是**账号维度**的，而「本适配器正在替哪个账号发请求」有两个来源：
+   *
+   * - 主推理路径：有 `accountPool` ⇒ 按 `access_token` 反查（既有逻辑）；
+   * - **探测路径**（账号卡片上的「测试」/「重测」）：`account-probe.ts` **刻意
+   *   不传 `accountPool`**（见其 L213 的注释：探测只测这一个账号、且不写标记）
+   *   ⇒ 反查那一条路**根本不存在** ⇒ `currentAccountId` 恒为 `''`
+   *   ⇒ 解析器按「空 id = 直连」处理 ⇒ **该账号的代理被完全绕过**。
+   *
+   * 症状与 issue 原话同形：墙外环境下「测试 / 重测」**恒失败**，而这个失败
+   * 与「账号已失效」在 UI 上**完全同形** ⇒ 用户会去误删好号。
+   *
+   * ## ⚠️ 为什么是「显式传入」而不是「探测时也传 accountPool」
+   *
+   * 传池会把探测接进换号/写标记的整套编排，而探测的**既定语义**就是不写任何
+   * 东西、只测这一个账号。改 `account-probe.ts` 会破坏那套语义并波及十家适配器。
+   *
+   * ## ⚠️ 为什么**优先于**反查
+   *
+   * 探测时反查恰恰是拿不到的那条路；即便将来有人给探测也挂了池，显式值也是
+   * 更权威的（调用方明确说了「我代表这个账号」）。
+   */
+  accountIdOverride?: string
+  /**
+   * 把探测到的项目号回写凭据（跨启动缓存，best-effort）。
+   *
+   * ⚠️ 只回写**探测到的真值**，不回写兜底串 —— 理由见 `persistGeminiProject`。
+   */
+  persistProject?: (value: string) => Promise<void>
+  /** 回写失败时的告警出口（可选）。 */
+  logger?: { warn(message: string): void }
+  /** 产品配置；默认 {@link GEMINI}。 */
+  product?: GeminiProduct
+}
+
+/** Gemini（Cloud Code Assist）模型适配器。 */
+export class GeminiAdapter extends LlmAdapter {
+  private readonly product: GeminiProduct
+  /**
+   * ⚠️ **2026-10-08 Task 7b：三个方法收敛到共享骨架** `createModelCatalog`。
+   * 原先 `listModels` / `resolveModel` / `listAllModels` 各写一遍骨架，
+   * 现在只剩 `toCatalogEntry`（本家私有形状 + 静态表判据）。
+   */
+  private readonly catalog: ModelCatalog
+
+  constructor(private readonly options: GeminiAdapterOptions) {
+    super()
+    this.product = options.product ?? GEMINI
+    // ⚠️ 本家目录是**静态表**（无远端拉取）⇒ 两个取数回调是同一份。
+    this.catalog = createModelCatalog(
+      { accountPool: options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.catalogEntries(),
+        // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
+        unknownModelInputModalities: () => ['text'] as const,
+        syncCatalog: () => this.catalogEntries(),
+      },
+    )
+  }
+
+  providerInfo(provider: string): LlmProviderInfo {
+    const id = typeof provider === 'string' && provider.length > 0 ? provider : this.product.id
+    return { id, name: this.product.displayName }
+  }
+
+  /**
+   * 静态模型表（用户拍板：不拉远端目录）。
+   *
+   * ⚠️ 静态表**每次现算**（纯本地、零成本），不做任何缓存 —— 缓存只会带来
+   * 「表被改过但进程还拿着旧值」这一种故障。
+   */
+  private loadModels(): readonly GeminiModelEntry[] {
+    return geminiFallbackEntries()
+  }
+
+  /**
+   * 完整目录（**不套黑名单**），供 Channel Pack「显示列表」用。
+   *
+   * ⚠️ **必须同步返回数组，不能是 `async`**（`minimax-adapter.ts`
+   * 记录的同类缺陷：写成 async 会让 `channel-pack-rpc.ts` 的两个消费者（`[...all]` 与
+   * `all.map`）都抛 `TypeError: all is not iterable`）。
+   *
+   * ⚠️ **2026-10-08 Task 7b**：该同步契约（连同上面这条缺陷史）已在
+   * `src/model-catalog.ts` 的 `syncCatalog` 上统一持有；此处只剩委托。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    return this.catalog.listAllModels()
+  }
+
+  /**
+   * 把本家私有条目转成共享骨架的中间结构。
+   *
+   * ⚠️ 本家目录是**静态表**（`geminiFallbackEntries()`，无远端拉取），
+   * 故 `loadCatalog` 与 `syncCatalog` 取同一份数据。
+   */
+  private toCatalogEntry(entry: GeminiModelEntry): CatalogEntry {
+    const reasoning = geminiReasoningInfo(entry)
+    const contextWindow = entry.contextWindow
+    const maxTokens = entry.maxTokens
+    return {
+      id: entry.id,
+      name: entry.name,
+      // ⚠️ 本家**不剥倍率**（`resolveModel` 也用 `name`）⇒ 不提供 `bareName`。
+      // ⚠️ 模态判据**内联在此**（Task 7b：原 `inputModalitiesFor` 已删除）——
+      // 它是本家私有的「该 entry 支不支持图片」，骨架不认识 `supportsImage`。
+      // ⚠️ 三态：本家静态表**总是**带 `supportsImage` 布尔 ⇒ 恒为数组，不会是 undefined。
+      inputModalities: entry.supportsImage === true ? ['text', 'image'] : ['text'],
+      ...contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {},
+      ...maxTokens !== undefined ? { maxTokens } : {},
+      ...reasoning !== undefined ? { reasoning } : {},
+    }
+  }
+
+  private catalogEntries(): readonly CatalogEntry[] {
+    return this.loadModels().map((entry) => this.toCatalogEntry(entry))
+  }
+
+  async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    return this.catalog.listModels(_provider)
+  }
+
+  async resolveModel(
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<LlmResolvedModelInfo> {
+    return this.catalog.resolveModel(provider, model, signal)
+  }
+
+  /** 兼容 0.1.1-rc.2 的 `prepareCall` shim（与其余适配器同款）。 */
+  async prepareCall(
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<{
+    model: LlmResolvedModelInfo
+    stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>
+  }> {
+    return {
+      model: await this.resolveModel(provider, model, signal),
+      stream: (options: GenerateOptions) => this.stream(options),
+    }
+  }
+
+  /** 图片两跳的第一跳（缩放版）；返回 `undefined` 表示「该发原图」。 */
+  private async projectImage(
+    ref: unknown,
+  ): Promise<{ data: Uint8Array; mediaType: string } | undefined> {
+    return await projectRequestImage(ref, {
+      readImageRequest: this.options.readImageRequest,
+      pixelBudget: this.product.imagePixelBudget,
+    })
+  }
+
+  /**
+   * 收集并内联本次请求涉及的全部图片。
+   *
+   * ⚠️ 两跳都失败时**必须抛错**（`buddy-adapter.ts` 的权威写法）：
+   * 静默丢弃会表现为「图片凭空消失、模型答非所问」，是最难排查的一类问题。
+   */
+  private async collectInlineImages(
+    messages: GenerateOptions['messages'],
+    entry: GeminiModelEntry | undefined,
+    model: string,
+  ): Promise<Map<string, { mediaType: string; data: string }> | undefined> {
+    const imageRefs = new Map<string, unknown>()
+    for (const message of messages) {
+      if (Array.isArray(message.content)) collectImages(message.content, imageRefs)
+    }
+    if (imageRefs.size === 0) return undefined
+
+    // ⚠️ 先判定模型能力：DSH 按适配器播报的 `inputModalities` 决定要不要把
+    // 图片投影成文本占位符。声明支持就必须真支持。
+    if (entry?.supportsImage !== true) {
+      throw new LlmError(
+        `gemini: 模型 "${model}" 不支持图片输入`,
+        'UNSUPPORTED_CONTENT',
+      )
+    }
+
+    const images = new Map<string, { mediaType: string; data: string }>()
+    for (const [id, ref] of imageRefs) {
+      const projected = await this.projectImage(ref)
+      let inline = projected
+      if (inline === undefined) {
+        const readImage = this.options.readImage
+        if (readImage === undefined) {
+          throw new LlmError(
+            'gemini: 图片输入需要附件服务（readImage / readImageRequest 均未提供）',
+            'UNSUPPORTED_CONTENT',
+          )
+        }
+        try {
+          inline = await readImage(ref)
+        } catch (error) {
+          throw new LlmError(
+            'gemini: 图片附件读取失败；附件服务可能未就绪，或该对象已不存在。',
+            'UNSUPPORTED_CONTENT',
+            { cause: error },
+          )
+        }
+      }
+      if (inline === undefined) {
+        throw new LlmError(
+          'gemini: 图片附件读取不到内容；附件服务可能未就绪，或该对象已不存在。',
+          'UNSUPPORTED_CONTENT',
+        )
+      }
+      if (inline.data.byteLength > GEMINI_MAX_IMAGE_BYTES_INLINE) {
+        throw new LlmError(
+          `gemini: 图片体积 ${inline.data.byteLength} 字节超过上游内联上限`
+          + ` ${GEMINI_MAX_IMAGE_BYTES_INLINE} 字节`,
+          'UNSUPPORTED_CONTENT',
+        )
+      }
+      const data = normalizeBase64(Buffer.from(inline.data).toString('base64'))
+      if (data === undefined) {
+        throw new LlmError('gemini: 图片编码不是合法 base64', 'UNSUPPORTED_CONTENT')
+      }
+      images.set(id, { mediaType: inline.mediaType === '' ? 'image/png' : inline.mediaType, data })
+    }
+    return images
+  }
+
+  /**
+   * 走 **Cloud Code 流式推理** 发一次请求。
+   *
+   * 控制流（计划 §3.1 的完整实现）：
+   * 1. 签名被拒 → 去签重试一次（同账号同端点）；
+   * 2. 403/404、400(quota|permission|unsupported|project) → 先换端点一次；
+   * 3. 429 第一次 → 先换端点（廉价尝试），第二次 → 换账号（主救场）；
+   * 4. 401 → 先续期一次，续不动 → 换账号；
+   * 5. 换账号用**局部可变**的 `currentAccountId`，`tried` 集合跨轮保留；
+   * 6. 全部试完 → 抛 `QUOTA_EXCEEDED`（不无限切）。
+   */
+  async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    // ⚠️ 模型名**先查表再取凭据**：未知 id 立即拒绝（纯本地判定，零网络、
+    // 零凭据成本）。放行的后果是上游对未知模型名**静默接受并落回
+    // gemini-3.8-flash**（实测假名 200、正常作答 —— 名字根本不参与上游
+    // 路由），用户选错模型时拿到的是错误模型的答案且无任何征兆，比报错
+    // 难查得多。错误码用 INVALID_REQUEST：不在 harness 可重试集合（不白
+    // 退避），也不是 AUTH/QUOTA（不触发换号/续期）。
+    // ⚠️ 限流标记 / `account.test` 探测链路传来的是**带档位的名字**
+    // （写标记用请求原始 id），先归一化再查表 —— 否则「测一下被限流的
+    // 档位」会被误拒（探测功能回归）。
+    const entry = this.loadModels().find((item) => item.id === geminiCanonicalModelId(options.model))
+    if (entry === undefined) {
+      throw new LlmError(
+        `gemini: 模型 "${options.model}" 不在本 provider 目录中（仅支持 ${GEMINI_UPSTREAM_FLASH}）`,
+        'INVALID_REQUEST',
+        // 模型名写错是确定性失败：带上 404，网关才不会把它当 502 让客户端白重试。
+        { status: 404 },
+      )
+    }
+
+    let credential = await this.options.resolveCredential(options.model)
+    if (credential === undefined || isGeminiExpired(credential)) {
+      await this.options.refresh()
+      credential = await this.options.resolveCredential(options.model)
+    }
+    if (credential === undefined || credential.access_token === '') {
+      throw new LlmError('gemini: no usable credential; log in first', 'MISSING_CREDENTIAL')
+    }
+
+    const requested = options.reasoningEffort === undefined
+      ? undefined
+      : String(options.reasoningEffort)
+    // ⚠️ 档位合法性：与 `geminiReasoningInfo` 的产出**保持一致**
+    //（否则 UI 给了选项、请求却把它丢掉 —— 用户选了「高」而模型按「中」跑）。
+    const declared = entry === undefined ? undefined : geminiReasoningInfo(entry)
+    const effort = requested !== undefined
+      && declared?.efforts.some((item) => String(item.id) === requested) === true
+      ? requested
+      : undefined
+    const spec = geminiModelSpec(options.model, effort)
+
+    /**
+     * 会话自动命名（`purpose: 'session-title'`）的思考与预算决策（issue IKKVDH）。
+     *
+     * DSH 用 **64 token** 发标题请求且**不传 `reasoningEffort`**，而宿主会把
+     * 本模型的默认档注入进来。本家档位实测为 `['low','medium','high','tiered']`
+     * （**没有 `off`/`none`**），且 `gemini.ts` 的模块头明确写着
+     * 「关掉 `includeThoughts` 照样思考照样计费（假关）」⇒ 本家**关不掉**思考，
+     * 只能走抬预算兜底。
+     *
+     * ⚠️ 缺口尤其明显：`medium` 档的 `thinkingBudget` 实测为 **4000**，而标题
+     * 请求只给 **64** —— 思考预算本身是输出上限的 **62 倍**，必然被腰斩。
+     *
+     * ⚠️ `declaredEfforts` 与 `resolveModel` 的 `reasoningFor` **同源**
+     * （都取 `geminiReasoningInfo(entry)`），避免「UI 与请求」分叉。
+     */
+    const titlePlan = planSessionTitleThinking({
+      purpose: options.purpose,
+      requestedEffort: requested,
+      declaredEfforts: declared?.efforts.map((item) => String(item.id)) ?? [],
+      maxTokens: options.maxTokens,
+    })
+
+    const images = await this.collectInlineImages(options.messages, entry, options.model)
+
+    const sessionLane = this.options.sessionLane ?? GEMINI_SESSION_LANE_INFER
+    const sigStore = this.options.sigStore
+    const pool = this.options.accountPool
+
+    // ⚠️ 起点账号：**局部可变**。不能每次问回调 —— 回调返回的是池的当前
+    // 默认账号，换号后不跟着变，会让「换号」变成在两个账号间无限来回。
+    //
+    // ⚠️ `accountIdOverride` **优先于**反查（IKLTZ2 审计 P1-1）：探测路径
+    // 刻意不挂 `accountPool` ⇒ 反查那条路不存在 ⇒ 没有这个覆盖值时
+    // `currentAccountId` 恒为 `''` ⇒ 账号代理被完全绕过（且症状与
+    // 「账号已失效」同形，用户会去误删好号）。
+    let currentAccountId = this.options.accountIdOverride ?? ''
+    if (currentAccountId === '' && pool !== undefined && credential.access_token !== '') {
+      currentAccountId = await pool
+        .findAccountIdByCredential(this.product.id, credential.access_token)
+        .catch(() => '')
+    }
+    // Token 账本（第 2 期）：回报「本笔请求解析出的账号」（空串不回报）。
+    if (currentAccountId !== '') reportLedgerAccount(this.product.id, currentAccountId)
+    const tried = new Set<string>()
+    if (currentAccountId !== '') tried.add(currentAccountId)
+
+    // 项目号缓存：**跨账号共用一份 Map**（键是凭据身份），故放在循环外。
+    // 见 `gemini-project.ts` 的三级缓存。
+    const projectCache = this.options.projectCache ?? new Map<string, string>()
+
+    /**
+     * 取当前账号该走的 fetcher（Gitee issue IKLTZ2）。
+     *
+     * ⚠️ **在循环内按 `currentAccountId` 现取**：换号后出口必须跟着换 ——
+     * 循环外固化一份会让换号后**仍走旧账号的代理**（症状是「换了号还是超时」，
+     * 且无任何报错，属最难查的一类静默失效）。
+     *
+     * ⚠️ 优先级：`fetchImpl`（单测替身）> `fetchFor`（生产代理）> 全局 `fetch`。
+     */
+    const fetcherForCurrentAccount = (): typeof fetch => {
+      if (this.options.fetchImpl !== undefined) return this.options.fetchImpl
+      if (this.options.fetchFor !== undefined) return this.options.fetchFor(currentAccountId)
+      return fetch
+    }
+
+    let endpointIdx = 0
+    let endpointSwitched = false
+    let droppedSignatures = false
+    let refreshedOnce = false
+    let rotations = 0
+    let lastFailure: { status: number; text: string } | undefined
+    // 会话升代：按 **base sessionId**（不含代数）计数，只在本请求内有效。
+    // 见 `deriveGeminiSessionId` 的 `generation` 段与 `isGeminiSessionOverflow`。
+    //
+    // ⚠️ base 由信封层算出后**经回调传进来**，这里不自己重算 —— 重算就是
+    // 把派生逻辑复制成两份，两处一旦漂移，升代会换错 key（表现为升代无效）。
+    const sessionBumps = new Map<string, number>()
+    let lastBaseSessionId = ''
+    const sessionGeneration = (base: string): number => {
+      lastBaseSessionId = base
+      return sessionBumps.get(base) ?? 0
+    }
+
+    try {
+      while (true) {
+        // 解析本轮的 project（三级缓存：内存 → 凭据字段 → 现探）。
+        //
+        // ⚠️ 必须在**循环内**按当前 `credential` 解析：换账号后凭据变了，
+        // project 是**按账号**的，用上一个账号的会发错项目号。
+        //
+        // ⚠️ 探测**失败**（非「探测到空」）⇒ 不发推理。原版实测行为：
+        // 注入 500 后原版只在端点间重试 LCA + quota，**不发**
+        // `streamGenerateContent`（见 `gemini-project.ts` 的模块注释）。
+        let project = this.options.project
+        if (project === undefined) {
+          const probe = await resolveGeminiProject({
+            credential,
+            cache: projectCache,
+            // ⚠️ 项目探测与推理**共用同一个账号出口**（否则探测走代理、推理直连，
+            // 用户会看到「项目号探测失败」这种指向错误的原因）。故这里也走
+            // `fetcherForCurrentAccount()`，但仍尊重显式注入的 `projectFetcher`
+            // —— 测试里「只拦探测、不拦推理」是常见需求。
+            fetcher: this.options.projectFetcher ?? fetcherForCurrentAccount(),
+            // ⚠️ 透传调用方信号：否则探测自带的 30s 超时会把更短的调用方超时拖长。
+            ...options.signal === undefined ? {} : { signal: options.signal },
+          })
+          if (probe.error !== undefined) {
+            throw new LlmError(
+              `gemini: 项目号探测失败，未发推理（与原版一致）— ${probe.error}`,
+              'SERVER',
+            )
+          }
+          project = probe.project
+          // 现探到**非兜底**的真值才回写凭据（best-effort，失败不影响推理）。
+          // 兜底串不回写：把 `aicode-consumers` 钉进凭据会让该账号将来拿到真实
+          // project 时被这个陈旧值挡住（见 `persistGeminiProject`）。
+          if (probe.probed === true && this.options.persistProject !== undefined) {
+            await persistGeminiProject({
+              credential,
+              project,
+              write: this.options.persistProject,
+              ...this.options.logger === undefined ? {} : { logger: this.options.logger },
+            })
+          }
+        }
+
+        // ⚠️ 每轮重新构造信封：`requestId` 每请求随机（原版口径），
+        // 且去签重试时 `lookupSignature` 必须换成「返回 undefined」。
+        // `sessionId` 由 (project, 首条 user 文本, lane) 确定性派生 —— 同一
+        // 对话内稳定（保住上游 prompt cache 命中），不同对话隔离。
+        const envelope = translateGeminiRequest({
+          modelId: options.model,
+          spec,
+          messages: options.messages,
+          ...options.system === undefined ? {} : { system: options.system },
+          ...options.tools === undefined ? {} : { tools: options.tools },
+          ...options.temperature === undefined ? {} : { temperature: options.temperature },
+          // ⚠️ 标题请求走 `titlePlan.maxTokens`（关不掉思考时已抬到兜底下限）——
+          // 它最终成为 `generationConfig.maxOutputTokens`（见 `gemini-messages.ts`）。
+          ...titlePlan.maxTokens === undefined ? {} : { maxTokens: titlePlan.maxTokens },
+          ...this.options.sessionId === undefined ? {} : { sessionId: this.options.sessionId },
+          sessionLane,
+          sessionGeneration,
+          project,
+          requestId: newGeminiRequestId(),
+          ...images === undefined ? {} : { images },
+          ...droppedSignatures || sigStore === undefined
+            ? {}
+            : {
+              lookupSignature: (name: string, argsJson: string) => {
+                // 精确键（工具名 + 逐字参数）优先；miss 时回退到「该工具名最近一次
+                // 签名」。参数漂移（路径/时间戳变化）在长任务里是必然事件，没有
+                // 这层回退就只能走去签重试，而那条路会把整条思考链丢掉。
+                return sigStore.get(name, argsJson) ?? sigStore.latestForTool(name)
+              },
+            },
+        })
+
+        const url = `${GEMINI_ENDPOINTS[endpointIdx] ?? GEMINI_ENDPOINTS[0]}${GEMINI_STREAM_PATH}`
+        // ⚠️ 请求体上限必须**发送前**检查：超限时上游要么回一个措辞不稳定的 400，
+        // 要么直接断连，两种都比本地判定难查。归类走 `CONTEXT_WINDOW_EXCEEDED`
+        // 让 harness 去压缩上下文重试（而不是抛 `INVALID_REQUEST` 这条死路）。
+        const wire = marshalAlphabetical(envelope)
+        const wireBytes = Buffer.byteLength(wire, 'utf8')
+        if (wireBytes > GEMINI_MAX_REQUEST_BODY_BYTES) {
+          throw new LlmError(
+            `gemini: 请求体 ${wireBytes} 字节超过上限 ${GEMINI_MAX_REQUEST_BODY_BYTES} 字节`,
+            CONTEXT_WINDOW_EXCEEDED_CODE,
+          )
+        }
+        let response: Response
+        try {
+          // ⚠️ **走 `fetcherForCurrentAccount()`**（Gitee issue IKLTZ2）：此处原先是
+          // 写死的裸 `fetch`，没有任何 seam —— 那正是 issue 建议里没点到的缺口
+          // （照字面只接 `fetchImpl` / `projectFetcher` 会让**推理主路径**漏掉代理）。
+          response = await fetcherForCurrentAccount()(url, {
+            method: 'POST',
+            // ⚠️ 流式**刻意不带 `Accept`**（抓包一致，见 `geminiHeaders`）。
+            headers: geminiHeaders(credential),
+            body: wire,
+            signal: options.signal,
+          }).then(checkQueuedResponse)
+        } catch (error) {
+          // 网络层失败：**如实抛 TRANSPORT**，让 harness 的退避去处理
+          // （本适配器不自己重试网络错误 —— 那会与 harness 的退避叠加）。
+          if (error instanceof LlmError) throw error
+          // ⚠️ **点名代理**（IKLTZ2 修法 3 / 审计 P2-2）：「连不上 Google」与
+          // 「Google 报错」在 TRANSPORT 这一格同形，而前者唯一出路是配代理。
+          // ⚠️ `aborted` 必须**真读调用方的 signal**（原先恒传字面量 `false`）：
+          // harness 给的 deadline 到期时，报文是 `AbortError`、**不带**
+          // `UND_ERR_*` 码 ⇒ 恒 false 会让「调用方超时」这类墙外症状拿不到提示。
+          const hint = geminiNetworkHint(error, options.signal?.aborted === true)
+          throw new LlmError(
+            `gemini: 请求发送失败 — ${error instanceof Error ? error.message : String(error)}`
+            + (hint === undefined ? '' : `；${hint}`),
+            'TRANSPORT',
+            { cause: error },
+          )
+        }
+
+        if (response.ok) {
+          if (response.body === null) {
+            throw new LlmError('gemini: 响应缺少 body', 'EMPTY_RESPONSE')
+          }
+          const body = response.body
+          try {
+            yield* consumeGeminiSse({
+              body,
+              ...options.signal === undefined ? {} : { signal: options.signal },
+              idleTimeoutMs: GEMINI_IDLE_TIMEOUT_MS,
+              ...sigStore === undefined ? {} : { onSignature: (name, argsJson, sig) => sigStore.put(name, argsJson, sig) },
+            })
+          } finally {
+            // ⚠️ 纯缓存，写失败只记日志（`flush` 内部已兜底）。
+            await sigStore?.flush().catch(() => {})
+          }
+          return
+        }
+
+        const text = await response.text().catch(() => '')
+        lastFailure = { status: response.status, text }
+        const status = response.status
+
+        // 1. 签名被拒 → 去签重试一次（同账号同端点）。
+        if (isGeminiSignatureError(text) && !droppedSignatures) {
+          droppedSignatures = true
+          continue
+        }
+
+        // 2. 服务端会话累计超 1M → **升代**换全新 sessionId 重发。
+        //
+        // ⚠️ 必须排在配额/端点判定**之前**：这条 400 的处置与它们都不同 ——
+        // 削本地历史无效（累计在服务端、按 sessionId 计），换端点/换号也无效。
+        // 排在后面会被 `endpointFirst`（400 + quota 类文案）先吃掉，白换一次端点。
+        //
+        // 只在未显式钉 sessionId 时升代：显式钉值意味着调用方要复刻特定会话，
+        // 擅自换掉会让它失去意义。
+        if (status === 400 && isGeminiSessionOverflow(text) && this.options.sessionId === undefined) {
+          const bumped = sessionBumps.get(lastBaseSessionId) ?? 0
+          if (bumped < GEMINI_MAX_SESSION_BUMPS) {
+            sessionBumps.set(lastBaseSessionId, bumped + 1)
+            continue
+          }
+          // 升过代仍报同一条：不再兜圈子，如实透传（见 GEMINI_MAX_SESSION_BUMPS）。
+        }
+
+        const endpointFirst = status === 403
+          || status === 404
+          || (status === 400 && isGeminiSwitchableText(text))
+        const quotaLike = status === 429 || (status === 400 && isGeminiQuotaText(text))
+
+        // 2.5 上下文超限：**不换端点、不换账号**，直接归 `CONTEXT_WINDOW_EXCEEDED`
+        // 交给 harness 压缩。
+        //
+        // ⚠️ 必须挡在换端点/换号**之前**：请求体本身太大，换端点或换账号都
+        // 减小不了它，白跑两轮。而且超限措辞里若出现 `exceeded`（`exceeds` 的
+        // 变体），会被 `quotaLike` 吃掉去换号 —— 那是完全无效的动作。
+        // 归 `CONTEXT_WINDOW_EXCEEDED` 才能触发 `dsh-compaction-basic` 压缩重试。
+        if (status === 400 && isGeminiContextOverflow(text)) {
+          throw this.classifyFailure(status, text)
+        }
+
+        // 2. 先换端点（廉价兜底，一次）。
+        if ((endpointFirst || status === 429) && !endpointSwitched) {
+          endpointSwitched = true
+          endpointIdx = endpointIdx === 0 ? 1 : 0
+          continue
+        }
+
+        // 3. 401 → 先续期一次，再考虑换账号。
+        if (status === 401 && !refreshedOnce) {
+          refreshedOnce = true
+          await this.options.refresh(undefined, 'auth').catch(() => {})
+          const refreshed = await this.options.resolveCredential(options.model).catch(() => undefined)
+          if (refreshed !== undefined && refreshed.access_token !== '') {
+            credential = refreshed
+            continue
+          }
+        }
+
+        const rotatable = quotaLike || status === 401 || endpointFirst
+        if (rotatable && pool !== undefined) {
+          // 记限流/失效冷却：`getAvailableAccount` 会据此跳过该账号。
+          if (currentAccountId !== '') {
+            const cooldown = status === 401
+              ? GEMINI_AUTH_COOLDOWN_MS
+              : GEMINI_RATE_LIMIT_COOLDOWN_MS
+            await pool
+              .updateModelRateLimit(currentAccountId, options.model, Date.now() + cooldown)
+              .catch(() => {})
+          }
+          if (rotations < GEMINI_MAX_ROTATE - 1) {
+            const next = await pool.getAvailableAccount<GeminiCredential>(this.product.id, options.model, tried)
+            if (next !== null && next !== undefined && !tried.has(next.entry.id)) {
+              rotations++
+              tried.add(next.entry.id)
+              currentAccountId = next.entry.id
+              credential = next.credential
+              // 换号后重置端点与去签状态：新账号值得从默认端点、带签名再试一次。
+              endpointIdx = 0
+              endpointSwitched = false
+              droppedSignatures = false
+              refreshedOnce = false
+              continue
+            }
+          }
+          throw new LlmError(
+            `gemini: 模型 ${options.model} 的所有账号均不可用（限流或额度耗尽），请稍后再试`,
+            'QUOTA_EXCEEDED',
+            { status },
+          )
+        }
+
+        // 4. 切完（或没有池）仍失败 → 透传原错误，归类见下。
+        throw this.classifyFailure(status, text)
+      }
+    } finally {
+      // 中途异常也要落盘：签名缓存是「下次能命中」的唯一来源。
+      await sigStore?.flush().catch(() => {})
+      void lastFailure
+    }
+  }
+
+  /**
+   * HTTP 失败 → {@link LlmError}。
+   *
+   * ⚠️ 归类必须拆细（计划 §3.1）：把 quota 归成 `SERVER` 会让 harness
+   * 白重试 5 次（500/1000/2000/4000/8000 ≈ 15.5 秒），而 `QUOTA_EXCEEDED`
+   * **不在** `DEFAULT_RETRYABLE_CODES` 里，会立刻把控制权交还用户。
+   */
+  private classifyFailure(status: number, text: string): LlmError {
+    const detail = text === '' ? '' : ` — ${text.slice(0, 500)}`
+    const message = `gemini: HTTP ${status}${detail}`
+    // ⚠️ 上下文超限必须**最先**判：`isGeminiQuotaText` 的关键词表里有
+    // `exceeded` / `exceeded` 一类的措辞，超限报文很容易被它先吃掉归成
+    // `QUOTA_EXCEEDED` —— 而那个码**不触发 compaction**，长会话就此报废。
+    // 见 `isGeminiContextOverflow` 的注释（归错码的代价不对称）。
+    if (status === 400 && isGeminiContextOverflow(text)) {
+      return new LlmError(message, CONTEXT_WINDOW_EXCEEDED_CODE, { status })
+    }
+    if (status === 400 && isGeminiQuotaText(text)) {
+      return new LlmError(message, 'QUOTA_EXCEEDED', { status })
+    }
+    if (status === 429) return new LlmError(message, 'RATE_LIMIT', { status })
+    // ⚠️ 403/404 归 `SERVER`（计划 §3.1 明确），**不**用 `httpErrorCode` 的
+    // `AUTH`：这两个码在 Cloud Code 上更多是「入口/模型注册表不认」，
+    // 归成 AUTH 会把用户引向「去重新登录」这个无效动作。
+    if (status === 403 || status === 404) return new LlmError(message, 'SERVER', { status })
+    if (status === 401) return new LlmError(message, 'AUTH', { status })
+    return new LlmError(message, httpErrorCode(status), { status })
+  }
+}
+
+/** 在 `ctx.llm` 上注册 gemini provider 路由与适配器。 */
+export function registerGeminiLlm(
+  ctx: Context,
+  options: GeminiAdapterOptions,
+): GeminiAdapter {
+  const product = options.product ?? GEMINI
+  const adapter = withQueueAccountRotation(product.id, options, scoped => new GeminiAdapter(scoped))
+  registerAdapterIdempotent(ctx.llm, [product.id], adapter)
+  return adapter
+}
+
+/** 供接线侧构造档位 id（避免各处重复 `as ReasoningEffortId`）。 */
+export function geminiEffortId(id: string): ReasoningEffortId {
+  return ReasoningEffortId(id)
+}

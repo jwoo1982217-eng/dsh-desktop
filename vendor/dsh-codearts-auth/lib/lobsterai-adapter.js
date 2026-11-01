@@ -31,7 +31,7 @@ import { LOBSTERAI } from './lobsterai-product.js';
 import { projectRequestImage } from './image-budget.js';
 import { classifyLobsteraiError, classifyLobsteraiStreamError, recordsLobsteraiRateLimit, shouldRotateLobsteraiAccount, } from './lobsterai-errors.js';
 import { normalizeHarnessMessages } from './message-shape.js';
-import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled } from './sse.js';
+import { createBlankReasoningSuppressor, createDsmlMarkerNormalizer, createReasoningLoopDetector, fixDsmlMarkers, hasUsableToolName, classifyToolArguments, toolArgsInvalidBlocks, toolArgsInvalidIsSoleOutput, isProseTruncatedByStopString, isReasoningLoopGuardEnabled, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, reasoningLoopFailure, resolveEmptyResponseReason, resolveToolPairing, splitThinkTaggedContent, stripBareThinkCloseTagIfEnabled, stripCourseLeakFromHistoryContent, stripCourseLeakIfEnabled, toolArgsInvalidFailure } from './sse.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { reportLedgerAccount } from './token-ledger.js';
 import { planSessionTitleThinking } from './session-title.js';
@@ -1628,6 +1628,16 @@ export class LobsteraiAdapter extends LlmAdapter {
         // 另：丢弃了无名 tool-call 且没有留下任何可用调用时，同样报 max-tokens
         // 而非 stop（否则模型本意调工具、harness 却认为「正常答完了」）。
         const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text));
+        /**
+         * **模型把工具参数写坏**（结构闭合配平但 JSON 非法）—— 与「流被掐断」
+         * 分开处置（真实缺陷，Gitee IKQ8Y1；与 `buddy-adapter.ts` 同因同修）。
+         *
+         * 只收**名字可用**的块：无名块的参数没有意义（它本来就会被丢弃）。
+         */
+        const invalidArgBlocks = [...toolCalls.values()]
+            .filter(block => hasUsableToolName(block.name))
+            .map(block => ({ block, kind: classifyToolArguments(block.text) }))
+            .filter(entry => entry.kind === 'invalid');
         const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced);
         /**
          * 正文是否被**上游停止串**掐断（见 `isProseTruncatedByStopString`）。
@@ -1655,15 +1665,20 @@ export class LobsteraiAdapter extends LlmAdapter {
             ? { kind: 'error', failure: reasoningLoopFailure(loopGuard?.diagnostics, options.maxTokens, 'reasoning') }
             : loopDetected
                 ? { kind: 'max-tokens' }
-                : finishReason === 'length'
-                    || (finishReason === undefined && toolOrder.length > 0)
-                    || argsTruncated
-                    || proseCutByStopString
-                    || (droppedUnnamedCalls && toolOrder.length === 0)
-                    ? { kind: 'max-tokens' }
-                    : finishReason === 'tool_calls' || toolOrder.length > 0
-                        ? { kind: 'tool-calls' }
-                        : { kind: 'stop' };
+                // ⚠️ 工具参数写坏有自己的码（Gitee IKQ8Y1）：报 max-tokens 会让 UI 说
+                // 「已达到输出 token 上限」（固定 i18n，不读适配器 message）。
+                // 门禁：零正文 + 无另一个参数可解析的可用调用。
+                : toolArgsInvalidIsSoleOutput(invalidArgBlocks.length, emittedProse, toolCalls.values(), finishReason === 'length' || (finishReason === undefined && !streamEnded))
+                    ? { kind: 'error', failure: toolArgsInvalidFailure(toolArgsInvalidBlocks(invalidArgBlocks)) }
+                    : finishReason === 'length'
+                        || (finishReason === undefined && toolOrder.length > 0)
+                        || argsTruncated
+                        || proseCutByStopString
+                        || (droppedUnnamedCalls && toolOrder.length === 0)
+                        ? { kind: 'max-tokens' }
+                        : finishReason === 'tool_calls' || toolOrder.length > 0
+                            ? { kind: 'tool-calls' }
+                            : { kind: 'stop' };
         // 零内容块响应（例如本次只收到过那个被压制的空白 reasoning）否则会以
         // `stop` 收场 —— 那是 DSH `EMPTY_RESPONSE` 契约明令禁止的静默结束。
         // ⚠️ 传入的是**上面已算好的** `reason`（含 loopDetected / length /

@@ -1,3 +1,4 @@
+import { type SignedChannelOutlet } from './direct-fetch.js';
 import type { Context } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
 import { type ImageRequestTarget } from './image-budget.js';
@@ -116,5 +117,7 @@ export declare function makeReadImageRequest(ctx: Context): (attachment: unknown
  * 域守卫从硬编码清单 + {@link PROBE_EXEMPT} 派生锁死（漏挂会让它**点名**变红）。
  */
 export declare const probeById: Record<string, NonNullable<ProviderRuntime['probe']>>;
-export declare function apply(ctx: Context): void;
+export declare function apply(ctx: Context, config?: {
+    outlet?: SignedChannelOutlet;
+}): void;
 //# sourceMappingURL=index.d.ts.map

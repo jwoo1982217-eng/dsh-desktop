@@ -238,7 +238,24 @@ describe('图片字节桥接（声明支持就必须真能用）', () => {
 
   it('接线层传了 readImage', () => {
     const at = indexSrc.indexOf('new OpencodeLocalAdapter(')
-    const body = indexSrc.slice(at, indexSrc.indexOf('const opencodeAdapter =', at))
-    expect(body).toMatch(/readImage:\s*makeReadImage\(ctx\)/)
+    expect(at, 'index.ts 里找不到 registerOpencodeLlm 调用点').toBeGreaterThan(-1)
+    // ⚠️⚠️ **不得用「起点 + 固定字符数」当窗口**：本文件原先写的是
+    //    `indexSrc.slice(at, at + 3200)`，而 2026-10-23 那次迁移（在调用实参里
+    //    加了一段说明注释）让 `readImage:` 恰好被挤出窗口 ⇒ 判据**假红**。
+    //    更早的同款假绿记录见 `ikp8of-provider-closed.spec.ts` 的
+    //    `matchParenEnd` 注释（4000 字符窗口「静默失锚」）。
+    //    ⇒ 用**括号配对**求本次调用的真实结尾，与内容长度无关。
+    const open = indexSrc.indexOf('(', at)
+    let depth = 0
+    let end = -1
+    for (let i = open; i < indexSrc.length; i += 1) {
+      if (indexSrc[i] === '(') depth += 1
+      else if (indexSrc[i] === ')') {
+        depth -= 1
+        if (depth === 0) { end = i; break }
+      }
+    }
+    expect(end, 'registerOpencodeLlm 的调用块尾无法确定（判据会跨块误判）').toBeGreaterThan(open)
+    expect(indexSrc.slice(open, end)).toMatch(/readImage:\s*makeReadImage\(ctx\)/)
   })
 })

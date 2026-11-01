@@ -1,10 +1,20 @@
 /**
  * Jet Hub 管理页面客户端插件。
  *
- * 注册两处：
- * 1. `settings.section` —— Jet Hub 设置页面；
- * 2. `conversation.input.right`（list 槽，会话作用域）—— 模型选择器旁的
+ * 注册**五处**槽位：
+ * 1. `main`（keyed，key = `jet-hub`）—— 中央主面板的 Jet Hub 页渲染体。
+ *    **无条件**注册：它只提供渲染体，不是入口。
+ * 2. `sidebar.panellist`（list）—— 主导航里「Jet Hub」那一行。按「面板入口」
+ *    偏好增删（`'sidebar'` 时有、`'settings'` 时无）。
+ * 3. `settings.section` —— 设置弹层里的 Jet Hub 整页。**条件注册**：
+ *    `'settings'` 时有、`'sidebar'` 时整条注销。⚠️ 与第 2 条互斥。
+ * 4. `plugins.bundle.config`（keyed，key = 本包名）—— **插件详情页**上的自有
+ *    设置卡片（「面板入口」下拉）。⚠️ **始终常驻**，是改回来的唯一路径。
+ * 5. `conversation.input.right`（list 槽，会话作用域）—— 模型选择器旁的
  *    **用量徽标**（订阅优先 / 积分兜底，点击展开明细）。
+ *
+ * 第 1/2/3 条都由 `panel-entry.js` 的 `registerJetHubPanelEntries` 一次管完
+ * （它们读的是同一份「面板入口」偏好，拆开写必然出现两份判据）。
  *
  * ## ⚠⚠️ 刻意**不**注册 `settings.models.provider-card`（Gitee issue IKJLHQ）
  *
@@ -65,11 +75,31 @@ export const inject = ['slots', 'connection', 'modelDirectories', 'sessions']
 
 import { callManagementRpc, unwrapRpcResult } from '../management-rpc.mjs'
 import { installJetHubStyles } from './jet-hub-styles.js'
-import { JET_HUB_RPC_CHANNEL, JetHubPage, providerLabel } from './jet-hub.js'
+// ⚠️ `JetHubPage` 已不在本文件使用：两处入口（含 `settings.section`）都由
+//    `panel-entry.js` 注册。本文件只留它真正用到的两个符号。
+import { JET_HUB_RPC_CHANNEL, providerLabel } from './jet-hub.js'
 import { startCarrierContribution } from './zcode-carrier.js'
 import { UsageBadge } from './usage-badge.js'
 import {installZcodeComposerReset} from './zcode-reset-launcher.js'
 import { createChatGptCall } from './chatgpt-plan-rpc.js'
+import { registerJetHubPanelEntries } from './panel-entry.js'
+import { JetHubPanelEntryCard } from './settings-card.js'
+// ⚠️ 本文件注册的另外两处槽位也要包边界（2026-10-25 审计 A3-3）：
+// 2026-10-22 之前只有 `panel-entry.js` 那两处（main / settings.section）包了，
+// 而 `plugins.bundle.config` 与 `conversation.input.right` 注册的是**裸组件**
+// —— 任一处渲染期异常仍会整块消失（插件详情卡片 / 用量徽标）。
+import { withErrorBoundary } from './error-boundary.js'
+
+/**
+ * ⚠️ **模块级常量，不要在 `apply()` 或 `inject` 回调里新建**（2026-10-25 审计 A3-3）。
+ *
+ * `withErrorBoundary` 每次调用都产生一个**新的类**。若写在 `inject` 回调里，
+ * 宿主每次渲染都拿到新的组件类型 ⇒ React 把整棵子树卸载重挂 ⇒ 徽标/卡片内
+ * 所有本地状态（含「刚刚展开的详情」）每次都丢。`panel-entry.js` 那两处
+ * 已有同款注释与守卫（`panel-entry-wiring.spec.ts` 的 M21）。
+ */
+const JetHubPanelEntryCardGuarded = withErrorBoundary(JetHubPanelEntryCard, { label: '插件详情页卡片' })
+const UsageBadgeGuarded = withErrorBoundary(UsageBadge, { label: '用量徽标' })
 
 export function apply(ctx) {
   ctx.effect(() => installJetHubStyles(), 'jet-hub: install styles')
@@ -96,13 +126,59 @@ export function apply(ctx) {
    */
   ctx.effect(() => startCarrierContribution({ rpcCall }), 'jet-hub: zcode 内部载体贡献循环')
 
-  ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section',
-    id: 'jet-hub',
-    order: 50,
-    label: () => 'Jet Hub',
-    inject: () => ({ rpcCall, chatGptCall, isolatedLoginCall }),
-  }, JetHubPage))
+  /**
+   * Jet Hub 的**两处入口**（主导航那一行 + 设置弹层那一节）与中央主面板。
+   *
+   * 三者都由 `registerJetHubPanelEntries` 一次管完：`main` key **无条件**注册
+   * （它只提供渲染体，不是入口），两处入口则按「面板入口」偏好**互斥**增删 ——
+   * 同一组件、同一份 `rpcCall`，任一时刻只保留一个。细节见
+   * `plugin-src/client/panel-entry.js` 的文件头。
+   *
+   * ⚠️ 这里**没有**无条件的 `settings.section` 注册：它已移进上面那个注册器，
+   * 因为「仅侧栏」时要把它整条注销。
+   *
+   * ⚠️ 别把注册器包进 `ctx.effect`：槽注册自己就是可撤销的，`slots.inject`
+   * 的返回值交给调用方即可，多包一层只会在热替换时留下双份注册。
+   *
+   * ⚠️⚠️ **错误边界已移进 `panel-entry.js`**（2026-10-22 整页白屏事故补强，PR #10）：
+   * 那两处槽位现在注册的都是**包了 `withErrorBoundary` 的**组件。本文件不再持有
+   * 任何 `JetHubPage` 引用 —— 入口与渲染体的注册都归注册器了，在这里复制一份
+   * 就会变成「同一个组件两条注册路径」，正是该文件头警告的那种分叉。
+   */
+  registerJetHubPanelEntries(ctx, rpcCall, { chatGptCall, isolatedLoginCall })
+
+  /**
+   * **插件详情页**上的自有设置卡片（`plugins.bundle.config`）。
+   *
+   * ## 槽位契约
+   *
+   * keyed 槽，按 bundle 的**包名**分派，渲染在插件页的「描述」与「包含的组件」
+   * 之间（`ui-plugin-manager` 的 `PluginManagerPage.tsx`，节点带 `data-plugin-config`）。
+   *
+   * ## ⚠️ key 必须是包名
+   *
+   * `config-ledger.ts` 把这个槽的 key 投影成「已配置」标志，页面按
+   * `entryKey = pkg.name` 精确查表。**key 不匹配则整段不渲染且无任何报错** ——
+   * 本插件一旦改名，这里必须同步（`build.mjs` 的安装期闸门只管
+   * `__ModuleLoader__.load` 那处注册，不管这个槽）。
+   *
+   * ## ⚠️ 这张卡**始终常驻**，不随下拉取值注销
+   *
+   * 它是宿主页面，不是我们的入口；而且它是用户在「仅侧栏 / 仅设置页」之间
+   * 改回来的**唯一**路径。
+   *
+   * ## 与 `package.json` 的关系
+   *
+   * `@deepseek-ai/dsh-client-ui-primitives`（卡片的 `Menu` 来源）在宿主的
+   * `PLATFORM_MODULES` 里，`dsh.client.inject` 还必须声明
+   * `@deepseek-ai/dsh-client-ui-plugin-manager`，否则本 bundle 可能先于它到达、
+   * 下面的 `inject` 一直等服务 ⇒ 卡片永不出现（且不报错）。
+   */
+  ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+    name: 'plugins.bundle.config',
+    key: 'dsh-providers-hub',
+    inject: () => ({ rpcCall }),
+  }, JetHubPanelEntryCardGuarded))
 
   /**
    * 模型选择器旁的**用量徽标**（`conversation.input.right`）。
@@ -199,5 +275,5 @@ export function apply(ctx) {
       claimCredits: (provider, runTasks, budgetMs) =>
         rpcCall('credits.claimAll', { provider, runTasks, budgetMs }),
     }),
-  }, UsageBadge))
+  }, UsageBadgeGuarded))
 }

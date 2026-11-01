@@ -28,6 +28,7 @@ import {
   OFFICIAL_STABLE_SECTIONS,
   buildContextPrefixBlock,
   buildZcodeSystemBlocks,
+  withCallerSystem,
   formatLocalIsoDate,
   withContextPrefix,
 } from '../../src/zcode-identity.js'
@@ -41,6 +42,7 @@ import {
   buildZcodeHeaders,
   ZCODE_BILLING_BALANCE_URL,
   ZCODE_PLAN_MESSAGES_URL,
+  ZCODE_VERSION_GATED_MIN_APP_VERSION,
 } from '../../src/zcode-upstream.js'
 import {
   describeUpstreamError,
@@ -189,21 +191,75 @@ describe('ZCode 官方身份块（3012 准入）', () => {
   })
 
   it('system 块第一块必须是 cliPrefix（顺序是准入判据的一部分）', () => {
-    const blocks = buildZcodeSystemBlocks('caller prompt', { cwd: process.cwd() })
+    const blocks = buildZcodeSystemBlocks({ cwd: process.cwd() })
     expect(blocks[0]?.text).toBe(OFFICIAL_CLI_PREFIX)
     expect(blocks[1]?.text).toBe(OFFICIAL_STABLE_SECTIONS.join('\n\n'))
   })
 
-  it('调用方 system 追加在**最后**（身份块必须在开头）', () => {
-    const blocks = buildZcodeSystemBlocks('MY-CALLER-PROMPT', { cwd: process.cwd() })
-    expect(blocks[blocks.length - 1]?.text).toBe('MY-CALLER-PROMPT')
-    expect(blocks.length).toBe(4) // cliPrefix + stable + env + caller
+  /**
+   * ★★ **恒为 3 块** —— 2026-10-25 的实测修复。
+   *
+   * 此前本函数会把调用方的 system 追加成 `block[3]`。三轮对照实验
+   * （同一账号、同一 URL 与全部 18 个请求头，只改请求体）证明：
+   *
+   * | system 块数 | 结果 |
+   * |---|---|
+   * | 3 块 | **HTTP 200** |
+   * | 4 块（第 4 块 = 调用方 system，2 062 字符） | **HTTP 405 + 3012** |
+   * | 4 块（同上，25 428 字符） | **HTTP 405 + 3012** |
+   * | 3 块 + 调用方内容改放进 messages | **HTTP 200** |
+   *
+   * ⇒ 判据是**块数**，与第 4 块多长无关。故本函数不得再多产块。
+   */
+  it('★★ system 恒为 3 块（第 4 块会让上游回 405 + 3012）', () => {
+    expect(buildZcodeSystemBlocks({ cwd: '.' })).toHaveLength(3)
+    expect(buildZcodeSystemBlocks({ cwd: '.', model: 'glm-5.3' })).toHaveLength(3)
   })
 
-  it('空/缺失的调用方 system 不产生空块', () => {
-    expect(buildZcodeSystemBlocks(undefined, { cwd: '.' })).toHaveLength(3)
-    expect(buildZcodeSystemBlocks('', { cwd: '.' })).toHaveLength(3)
-    expect(buildZcodeSystemBlocks('   ', { cwd: '.' })).toHaveLength(3)
+  /**
+   * 调用方 system 的落点是**首轮 user 消息**，不是 `system` 数组。
+   * 见上面那条用例的对照实验表。
+   */
+  it('★★ 调用方 system 走 messages，不进 system 数组', () => {
+    const caller = 'MY-CALLER-PROMPT'
+    const blocks = buildZcodeSystemBlocks({ cwd: process.cwd() })
+    expect(blocks.some((b) => b.text === caller)).toBe(false)
+
+    const messages = withCallerSystem(
+      [{ role: 'user', content: 'hello' }],
+      caller,
+    )
+    const content = messages[0]?.content as Array<{ type: string; text: string }>
+    expect(Array.isArray(content)).toBe(true)
+    expect(content.at(-1)).toEqual({ type: 'text', text: caller })
+  })
+
+  it('withCallerSystem：空/缺失不产生空块，也不改消息形状', () => {
+    const base = [{ role: 'user', content: 'hello' }]
+    expect(withCallerSystem(base, undefined)).toEqual(base)
+    expect(withCallerSystem(base, '')).toEqual(base)
+    expect(withCallerSystem(base, '   ')).toEqual(base)
+  })
+
+  it('withCallerSystem：排在已有日期块**之后**（官方形态是日期块打头）', () => {
+    const withDate = withContextPrefix([{ role: 'user', content: 'hello' }])
+    const out = withCallerSystem(withDate, 'CALLER')
+    const content = out[0]?.content as Array<{ text?: string }>
+    expect(content[0]?.text?.startsWith('<system-reminder>')).toBe(true)
+    expect(content.at(-1)?.text).toBe('CALLER')
+  })
+
+  it('withCallerSystem：幂等（重复调用不重复插入）', () => {
+    const once = withCallerSystem([{ role: 'user', content: 'hello' }], 'CALLER')
+    const twice = withCallerSystem(once, 'CALLER')
+    const content = twice[0]?.content as Array<{ text?: string }>
+    expect(content.filter((c) => c.text === 'CALLER')).toHaveLength(1)
+  })
+
+  it('withCallerSystem：首条不是 user 时原样返回（不抛错）', () => {
+    const base = [{ role: 'assistant', content: 'hi' }]
+    expect(withCallerSystem(base, 'CALLER')).toEqual(base)
+    expect(withCallerSystem([], 'CALLER')).toEqual([])
   })
 
   /**
@@ -219,32 +275,30 @@ describe('ZCode 官方身份块（3012 准入）', () => {
    *
    * ⇒ 收敛成「只最后一块」，预算留给 `withToolCacheBreakpoint()`。
    *
+   * ⚠ 2026-10-25 起 system 恒为 3 块，故「最后一块」= environment 段。
+   * 调用方 system 已移出 system（见上面的用例），它不再落在断点内 ——
+   * 这是可接受的取舍：**争到 200 比争缓存重要**。
+   *
    * 反向验证：改回「每块都打」⇒ 本条变红；同时断点总数会到 4-5 个，
    * 撞上「最多 4 个」的上限。
    */
   it('★ 只在最后一块打 cache_control（断点预算留给 tools）', () => {
-    const blocks = buildZcodeSystemBlocks('x', { cwd: '.' })
+    const blocks = buildZcodeSystemBlocks({ cwd: '.' })
     expect(blocks[blocks.length - 1]?.cache_control?.type).toBe('ephemeral')
     // 前面的块不再单独打点 —— 前缀式语义下它们的覆盖面已被最后那个包含。
     expect(blocks.slice(0, -1).every((b) => b.cache_control === undefined)).toBe(true)
   })
 
   it('★ system + tools 的断点总数不得超过 Anthropic 的上限（4）', () => {
-    const blocks = buildZcodeSystemBlocks('x', { cwd: '.' })
+    const blocks = buildZcodeSystemBlocks({ cwd: '.' })
     const systemBreakpoints = blocks.filter((b) => b.cache_control?.type === 'ephemeral').length
     // tools 侧固定 1 个（`withToolCacheBreakpoint` 只给最后一个工具打点）。
     const toolBreakpoints = 1
     expect(systemBreakpoints + toolBreakpoints).toBeLessThanOrEqual(4)
   })
 
-  it('有调用方 system 时断点落在**它**身上（那段最大、最值得缓存）', () => {
-    const blocks = buildZcodeSystemBlocks('MY-CALLER-PROMPT', { cwd: '.' })
-    expect(blocks[blocks.length - 1]?.text).toBe('MY-CALLER-PROMPT')
-    expect(blocks[blocks.length - 1]?.cache_control?.type).toBe('ephemeral')
-  })
-
   it('environment 段含工作目录与平台（缺了会让模型用相对路径瞎猜）', () => {
-    const blocks = buildZcodeSystemBlocks(undefined, { cwd: 'D:\\proj', model: 'glm-5.3-flash' })
+    const blocks = buildZcodeSystemBlocks({ cwd: 'D:\\proj', model: 'glm-5.3-flash' })
     const env = blocks[2]?.text ?? ''
     expect(env).toContain('D:\\proj')
     expect(env).toContain('Primary working directory')
@@ -438,6 +492,34 @@ describe('ZCode 请求头与错误映射', () => {
   it('JSON 头默认带，可用 json:false 关掉', () => {
     expect(buildZcodeHeaders(credential)['Content-Type']).toBe('application/json')
     expect(buildZcodeHeaders(credential, { json: false })).not.toHaveProperty('Content-Type')
+  })
+
+  it('★ 版本号必须抬到门槛 —— 报旧版本会被上游判成异常客户端', () => {
+    // 依据（2026-10-25 真机取证）：官方客户端 2026-10-23 升级到 3.16.3 之后，
+    // 插件的**推理**请求开始稳定 `405 + request has been blocked due to
+    // unusual activity`（跨账号、跨会话；官方客户端同账号同网络正常）。
+    // 当时身份块已逐字对齐、官方 11 个头（`Suc` 全量）也全部对齐，
+    // **版本号是唯一与官方不一致的请求特征**。
+    //
+    // 反面：改回 `credential.app_version ?? ZCODE_APP_VERSION_FALLBACK`
+    // 会让本用例变红（凭据写的是 3.14.3）。
+    const headers = buildZcodeHeaders({ ...credential, app_version: '3.14.3' })
+    expect(headers['X-ZCode-App-Version']).toBe(ZCODE_VERSION_GATED_MIN_APP_VERSION)
+    expect(headers['User-Agent']).toBe(`ZCode/${ZCODE_VERSION_GATED_MIN_APP_VERSION}`)
+  })
+
+  it('凭据版本比门槛高时用凭据自己的（向前兼容，不把用户降级）', () => {
+    const headers = buildZcodeHeaders({ ...credential, app_version: '3.17.0' })
+    expect(headers['X-ZCode-App-Version']).toBe('3.17.0')
+    expect(headers['User-Agent']).toBe('ZCode/3.17.0')
+  })
+
+  it('显式 appVersion 覆盖优先于凭据与门槛两者', () => {
+    const headers = buildZcodeHeaders(
+      { ...credential, app_version: '3.17.0' },
+      { appVersion: '3.16.3' },
+    )
+    expect(headers['X-ZCode-App-Version']).toBe('3.16.3')
   })
 
   it('端点常量是实测值', () => {

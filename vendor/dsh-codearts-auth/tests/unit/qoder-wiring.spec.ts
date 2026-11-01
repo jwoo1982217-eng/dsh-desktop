@@ -109,7 +109,8 @@ describe('Qoder Jet Hub RPC 分支（src/jet-hub-rpc.ts）', () => {
     const code = codeOnly(rpc)
     // 重构后分支按注册表判定，实例来自 member.auth（见下面的注册表 describe）。
     expect(code).toContain('isQoderFamily(provider)')
-    expect(code).toContain('auth.startLogin({ refName })')
+    // ⚠️ `accountId` 必传（2026-10-21）：出口代理按账号取，不传则墙外环境登录恒失败。
+    expect(code).toContain('auth.startLogin({ refName, accountId: id })')
   })
 
   /**
@@ -203,7 +204,10 @@ describe('QoderCN 宿主侧接线（src/index.ts）', () => {
     // ⚠️ 2026-10-08（Task 11-A）：此处曾写作 `qoderCnAuth`（驼峰）—— **那是错的**，
     //    与 `src/qoder-auth.ts` 的类型声明同因（见那里的注释）。真实服务名由
     //    product id `qodercn`（全小写、不带连字符）逐字拼出。
-    expect(index).toContain('new QoderAuth(ctx, { product: QODER_CN })')
+    // ⚠️ 2026-10-21 改：构造选项现在还会带 `fetchFor`（按账号取出口代理，
+    //    国际版被 SNI 阻断）⇒ 用正则只守「product: QODER_CN 在选项里」，
+    //    不再把整串选项锁死 —— 再往后加选项不该让这条守卫红。
+    expect(index).toMatch(/new QoderAuth\(ctx, \{[^}]*product: QODER_CN\b/)
   })
 
   it('注册了 CN 的 LLM 路由并传入 product: QODER_CN', () => {
@@ -325,9 +329,20 @@ describe('Qoder 同族 RPC 注册表（src/jet-hub-rpc.ts）', () => {
     expect(loginStart).toBeGreaterThan(-1)
     const loginBlock = code.slice(loginStart, code.indexOf('} else if (provider === TRAE.id)'))
     expect(loginBlock.length).toBeGreaterThan(0)
-    expect(loginBlock).toContain('auth.startLogin({ refName })')
+    // ⚠️ 2026-10-21 改：登录现在**必须带 `accountId`**。`startQoderLoginFlow`
+    //    第一步就打设备码端点（`openapi.qoder.sh`，与国际版余额/推理同一台被
+    //    SNI 阻断的主机）⇒ 墙外环境下要拿到出口代理，而代理是**账号维度**的、
+    //    只能按 `accountId` 从池里取。不传 ⇒ 解析器只拿空 id 去查
+    //    `QODER_PENDING_PROXY_KEY`，用户没配 pending 就恒直连 ⇒ 国际版登录恒失败。
+    expect(loginBlock).toContain('auth.startLogin({ refName, accountId: id })')
     expect(loginBlock).toContain('provider: product.id')
-    expect(loginBlock).toContain('fetchQoderUserNickname(credential, product)')
+    // ⚠️ 顺序也是判据：占位条目（带代理）必须在 `startLogin` **之前**入库，
+    //    否则登录第一步仍拿不到出口（见 `src/jet-hub-rpc.ts` 那段长注释）。
+    expect(loginBlock.indexOf('await pool.addAccount({'))
+      .toBeLessThan(loginBlock.indexOf('auth.startLogin('))
+    // ⚠️ userinfo 也在这台被阻断的主机上 ⇒ 必须带**该账号**的 fetcher。
+    //    漏接的症状是「登录成功但昵称永远是 qoder-xxxx」（失败被静默吞掉）。
+    expect(loginBlock).toContain('fetchQoderUserNickname(credential, product, qoderFetchForAccount(id))')
     expect(loginBlock).not.toContain('fetchQoderUserNickname(credential, QODER)')
   })
 
@@ -360,7 +375,10 @@ describe('Qoder 同族 RPC 注册表（src/jet-hub-rpc.ts）', () => {
     const end = code.indexOf("case 'credits.balances'")
     const branch = code.slice(start, end)
     expect(branch).toContain('isQoderFamily(req.provider)')
-    expect(branch).toContain('claimQoderDailyCheckin(credential, product)')
+    // ⚠️ 2026-10-21 改：领取同样要出口代理（签到端点在同一个被墙域名上），
+    //    故第三参现在是按账号取的 fetcher ⇒ 判据只守「credential + product
+    //    两个实参按序传进去了」，不锁死第三参。
+    expect(branch).toContain('claimQoderDailyCheckin(credential, product,')
     expect(branch).toContain('precheckStatus: false')
     // ⚠️ 不能退化成只认国际版
     expect(branch).not.toContain('claimQoderDailyCheckin(credential, QODER)')
@@ -382,7 +400,15 @@ describe('Qoder 同族 RPC 注册表（src/jet-hub-rpc.ts）', () => {
     const end = code.indexOf("case '", start + "case 'credits.balances'".length)
     const branch = code.slice(start, end < 0 ? undefined : end)
     expect(branch).toContain('isQoderFamily(req.provider)')
-    expect(branch).toContain('fetchQoderCreditBalance(credential, product)')
+    // ⚠️ 2026-10-21 改：此处原断言 `fetchQoderCreditBalance(credential, product)`。
+    //    面板改用**带原因**的变体 `fetchQoderBalanceDetailed`（同一个文件里
+    //    并列存在，前者只回 `null`、后者回 `{ balance, error }`）。断言要守的
+    //    不变式是「余额查询按 `product` 分站」—— 即调用点必须**把 product 传进去**
+    //    （两站 `openApiBase` 不同，传错就查到别人的账），故判据换成新函数名。
+    //    ⚠️ 2026-10-21 再改：第三参现在是**按账号取出口代理**的 fetcher
+    //    （国际版被 SNI 阻断），故判据只守「product 被传进去、后面紧跟逗号」，
+    //    不锁死实参个数 —— 再往后加参数不该让这条守卫红。
+    expect(branch).toContain('fetchQoderBalanceDetailed(credential, product,')
     // ⚠️ 核心：qoder 的特例必须**先于**查表 —— 否则它会落到积分表里
     //    （表里没有 qoder 条目 ⇒ 变成 `unsupported provider`，用户看到
     //    「该渠道不支持积分」而它其实有余额接口）。行为由

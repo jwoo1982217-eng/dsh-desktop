@@ -39,11 +39,25 @@ import {
   calculateAutoclawSign,
   type AutoclawCredential,
 } from './autoclaw.js'
+import { refreshAutoclawToken } from './autoclaw-oauth.js'
 
 export const AUTOCLAW_WALLETS_PATH = '/agent-assetmgr/api/v2/wallets'
 export const AUTOCLAW_LEDGERS_PATH = '/agent-assetmgr/api/v1/ledgers_std'
 export const AUTOCLAW_DAILY_CLAIM_PATH = '/userapi/v1/user-info'
 export const AUTOCLAW_CREDITS_TIMEOUT_MS = 15_000
+
+/**
+ * 签到腿**刷新（登录事件）**的单次请求超时。
+ *
+ * ⚠️ 存在的理由（2026-10-27 审计 P2-2）：`refreshAutoclawToken` 会**依次试两个
+ * 端点**，若沿用它的 60s 默认值，光刷新就 120s，加 claim 自身 15s ⇒ **135s**
+ * （实测真实挂钟 120,015ms；修复前上界 15s，**9 倍**）。而这段等待发生在
+ * **签到之前** ⇒ 用户点「一键领取积分」后界面最长转两分多钟，每个账号各付一次。
+ *
+ * 取值 5s：刷新是**增量能力**（登录事件 → 活动奖励），不值得为它拖长一个
+ * 既有功能；两个端点各 5s ⇒ 最坏 10s，仍在可接受范围。
+ */
+export const AUTOCLAW_CLAIM_REFRESH_TIMEOUT_MS = 5_000
 export const AUTOCLAW_CREDIT_UNIT = '积分'
 
 /**
@@ -95,10 +109,90 @@ export interface AutoclawCreditsOptions {
   readonly product?: AutoclawProduct
   readonly fetcher?: typeof fetch
   readonly deviceId?: string
+  /**
+   * 日志出口（可选）；宿主 RPC 层经 `ProviderCallContext.warn` 传入。
+   *
+   * ⚠️ 存在的理由（2026-10-27 审计 P1-3）：刷新失败原先被裸 `catch` 完全吞掉
+   * ⇒ `outcome` 与**成功逐字相同**，而本文件**没有任何日志出口**（改前全仓零日志）。
+   * 本 PR 的立论正是「没登录就没奖励」这个**静默缺失** —— 它引入的新失败路径
+   * 不能同样是静默的。
+   */
+  readonly warn?: (message: string) => void
+  /**
+   * 把**轮换后的**凭据写回（可选）。
+   *
+   * ⚠️⚠️ 存在的理由（2026-10-27 审计 **P0**，两路独立审计各自命中）：
+   * `refreshAutoclawToken` 会解析并返回轮换后的 `refresh_token`
+   * （`autoclaw-oauth.ts` 的 `newRefresh`），而本文件的刷新腿原先**只取
+   * `access_token`、把 `refresh_token` 直接丢弃**。
+   *
+   * 若服务端按 OAuth 2.1 RTR **一次性轮换**，丢弃就等于**每天烧掉一次续期能力**：
+   * 旧 refresh_token 立即失效 ⇒ 此后每轮刷新的 401 被静默降级 ⇒ 活动奖励永不再发；
+   * 而自愈/续期读到盘上的死 token 会抛 `RefreshTokenExpiredError` ⇒
+   * `pool.updateAccount(…, { refreshable: false })` ⇒ 用户被要求重登，
+   * **而重登拿到的 token 又会在下一次签到时被同样烧掉**。
+   *
+   * ⚠️ 判断依据不是「我觉得会轮换」，而是**本仓库自己的记载**：
+   * `src/jet-hub-rpc.ts` 的续期注释明写「续期**会轮换** refresh_token，并发会让
+   * 后写的把先写的新 token 覆盖成已失效的旧 token」（并为此建了
+   * `balanceHealInFlight`）；同 provider 的 `autoclaw-auth.ts` 那条续期腿
+   * **会** `credentials.set` 落盘 —— **同一字段两套口径**。
+   * 而 `docs/agent-notes/providers-autoclaw.md` 把「续期端点是否仍接受这批
+   * refresh_token」登记为**未测**。
+   *
+   * ⇒ 修法：把整份刷新结果交给调用方落盘（与 `autoclaw-auth.ts` 同源）。
+   * **没有落盘出口时不得静默丢弃** —— 会 `warn` 出声（见实现）。
+   */
+  readonly persist?: (credential: AutoclawCredential) => Promise<void>
+  /** 刷新腿的单次请求超时；缺省 {@link AUTOCLAW_CLAIM_REFRESH_TIMEOUT_MS}。 */
+  readonly refreshTimeoutMs?: number
 }
 
-function cleanToken(token?: string): string {
-  if (!token) return ''
+/**
+ * **在飞刷新**：同一个 `refresh_token` 的并发调用共享一次请求。
+ *
+ * ⚠️⚠️ 存在的理由（2026-10-27 自查实测，由本文件的**落盘腿自己**引入的竞态）：
+ *
+ * 落盘腿让「刷新 → 写回新 `refresh_token`」成为一次**写操作**。而并发时两次
+ * 刷新各自拿到一个新 token，写回的先后顺序**由网络抖动决定**，不由签发顺序决定
+ * ⇒ **晚到的旧响应会把已作废的旧 token 覆盖回盘上**。
+ *
+ * 实测（有状态桩：同一 RT 宽限期内可用两次、只有最新签发有效；只给**第一次**响应
+ * 加 50ms 延迟）：
+ *
+ * ```
+ * [抖动] 签发次数 = 2 | 落盘序列 = ["RT-2","RT-1"]
+ * [抖动] 服务端最新有效 RT = RT-2
+ * [抖动] 最后落盘 = RT-1 | 它还有效吗 = false   ← 盘上留下作废 token
+ * ```
+ *
+ * ⇒ 后果与 P0 同源同量级：下一次续期读到死 token ⇒ `RefreshTokenExpiredError`
+ * ⇒ 账号被标 `refreshable:false`。而本仓库**早就为同一形态**给自愈腿建了
+ * `balanceHealInFlight` 去重表，并逐字写下「并发会让后写的把先写的新 token
+ * 覆盖成已失效的旧 token」—— 这条新腿此前不在任何闸门之内。
+ *
+ * 按 `refresh_token` 作键（而不是设备号或账号）：它**就是**被轮换的那个东西，
+ * 同一个 RT 的并发刷新在语义上就是同一件事。任务落定即摘除，不会累积。
+ */
+const inflightRefreshes = new Map<string, Promise<AutoclawCredential | undefined>>()
+
+/**
+ * 归一化 token 字符串。
+ *
+ * ⚠️⚠️ **`typeof` 闸门不可省**（2026-10-27 审计 P1-2，本 PR 引入的**回归**）：
+ * 原写法只挡 falsy（`if (!token) return ''`），而 `refresh_token` 的实际来源是
+ * **用户可编辑的备份文件** —— `src/backup.ts` 只判外层 `typeof value === 'string'`，
+ * 内层字段可以是数字 / 对象 / 布尔。传进来就会走到 `token.replace(...)` 抛
+ * `TypeError: token.replace is not a function`，而按契约 `claimAutoclawDailyQuota`
+ * **不抛异常**，且该调用写在 claim 的 `try` **之外** ⇒ 异常直接逃到
+ * `collectClaimResults` 的裸 `JSON.parse` 出口，用户看到一句毫无出路的内部错误。
+ * 修复前这条路径**根本不读** `refresh_token` ⇒ 那种凭据本来能正常签到。
+ *
+ * ⚠️ 同仓的 `cleanBearerToken`（`src/autoclaw.ts`）**已有** `typeof` 闸门 ——
+ * 这里补齐，不再让同一语义有两套口径。
+ */
+function cleanToken(token?: unknown): string {
+  if (typeof token !== 'string' || token.length === 0) return ''
   return token.replace(/^Bearer\s+/i, '').trim()
 }
 
@@ -465,6 +559,25 @@ export async function fetchAutoclawBalanceDetailed(
     //   不守恒时回退钱包包是对的（宁可没有临期档，也不给错数）——
     //   但**不得**据此声称本渠道已支持按批次分档。
     let packages = walletPackages
+    /**
+     * ⚠️⚠️ **`degraded` 标记**（2026-10-21 二轮审计发现，P1）。
+     *
+     * 本家余额有**两条数据源**：钱包端点（必成，给总额）+ 流水端点（给逐批次到期）。
+     * 流水失败 / 守恒不成立时**静默回退钱包包** —— 总额对，但**逐包到期全部丢失**
+     * （钱包包没有 `deductionEndTime`）。
+     *
+     * 而 `splitBuddyCreditsByExpiry` 把「没有到期时刻」判成**永久桶**（对「真·永久」
+     * 是对的）⇒ 一次流水抖动会让「有临期积分的账号」被判成**只剩永久积分** ⇒
+     * 锁定状态下报「积分都已用尽」—— **那句会把用户推向不可撤回的解锁**。
+     *
+     * 实测（同一账号、同一 5000 余额，只改流水端点是否 500）：
+     * ```
+     * 流水正常 → split={expiring:5000} tier=expiring（可用）✅
+     * 流水 500 → split={permanent:5000} tier=none（「积分都已用尽」）❌
+     * ```
+     * ⇒ 回退时必须打出标记，让选号层把「读不到明细」归到 `unknown` 而不是 `exhausted`。
+     */
+    let degraded = false
     if (total > 0) {
       try {
         const entries = await fetchAutoclawLedgerEntries(credential, options)
@@ -481,9 +594,15 @@ export async function fetchAutoclawBalanceDetailed(
         const tolerance = Math.max(100, Math.floor(total * 0.01))
         if (batches.length > 0 && Math.abs(batchSum - total) <= tolerance) {
           packages = batches
+        } else {
+          // ⚠️ 守恒不成立 / 一个批次都没有 ⇒ 回退钱包包 ⇒ **明细不可用**。
+          degraded = true
         }
       } catch {
         // 流水不可达：静默回退钱包包（总额与长期数仍正确，只是没有临期档）。
+        // ⚠️ **但必须打 `degraded` 标记**：否则「读不到明细」会被下游当成
+        //    「用户只剩永久积分」，进而在锁定时报「积分都已用尽」（见上）。
+        degraded = true
       }
     }
 
@@ -505,6 +624,9 @@ export async function fetchAutoclawBalanceDetailed(
       total,
       packages,
       expiredTotal: 0,
+      // ⚠️ 只有**真的降级**时才带上该键（`undefined` 不写 ⇒ 与既有响应逐字节相同，
+      //    避免让所有消费者都去处理一个恒为 `false` 的字段）。
+      ...(degraded ? { degraded: true } : {}),
     }
     return { balance }
   } catch (error) {
@@ -604,8 +726,153 @@ export async function fetchAutoclawCreditBalance(
 }
 
 /**
+ * 领取前先做一次 **token 刷新**（= 服务端眼里的「登录」）。
+ *
+ * ## ⚠️⚠️ 为什么这是必需的（2026-10-27 真机取证，用户报障「1 亿 Tokens 领不到」）
+ *
+ * AutoClaw 的活动奖励**不是**由 `user-info` 本身发放的，而是由「**登录事件**」触发：
+ * 官方客户端的实现（`AutoClaw2/resources/app/dist/main.cjs` → `claimDailyCreditsOnSignIn`）是
+ * **监听登录状态**，一旦进入 `authenticated` 就调一次 `user-info`：
+ *
+ * ```js
+ * function claimDailyCreditsOnSignIn(account, dailyCredits) {
+ *   let previous = account.snapshot().status
+ *   account.subscribe((snapshot) => {
+ *     const entered = snapshot.status === 'authenticated' && previous !== 'authenticated'
+ *     previous = snapshot.status
+ *     if (entered) void dailyCredits.claim()   // → POST /userapi/v1/user-info
+ *   })
+ * }
+ * ```
+ *
+ * 也就是说：**服务端把「签发 token」当作「登录」**，之后那次 `user-info` 才发放
+ * `autoclaw_user_active_reward_*` 这类登录奖励。
+ *
+ * 而本插件此前**只用存量 access_token 调 `user-info`** —— 在服务端看来这不是一次
+ * 登录，于是活动奖励永远不发。真机对照（同一账号、同一端点，仅差一次 refresh）：
+ *
+ * | 调用 | 结果 |
+ * |---|---|
+ * | 存量 token → `user-info` | `code: 0`，只有每日签到，无活动奖励 |
+ * | `POST /userapi/v1/refresh` → `user-info` | **立刻 +10000 积分**（`autoclaw_user_active_reward_202609`） |
+ *
+ * ## 为什么**不落盘**新 token
+ *
+ * 实测 refresh **不轮换 `refresh_token`**，且**旧 `access_token` 刷新后仍有效**
+ * （刷新后用它查余额仍 `code: 0`）⇒ 本次领完即可丢弃新 token，
+ * 不必把「新凭据」从 `claim` 冒泡到调用方（那要改 `ClaimOutcome` 契约与
+ * `provider-credits` 的 `claim` 签名，代价远大于收益）。
+ * 下次签到会再刷新一次，得到新的登录事件 —— 这正是我们要的语义。
+ *
+ * @returns 刷新后的**整份凭据**；**拿不到就返回 `undefined`**（调用方降级用原 token）
+ */
+async function refreshCredentialForLoginEvent(
+  credential: AutoclawCredential,
+  product: AutoclawProduct,
+  deviceId: string,
+  fetcher: typeof fetch,
+  options?: {
+    warn?: (message: string) => void
+    persist?: (credential: AutoclawCredential) => Promise<void>
+    timeoutMs?: number
+  },
+): Promise<AutoclawCredential | undefined> {
+  const refreshToken = cleanToken(credential.refresh_token)
+  // 没有 refresh_token（老凭据 / 手工导入）⇒ 静默跳过，不阻塞签到。
+  if (!refreshToken) return undefined
+  /**
+   * ⚠️⚠️ **单飞**：同一个 `refresh_token` 的并发调用共享一次刷新（也共享那一次落盘）。
+   *
+   * 见 {@link inflightRefreshes} 的实测：不做单飞时，**晚到的旧响应会把已作废的
+   * 旧 token 覆盖回盘上**（落盘序列 `["RT-2","RT-1"]`，而服务端只认 `RT-2`）
+   * ⇒ 与 P0 同量级的账号失效。本仓库为自愈腿早已建了同形的 `balanceHealInFlight`。
+   */
+  const shared = inflightRefreshes.get(refreshToken)
+  if (shared !== undefined) return await shared
+  const task = refreshAndPersist(refreshToken, product, deviceId, fetcher, options)
+  inflightRefreshes.set(refreshToken, task)
+  try {
+    return await task
+  } finally {
+    // 落定即摘除（无论成败）——否则 Map 会随 token 逐日累积。
+    if (inflightRefreshes.get(refreshToken) === task) inflightRefreshes.delete(refreshToken)
+  }
+}
+
+/**
+ * 真正做「刷新 + 轮换落盘」的那一段（由 {@link refreshCredentialForLoginEvent} 单飞包裹）。
+ */
+async function refreshAndPersist(
+  refreshToken: string,
+  product: AutoclawProduct,
+  deviceId: string,
+  fetcher: typeof fetch,
+  options?: {
+    warn?: (message: string) => void
+    persist?: (credential: AutoclawCredential) => Promise<void>
+    timeoutMs?: number
+  },
+): Promise<AutoclawCredential | undefined> {
+  let fresh: AutoclawCredential
+  try {
+    fresh = await refreshAutoclawToken(refreshToken, {
+      product,
+      fetchImpl: fetcher,
+      deviceId,
+      ...options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs },
+    })
+  } catch (error) {
+    /**
+     * ⚠️ **刷新失败绝不阻断签到**（降级用原 token 继续）：
+     * 签到本身仍有价值（每日额度），而活动奖励是增量。
+     * 把「登录事件」失败升级成签到失败，等于用一个新功能打坏一个老功能。
+     *
+     * ⚠️ 但**必须留痕**（2026-10-27 审计 P1-3）：原先这里是裸 `catch { return
+     * undefined }` ⇒ 刷新失败与成功的 `outcome` **逐字相同**、全仓零日志 ⇒
+     * 用户永远不知道「活动奖励其实没发」，而那正是本次改动存在的**唯一理由**。
+     */
+    const detail = error instanceof Error ? error.message : String(error)
+    options?.warn?.(`[autoclaw] 登录事件刷新失败（照常签到，活动奖励可能不发）：${detail}`)
+    return undefined
+  }
+  /**
+   * ⚠️⚠️ **轮换出的 `refresh_token` 必须落盘**（2026-10-27 审计 P0，见
+   * `AutoclawCreditsOptions.persist` 的长注释）。
+   *
+   * 判据是「**变了才写**」：多数刷新不轮换（服务端原样回旧值），那种情况写回
+   * 是多余的 I/O 且会覆盖并发写者；只有真的换了才值得落盘。
+   */
+  const rotated = cleanToken(fresh.refresh_token)
+  if (rotated !== '' && rotated !== refreshToken) {
+    if (options?.persist !== undefined) {
+      try {
+        await options.persist(fresh)
+      } catch (error) {
+        // 落盘失败**不得**打断签到（同「刷新失败不阻断」的取舍）；
+        // 但必须出声 —— 这一格意味着下次刷新会用已作废的旧 token。
+        const detail = error instanceof Error ? error.message : String(error)
+        options?.warn?.(
+          `[autoclaw] 服务端轮换了 refresh_token 但落盘失败（下次签到可能续期失败）：${detail}`,
+        )
+      }
+    } else {
+      // 没有落盘出口 ⇒ **绝不静默**：这一格会让账号逐步失去续期能力。
+      options?.warn?.(
+        '[autoclaw] 服务端轮换了 refresh_token，但本次签到路径没有落盘出口'
+        + '（旧 token 可能已作废，续期能力会逐步失效）',
+      )
+    }
+  }
+  return fresh
+}
+
+/**
  * 执行 AutoClaw 每日签到领额度。
  * 遵循 POST /userapi/v1/user-info 规范，不抛出异常。
+ *
+ * ⚠️ 调用前会先刷新一次 token —— 那是服务端认定的「登录」事件，
+ *    活动奖励（如「1 亿 Tokens」）只在那之后的那次签到请求上发放。
+ *    详见 {@link refreshCredentialForLoginEvent}。
  */
 export async function claimAutoclawDailyQuota(
   credential: AutoclawCredential,
@@ -630,13 +897,27 @@ export async function claimAutoclawDailyQuota(
     ?? credential.device_id
     ?? randomUUID()
 
+  /**
+   * ★ **先刷新（= 一次登录）再签到** —— 活动奖励依赖这个顺序。
+   *
+   * ⚠️ 顺序不可颠倒：服务端在「签发 token」时记下登录，由**紧随其后**的
+   *    `user-info` 触发发放。反过来（先 user-info 再 refresh）只会白发一次
+   *    签到请求，活动奖励落空。
+   */
+  const refreshed = await refreshCredentialForLoginEvent(credential, product, deviceId, fetcher, {
+    ...options?.warn === undefined ? {} : { warn: options.warn },
+    ...options?.persist === undefined ? {} : { persist: options.persist },
+    timeoutMs: options?.refreshTimeoutMs ?? AUTOCLAW_CLAIM_REFRESH_TIMEOUT_MS,
+  })
+  const claimToken = cleanToken(refreshed?.access_token) || token
+
   const url = `${product.apiBase}${AUTOCLAW_DAILY_CLAIM_PATH}`
   const body = {
     source_id: AUTOCLAW_SOURCE_ID,
     device_id: deviceId,
   }
   try {
-    const headers = buildAutoclawCreditsHeaders(product, token)
+    const headers = buildAutoclawCreditsHeaders(product, claimToken)
     const resp = await fetcher(url, {
       method: 'POST',
       headers,
@@ -706,3 +987,4 @@ export async function claimAutoclawDailyQuota(
     }
   }
 }
+

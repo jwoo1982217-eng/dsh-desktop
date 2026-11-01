@@ -1,5 +1,16 @@
 export declare const DEFAULT_GATEWAY_HOST = "127.0.0.1";
 export declare const DEFAULT_GATEWAY_PORT = 8326;
+/**
+ * 「允许局域网访问」设置页开关（2026-10-20）打开时的监听地址：绑全部网卡。
+ *
+ * ⚠️⚠️ 与 {@link isWildcardHost} 的关系必须说清：那个 fail-closed 闸门拦的是
+ * **env 字符串解析链上的意外通配**（不可见字符、`U+3002` 表意句号、全角数字等
+ * 三轮审计实测的绕过形态）——它防的是「用户写了个看起来无害的串，内核却绑了
+ * 全网卡」。而这里的 `'0.0.0.0'` 是**程序内字面量**：没有解析环节、没有绕过面，
+ * 是用户在设置页里**显式**做出的选择（开关默认关闭，打开时 UI 会同步给出
+ * 暴露面警告）。两者正交，谁也不取代谁。
+ */
+export declare const WILDCARD_GATEWAY_HOST = "0.0.0.0";
 export interface OpenAiGatewayConfig {
     host: string;
     port: number;
@@ -87,6 +98,27 @@ export declare function isWildcardHost(host: string): boolean;
  * 处理（宁可多提示，不漏暴露风险）。
  */
 export declare function isLoopbackHost(host: string): boolean;
+/**
+ * env 是否**显式**给了监听 host。
+ *
+ * 「允许局域网访问」设置页开关据此判断自己会不会被覆盖：env 是运维口径，
+ * 优先级高于 UI 开关（与 `DSH_OPENAI_GATEWAY_ENABLED` 优先于设置页开关同一
+ * 取向，见 `runtime.ts` 的注释）。开关打开但 env 给了 host 时，UI 必须明说
+ * 「这个开关此刻不生效」，否则又是一个「打开了却没反应」。
+ */
+export declare function isGatewayHostFromEnv(env?: NodeJS.ProcessEnv): boolean;
+/** {@link resolveGatewayConfig} 的可选项。 */
+export interface ResolveGatewayConfigOptions {
+    /**
+     * 「允许局域网访问」设置页开关（默认 `false` = 只绑 127.0.0.1，老用户行为不变）。
+     *
+     * ⚠️ `true` 时绑定 {@link WILDCARD_GATEWAY_HOST}——这是**程序内字面量**，
+     * 不经过 {@link resolveHost} 的字符串解析链，因此 IKL7UN 的 fail-closed 闸门
+     * （防意外通配）不适用也不需要适用。⚠️ env 显式给了 `DSH_OPENAI_GATEWAY_HOST`
+     * 时本开关**不生效**（env 优先，见 {@link isGatewayHostFromEnv}）。
+     */
+    allowLan?: boolean;
+}
 /** 解析本机网关配置，地址/端口错误时显式失败，避免静默换端口或静默监听全网卡。 */
-export declare function resolveGatewayConfig(env?: NodeJS.ProcessEnv): OpenAiGatewayConfig;
+export declare function resolveGatewayConfig(env?: NodeJS.ProcessEnv, options?: ResolveGatewayConfigOptions): OpenAiGatewayConfig;
 //# sourceMappingURL=config.d.ts.map

@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "verifiedDate": "2026-10-25",
+  "timezone": "Asia/Shanghai",
+  "platform": "macOS",
+  "dshCoreVersion": "0.2.1-alpha.4",
+  "proxy": {
+    "configuration": "DSH_HOME/.env",
+    "endpoint": "http://127.0.0.1:1082",
+    "mode": "0600",
+    "loadedSource": "user-env",
+    "localConnectionsBypassProxy": true
+  },
+  "liveAcceptance": {
+    "normalRestartWhenNoRunningTurns": true,
+    "allExistingSessionsPreserved": true,
+    "existingConfigurationFilesPreserved": true,
+    "readme": {
+      "url": "https://raw.githubusercontent.com/LaurieWired/GhidraMCP/main/README.md",
+      "status": 200,
+      "utf8Bytes": 5151,
+      "characters": 5149,
+      "truncated": false
+    },
+    "githubPageStatus": 200,
+    "githubHtmlCharacterLimit": 100000,
+    "desktopConnectionRecovered": true
+  },
+  "boundaries": {
+    "localUiUnauthenticatedStatus": 401,
+    "webToolLocalLiteralError": "WEB_BLOCKED_URL",
+    "badProxyFailed": true,
+    "fetchRecoveredAfterProxyRestoration": true
+  },
+  "defenderHelper": {
+    "observedStopCaller": "Microsoft Defender Helper",
+    "observedStopTimesLocal": ["10:13", "12:31"],
+    "disabledService": "com.microsoft.wdav.tray",
+    "helperStoppedAndNotRespawnedDuringShortObservation": true,
+    "antimalwareMainProcessesPreserved": true,
+    "sameShadowrocketConnectionPreserved": true,
+    "trayAndHelperNotificationsUnavailable": true
+  },
+  "limits": [
+    "This is evidence from one Mac, not a guarantee for every machine or SDK version.",
+    "macOS reboot persistence and long-term stability were not exercised.",
+    "The internal Defender trigger and AutoClaw error classification were not fixed.",
+    "Antimalware process preservation does not establish effective protection."
+  ]
+}

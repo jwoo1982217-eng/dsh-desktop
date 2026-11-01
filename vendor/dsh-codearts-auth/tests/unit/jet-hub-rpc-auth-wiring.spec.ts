@@ -89,6 +89,15 @@ const AUTH_SERVICE: Readonly<Record<string, string>> = {
   // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。服务名同理由派生 ⇒ `modelscopeAuth`。
   //    该名字由 `provider-runtime-wiring.spec.ts` 的真跑 `apply()` 探针独立验证过。
   modelscope: 'modelscopeAuth',
+  // ⚠️ **本 fork 独有**（qiniu，2026-10-29）。服务名同理由派生 ⇒ `qiniuAuth`。
+  qiniu: 'qiniuAuth',
+  // ⚠️ Codely（Unity，2026-10-22 A6）：服务名 `codelyAuth`（全小写，与 provider id 同形）。
+  //    ⚠️ `CodelyAuth` 已从裸类改为 `extends Service`（否则 ctx 上永远没有
+  //    `codelyAuth`，本表取不到实例）—— 见 `codely-auth-service.ts` 的类注释。
+  codely: 'codelyAuth',
+  // ⚠️ 超级麦吉（Magicrew，2026-10-29）：服务名由 `${product.id}Auth` 派生
+  //    ⇒ `magicrewAuth`（`MagicrewAuth` 是 `extends Service`，构造时自 provide）。
+  magicrew: 'magicrewAuth',
 }
 
 /**
@@ -251,7 +260,25 @@ async function setup(accounts: ProviderAccountEntry[]): Promise<{
    */
   const settleBackground = async (): Promise<void> => {
     // 让出若干拍：首轮链有多个 `await`（读池 → 逐账号续期 → 兜底）。
-    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setTimeout(resolve, 0))
+    // ⚠️⚠️ 2026-10-22（A6）：**固定拍数已不可靠** —— 改成「轮询到静默」。
+    //
+    // 原写法是 5 拍（后来加到 12），它隐含一个假设：「背景链的 await 次数固定」。
+    // 而 codely 加入后它不再成立：每家的 `refreshAll` 都会“读池 → **逐账号 `await`** → 写回”，
+    // 拍数与**账号数×家数** 成正比 ⇒ 任何固定值都是“恰好够”的幸存，
+    // 下一次加 provider / 加账号就会重新渗到测量区，表现为**假错位**
+    // （实测先报 minimax 、拍数加大后又报 buddy）。
+    //
+    // ⇒ 判据改成：**轮询直到连续 N 拍没有新调用**才算背景链跑完，
+    //   然后清零记录。它不依赖「链有多长」，只依赖「它有没有停」。
+    //   ⚠️ 不得改成「只断言列表包含**自己**」—— 那会连真正的错位一起放过。
+    let quiet = 0
+    let lastLen = -1
+    // 上限 200 拍（防死循环；成本是微任务循环，实测远小于此）。
+    for (let i = 0; i < 2000 && quiet < 20; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      if (called.length === lastLen) quiet += 1
+      else { quiet = 0; lastLen = called.length }
+    }
     called.length = 0
   }
   await settleBackground()
@@ -279,7 +306,7 @@ function entry(provider: string, credentialRef: string): ProviderAccountEntry {
 }
 
 describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.refresh）', () => {
-  it('registry 里占 auth 键位的恰好 17 家（opencode / aggregate 豁免）', () => {
+  it('registry 里占 auth 键位的恰好 18 家（opencode / aggregate 豁免）', () => {
     // ★ **方向性**：以 `PROVIDER_REGISTRY` 为权威，`AUTH_SERVICE` 是被测对象。
     //   「registry 里有、表里没有」⇒ 红，且 `toEqual` 的差异**点名那个 id**
     //   （而不是让下面的逐 provider 用例静默少跑一家）。
@@ -295,7 +322,9 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：17 → 18；
     //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20。
-    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(20)
+    // ⚠️ 2026-10-22（A6）：codely 已接入 auth（`CodelyAuth` 改为 Service + 接进 auths）：20 → 21。
+    // ⚠️ 2026-10-29 加 qiniu（七牛云）+ magicrew：21 → 22 → 23 个 auth 键。
+    expect(EXPECTED_AUTH_PROVIDER_IDS).toHaveLength(23)
     // 另一方向（原断言的**全部**证明力都在这条上，单独留着免得它随上面那条一起消失）：
     // 表里的每个键都必须是 registry 里真实存在的 provider id（防拼写错误造成的僵尸项）。
     for (const id of Object.keys(AUTH_SERVICE)) {
@@ -326,6 +355,14 @@ describe('★ registerJetHubRpc 的命名对象接线（真跑 apply + account.r
     // 「qodercn 的账号去刷了 qoder 的凭据」这类串接。
     const accounts = EXPECTED_AUTH_PROVIDER_IDS.map((id) => entry(id, `${id.toUpperCase()}_ACCOUNT_WIRE`))
     const { call, calledServices } = await setup(accounts)
+
+    // ⚠️ **测量前必须排空背景链**：`apply(ctx)` 的**首轮**续期是 fire-and-forget
+    //    （`src/index.ts` 里刻意不 await），它的调用会落在 `setup()` 装好 spy
+    //    **之后** ⇒ 混进下面「只有自己那个实例被调用」的测量 ⇒ 假红。
+    //    ⚠️ 这条是 2026-10-29 加 magicrew 时暴露的：每多一个 provider，背景链就多
+    //    一条，原来靠运气对齐的时序就崩了。**不要**改成放宽断言（那会连同真正的
+    //    串接一起放过）。
+    await new Promise((resolve) => setTimeout(resolve, 100))
 
     for (const id of EXPECTED_AUTH_PROVIDER_IDS) {
       const expected = AUTH_SERVICE[id]!

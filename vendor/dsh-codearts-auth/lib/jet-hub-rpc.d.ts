@@ -11,7 +11,10 @@
  *           model.list / model.setDisabled /
  *           captcha.demand / captcha.carrierUrl / captcha.contribute（内部载体，
  *           载体页见 src/zcode-carrier-page.ts 与 src/captcha-carrier-server.ts）/
- *           backup.export / backup.import / backup.status
+ *           backup.export / backup.import / backup.status /
+ *           nativeSearch.getEnabled / nativeSearch.setEnabled /
+ *           sessionBalance.getEnabled / sessionBalance.setEnabled /
+ *           panelEntry.get / panelEntry.set /
  * 另有一条 GET 路由 `/api/jet-hub/captcha-carrier`：渲染内部载体的载体页
  * （⚠ 手工诊断用；guest 加载不到它，见该路由注释里的主进程取证）。
  */
@@ -38,7 +41,11 @@ type OfficeAceAuth = typeof OfficeAceAuthModule;
 import type { AccioAuth } from './accio-auth.js';
 import type { AutoclawAuth } from './autoclaw-auth.js';
 import type { ModelscopeAuth } from './modelscope-auth.js';
+import type { QiniuAuth } from './qiniu-auth.js';
 import { type AstudioAuth } from './astudio-auth.js';
+import { type MagicrewAuth } from './magicrew-auth.js';
+import type { CodelyAuth } from './codely-auth-service.js';
+import { balanceCacheOf } from './provider-runtime.js';
 import type { BuddyCredential } from './buddy.js';
 import { type CheckinStatus, type ClaimOutcome, type CreditBalance } from './credits.js';
 import { type BuddyProduct } from './product.js';
@@ -269,6 +276,13 @@ export interface CreditsEndpointDeps<TCredential = BuddyCredential, TProduct = B
     } | undefined>;
     /** 查询签到状态；默认使用真实的 fetchCheckinStatus。 */
     fetchStatus?: (credential: TCredential, product: TProduct) => Promise<CheckinStatus | null>;
+    /**
+     * `collectCreditsStatus` 的**并发度**；默认 3。
+     *
+     * 只影响 `credits.status` 这一趟逐账号查询（见该函数的长注释）。
+     * `1` = 完全串行（升级前语义）；测试与将来调参用。
+     */
+    concurrency?: number;
     /** 执行签到领取；默认使用真实的 claimDailyCheckin。 */
     claim?: (credential: TCredential, product: TProduct, entry: ProviderAccountEntry) => Promise<ClaimOutcome>;
     /**
@@ -433,7 +447,55 @@ export interface CreditsEndpointDeps<TCredential = BuddyCredential, TProduct = B
     fetcher?: typeof fetch;
 }
 /**
- * 逐账号收集签到状态（顺序执行，避免并发触发风控）。
+ * `credits.status` 逐账号查询的**默认并发度**。
+ *
+ * 3 的依据与代价见 `collectCreditsStatus` 函数体内那段注释（**不要**用「浏览器
+ * 默认 6」来论证 —— 那是不同量纲）。
+ */
+export declare const DEFAULT_CREDITS_STATUS_CONCURRENCY = 3;
+/**
+ * `credits.status` 逐账号查询的**并发硬上界**。
+ *
+ * ## ⚠️ 为什么必须有它（2026-10-22 审计打穿）
+ *
+ * 初版的上界是 `accounts.length`：
+ *
+ * ```ts
+ * Math.max(1, Math.min(deps.concurrency ?? 3, accounts.length || 1))
+ * ```
+ *
+ * 于是 `deps.concurrency = 1e10`（任何 ≥ 账号数的安全整数）⇒ 并发度 = 账号数
+ * ⇒ **31 个账号 = 31 个并发请求打同一上游**（实测峰值 31）。注释说的「3 个并发
+ * 压力很低」这个保护**只由 `accounts.length` 约束，没有任何硬顶**。
+ *
+ * ⇒ 上界改为本常量。它同时给「将来有人把默认值调大」加了一道闸。
+ *
+ * ⚠️ 取值 8：足够覆盖「账号很多」的正常情形（3 是默认，8 是天花板），且远低于
+ * 任何一家上游会当成爬虫的量级。调它需要重新核对 `fetchStatus` 各家的限流策略。
+ */
+export declare const MAX_CREDITS_STATUS_CONCURRENCY = 8;
+/**
+ * 解析 `credits.status` 的并发度（**纯函数，可直接单测**）。
+ *
+ * 逐格行为（2026-10-22 审计逐格实测确认）：
+ *
+ * | 传入 | 结果 | 说明 |
+ * |---|---|---|
+ * | `undefined` / `0` / `-1` / `NaN` / `1.5` / `Infinity` / 字符串 | 3 | 非「正整数」一律回落默认 |
+ * | `1` | 1 | 恢复旧的完全串行语义 |
+ * | `4` | 4 | |
+ * | `1e10` / `MAX_SAFE_INTEGER` | **8** | 被 {@link MAX_CREDITS_STATUS_CONCURRENCY} 硬顶（初版这里会变成账号数） |
+ * | `accounts.length === 0` | 1 | 起 1 个 worker 立刻返回 -1（**不能**是 0 —— 那会让 `results` 全是空洞） |
+ *
+ * ⚠️ `concurrency: 0` 的语义是「**回落默认 3**」，**不是**「串行」——要串行请传 `1`。
+ *    这条在初版注释里没写，是审计点出来的语义空隙。
+ */
+export declare function resolveCreditsStatusConcurrency(raw: unknown, accountCount: number): number;
+/**
+ * 逐账号收集签到状态（**有限并发**，默认 3；见函数体内 `concurrency` 的说明）。
+ *
+ * ⚠️ **原实现是纯串行**，注释写「顺序执行，避免并发触发风控」。2026-10-22 改成
+ * 有限并发，理由与代价见函数体内那段长注释 —— **别再照旧注释改回串行**。
  *
  * **包含已停用账号**：停用只影响账号池的自动选择与限流切换，不改变账号本身
  * 是否已签到。用户要看到的是「这个账号今天领了没」，因此这里不过滤 enabled。
@@ -547,6 +609,25 @@ export interface JetHubAuths {
      * 而按 id 查表（`authOf`）会把国际站账号分派到**国内站实例**上。
      */
     readonly minimaxintl: MinimaxAuth;
+    /**
+     * Codely（Unity）的续期实例 —— **可选键**（2026-10-22 A6 接线）。
+     *
+     * ⚠️ 为何是**可选**而不是必填：它的接线需要同时改到 `index.ts` 的
+     * `auths` 对象、`SELF_HEAL_REFRESHABLE_PROVIDERS`、`jet-hub-store.ts` 的前缀表，
+     * 以及多张从注册表派生的守卫。写成**必填**会让下一个加 provider 的人
+     * 被迫同时改所有消费方（而那些消费方本来就应该按 `channel` 派生）。
+     * 缺它时：存在的 `refreshAccountCredential` / `refreshAll` 路径会跳过 codely（与各家同形）。
+     */
+    readonly codely?: CodelyAuth;
+    /**
+     * ⚠️ **Codely 的键暂不在此声明**（2026-10-20）：接线必须**四处同时**做——
+     * ① 本接口加 `codely`；② `index.ts` 的 auths 对象传值；
+     * ③ `SELF_HEAL_REFRESHABLE_PROVIDERS` 加 `CODERLY.id`；
+     * ④ `jet-hub-rpc-auth-wiring.spec` 的 17→18 与 `refreshAll` 14→15 计数。
+     * 缺任一处都会让「接口↔运行时交叉校验」变红（本轮实测：只加接口 ⇒ 2 条红）。
+     * 续期实现已就绪（`src/codely-auth-service.ts` 的 `CodelyAuth`），
+     * 推理与目录都不依赖它 ⇒ 不接也不影响使用。
+     */
     readonly zcode: ZcodeAuth;
     readonly gemini: GeminiAuth;
     /**
@@ -567,6 +648,14 @@ export interface JetHubAuths {
      * —— 一次做完的同步路径 ⇒ 返回体靠 `reused: true` 走前端的成功出口。
      */
     readonly astudio: AstudioAuth;
+    /**
+     * 超级麦吉（Magicrew，2026-10-29）。
+     *
+     * ⚠️ 值必须是 `index.ts` 里 `registerProviderRuntime` 那个 `registry` 数组中
+     * `['magicrew', magicrewAuth]` 的**同一个对象**，否则守卫用例布在该实例上的
+     * spy 收不到注册循环的调用（本仓库复发过 6 次）。
+     */
+    readonly magicrew: MagicrewAuth;
     readonly autoclaw: AutoclawAuth;
     /**
      * **AutoClaw 国际版**（`autoclawintl`）。
@@ -588,6 +677,12 @@ export interface JetHubAuths {
      * ⚠️ 值是 `ModelscopeAuth` **Service 实例**（与 accio 同款），不是命名空间。
      */
     readonly modelscope: ModelscopeAuth;
+    /**
+     * 七牛云 AI（Qiniu）—— **本 fork 独有**（上游 rc.11 仍无此 provider）。
+     *
+     * ⚠️ 值是 `QiniuAuth` **Service 实例**，与 modelscope 同款。
+     */
+    readonly qiniu: QiniuAuth;
 }
 /**
  * 按 provider id 取 auth 实例。
@@ -635,6 +730,10 @@ export declare function authOf(auths: JetHubAuths, provider: string): JetHubAuth
  *（`tests/unit/credits-runtime-parity.spec.ts` 的 `vi.mock('provider-credits')`）——
  * 断言仍打在**端点响应**上，判别力与原形参方案逐条等价。
  */
+export interface JetHubRpcConfig {
+    codeartsFetcher?: typeof fetch;
+    balanceCache?: ReturnType<typeof balanceCacheOf>;
+}
 export declare function registerJetHubRpc(ctx: Context, pool: AccountPool, 
 /** ⚠️ 命名对象，不是位置参数。键是 provider id（见 `JetHubAuths`）。 */
 auths: JetHubAuths, 
@@ -645,7 +744,7 @@ auths: JetHubAuths,
  * 使被关闭的模型也能显示正确的展示名（含倍率），而不是退化成裸 id。
  * 省略时退化为只用 `ctx.llm.listModels()` 的历史行为。
  */
-modelAdapters?: Readonly<Record<string, ModelCatalogSource>>): void;
+modelAdapters?: Readonly<Record<string, ModelCatalogSource>>, config?: JetHubRpcConfig): void;
 /**
  * 「显示列表」所需的最小适配器接口：能给出**不套用户黑名单**的完整目录。
  *
@@ -658,6 +757,27 @@ export interface ModelCatalogSource {
         name: string;
         isFree?: boolean;
     }[];
+    /**
+     * 「我这份 `listAllModels()` **确认**来自远端完整读取」的适配器自报钩子。
+     *
+     * ## 用途（`model.list` 的「已下架」判据）
+     *
+     * `model.list` 补回黑名单条目时，只补**仍在售**的（否则上游已下架、
+     * 用户曾关掉的模型会永久留在设置页、点开必然 404）。
+     * 但「不在 `listAllModels()` 里」**不足以**证明已下架：冷缓存 / 远端降级时
+     * 它返回的是各家**编译期兜底表**（远端目录的**子集** —— Issue IKJW33 实测
+     * `cline` 冷缓存 3 条 vs 远端 460 条）。拿子集当在售集合会把用户关掉的
+     * **在售**模型判成已下架 ⇒ 从设置页彻底消失、无法重新打开。
+     *
+     * ⇒ 只有本方法返回 `true` 时才允许隐藏；返回 `false` / 未实现（`undefined`）
+     * 一律**放弃判据**（照旧补回）。方向与 `dead-model-store.ts` 的
+     * 「不从残缺目录反推」一致：**宁可留幽灵，不可删在售**。
+     *
+     * ⚠️ **可选**：只有能证明自己目录来源的家实现它（当前只有 codearts ——
+     * 它有两个目录端点、且由接线层的 `catalogComplete` 上报两来源成败）。
+     * 其余家不实现 ⇒ 行为与加这条判据之前逐字节一致。
+     */
+    catalogConfirmedRemote?(): boolean;
     /**
      * 聚合目录（**可选** —— 只有聚合适配器实现它）。
      *

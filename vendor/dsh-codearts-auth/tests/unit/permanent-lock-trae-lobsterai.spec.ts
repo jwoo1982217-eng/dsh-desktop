@@ -190,9 +190,12 @@ describe('前后端能力声明一致（trae / lobsterai）', () => {
     expect(PERMANENT_LOCK_PROVIDERS.has('loomy')).toBe(true)
     expect(PERMANENT_LOCK_PROVIDERS.has('buddy')).toBe(true)
     expect(PERMANENT_LOCK_PROVIDERS.has('workbuddy')).toBe(true)
-    // ⚠️ 这两家没有逐包到期时间，加进来开关无效
-    expect(PERMANENT_LOCK_PROVIDERS.has('qoder')).toBe(false)
+    // ⚠️ cline 没有逐包到期时间，加进来开关无效
     expect(PERMANENT_LOCK_PROVIDERS.has('cline')).toBe(false)
+    // ⚠️ qoder / qodercn **已于 2026-10-20 加入**（用户要求补齐三档分档 + 永久锁）：
+    //    此前「没有逐包到期时间 ⇒ 加进来也没用」的判断已被证伪 —— 恰恰因为
+    //    **拿不到逐包到期**，哨兵被识别为永久桶，「锁定永久积分」才真能把它保住。
+    //    ⇒ 本用例的反向断言不再把这两家列为「不得登记」。
   })
 
   it('前端 supportsPermanentLock 与后端逐项一致', () => {
@@ -200,7 +203,11 @@ describe('前后端能力声明一致（trae / lobsterai）', () => {
       expect(supportsPermanentLock(id), id).toBe(true)
     }
     // 反向：后端没登记的，前端也不得渲染按钮
-    for (const id of ['qoder', 'qodercn', 'cline', 'raccoon', 'minimax', 'zcode', 'codearts']) {
+    // ⚠️ qoder / qodercn **已于 2026-10-20 移出本名单**（它们已登记
+    //    `permanentLock: true`）；留着会让本用例红 —— 这是正确的红灯，
+    //    不许靠放宽断言绕过。
+    // ⚠️ minimax / minimaxintl / astudio 同理（三家均于 2026-10-20 登记）。
+    for (const id of ['cline', 'raccoon', 'zcode', 'codearts']) {
       expect(supportsPermanentLock(id), id).toBe(false)
     }
   })

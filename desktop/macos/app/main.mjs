@@ -112,7 +112,14 @@ async function connect() {
     }
     backend = new Backend({home, runtime: path.join(resources, 'runtime'), node: path.join(resources, 'bin', isWindows ? 'node.exe' : 'node'), port, cwd: homedir(), log});
     backend.on('unavailable', () => { if (!quitting) showSplash('DSH 已停止', '请从菜单 DSH → 重新连接再次启动。'); });
-    const state = await backend.start();
+    const current = backend;
+    const progress = status => {
+      if (connecting && backend === current && !quitting) void showSplash('正在启动 DSH…', status).catch(() => {});
+    };
+    current.on('status', progress);
+    let state;
+    try { state = await current.start(); }
+    finally { current.off('status', progress); }
     origin = new URL(state.url).origin;
     await window.loadURL(state.url);
     window.setTitle('DSH');

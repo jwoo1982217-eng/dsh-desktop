@@ -388,26 +388,31 @@ describe('搜索框缺陷守卫：主题 token 与弹窗位置（源码级回归
   })
 
   /**
-   * ⚠️ 模型列表弹窗必须**顶部锚定**，不得垂直居中。
+   * ⚠️ 所有弹窗一律**垂直居中**（2026-10-26 用户需求「检查所有弹窗，都调整为居中显示」）。
    *
-   * 列表长度随搜索变化 → 弹窗高度变化 → `align-items: center` 把它变成整体
-   * 位移（实测 top 从 4px 跳到 187px）。顶部锚定后上边缘固定。
+   * 历史：2026-10-07 曾为「弹窗上下跳」把模型列表弹窗改成顶部锚定
+   * （`.dim-jh-modalOverlay--top` + `align-items: flex-start`）。那个修饰类
+   * 已整体删除，跳动问题改由 `.dim-jh-modal` 的 `min-height` 兜底。
+   * 本表钉住「居中」这个口径，防止有人为修跳动又把它改回顶锚。
    */
-  it('模型列表弹窗顶部锚定（避免列表变短时弹窗整体跳动）', () => {
-    expect(styles).toMatch(/\.dim-jh-modalOverlay--top\s*\{[^}]*align-items:\s*flex-start/)
+  it('弹窗遮罩必须垂直居中（不得退回顶部锚定）', () => {
+    expect(styles).toMatch(/\.dim-jh-modalOverlay\s*\{[^}]*align-items:\s*center/)
+    expect(styles, '顶部锚定修饰类已被删除，不要再加回来')
+      .not.toMatch(/\.dim-jh-modalOverlay--top\s*\{/)
   })
 
-  /** 顶锚后 max-height 必须按 padding box 算，否则 8vh 会溢出视口。 */
-  it('顶锚弹窗的 max-height 按 padding box 计算（不用 100vh 算式）', () => {
-    expect(styles).toMatch(/\.dim-jh-modalOverlay--top\s+\.dim-jh-modal\s*\{[^}]*max-height:\s*100%/)
+  /** 居中后高度变化仍会让弹窗位移，靠 min-height 把区间压窄。 */
+  it('弹窗有 min-height 兜底（居中的代价：高度变化会变成整体位移）', () => {
+    expect(styles).toMatch(/\.dim-jh-modal\s*\{[^}]*min-height:\s*min\(300px/)
   })
 
-  /** 客户端必须真的用上顶锚修饰类，否则上面的 CSS 是死代码。 */
-  it('ModelListPanel 的遮罩使用 --top 修饰类', () => {
-    const js = readFileSync(
-      resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/jet-hub.js'),
-      'utf8',
-    )
-    expect(js).toContain('dim-jh-modalOverlay dim-jh-modalOverlay--top')
+  /** 客户端不得再用顶锚修饰类（用了就说明 CSS 已删而 JS 没跟）。 */
+  it('全仓客户端代码不再出现 --top 修饰类', () => {
+    const dir = resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client')
+    const files = ['jet-hub.js', 'opencode-proxy-modal.js', 'modelscope-key-modal.js']
+    for (const file of files) {
+      const js = readFileSync(resolve(dir, file), 'utf8')
+      expect(js, `${file} 仍在用已删除的顶锚修饰类`).not.toContain('dim-jh-modalOverlay--top')
+    }
   })
 })

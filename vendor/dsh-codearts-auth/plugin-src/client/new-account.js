@@ -65,6 +65,10 @@
  */
 const PROVIDERS_ASKING_OPTIONS = Object.freeze(['zcode', 'accio', 'astudio', 'autoclaw', 'autoclawintl']);
 
+export function phoneLoginPresentation() {
+  return typeof window !== 'undefined' && window.__dshPhonePresentation === true;
+}
+
 /**
  * 该 provider 的「新建账号」是否**需要先问一句**（即是否弹预选窗）。
  *
@@ -115,6 +119,10 @@ export function newAccountAsksChannel(provider) {
  *   astudioLoginMethod?: string, autoclawMode?: string }}
  */
 export function buildCreateAccountPayload(provider, zcodeProvider, accioRegion, astudioLoginMethod, autoclawMode) {
+  if (phoneLoginPresentation()) {
+    if (provider === 'astudio') return { provider, astudioLoginMethod: 'web' };
+    if (provider === 'autoclaw' || provider === 'autoclawintl') return { provider, autoclawMode: provider === 'autoclaw' ? 'sms' : 'oauth' };
+  }
   // 排除法：先把「载荷里没有任何专属字段」的 provider 早退掉（方向与白名单相反）。
   // ⚠️⚠️ **`autoclawintl` 必须在这里**（2026-10-20 修）：原实现只列了 `autoclaw`
   //    ⇒ 国际版的载荷被早退成 `{ provider }`，丢掉 `autoclawMode`

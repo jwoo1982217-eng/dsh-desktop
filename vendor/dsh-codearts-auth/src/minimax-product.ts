@@ -288,6 +288,47 @@ export function minimaxProductById(id: string): MinimaxProduct | undefined {
 
 /** OAuth 设备码申请（asar `endpoint-config.js`）。 */
 export const MINIMAX_DEVICE_CODE_PATH = '/oauth2/device/code'
+/**
+ * 设备码**授权页**的服务端读接口（Gitee 反馈「链接自带旧登录态」的修法依据）。
+ *
+ * ## 为什么需要它（2026-10-24 实测）
+ *
+ * `verification_uri_complete`（`/oauth-authorize?user_code=…`）**不含任何身份**，
+ * 身份全部来自浏览器 cookie —— 带已有会话打开就复用旧账号，用户看到的是
+ * 「旧账号的授权页」。上游页面**不认**任何强制重新登录的参数（实测
+ * `prompt=login` / `prompt=consent` / `prompt=select_account` / `force_login=1`
+ * / `relogin=1` 五个参数：授权页 chunk 里这五个词命中数**全为 0**，只是被塞进
+ * Next router 的 query）。
+ *
+ * 上游**自己**的「切换账号」按钮走的是这条端点：**不带 cookie** 请求时服务端恒回
+ * `401 {"error":"login_required","login_url":"/unified-login?login_redirect=…"}`，
+ * 而那个 `login_url` **自带 `login_redirect=<原授权页>`** ⇒ 用户在统一登录页
+ * 登录完成后**自动回到授权页**并放行**新**账号。
+ *
+ * ⇒ 本端点让宿主可以**不依赖浏览器会话**地合成「保证走一遍登录」的链接，
+ * 且**不触碰任何凭据**（纯 GET，无 `Authorization`）。
+ *
+ * ⚠️ 实测**不需要** `app_id`（带 `app_id=1` / `mcode-public` / `web` 与完全不带，
+ * 四种形态响应逐字相同）。
+ */
+export const MINIMAX_DEVICE_AUTHORIZE_PATH = '/oauth2/device/authorize'
+/**
+ * 网页会话登出（「旧 session 掉登录状态」的兜底路径）。
+ *
+ * 实测：`GET https://account.minimax.cn/oauth2/logout` → `302 → /unified-login`
+ * + `Set-Cookie: _sid=; path=/; HttpOnly; secure; SameSite=Lax`。
+ *
+ * ⚠️ **它不接受任何回跳参数**（实测 `redirect` / `redirect_url` / `return_to` /
+ * `returnTo` / `url` / `service` / `target` / `to` / `continue` / `next_url` /
+ * `next` 共 11 个参数，`Location` 恒为 `/unified-login`）⇒ 登出后**不会**自动
+ * 回到授权页，必须由调用方再导航一次（配合 {@link MINIMAX_DEVICE_AUTHORIZE_PATH}
+ * 合成的 `login_url` 正好构成两跳）。
+ *
+ * ⚠️⚠️ **作用域是整个 `account.minimax.cn` 网页会话** —— 用户日常浏览器里同一个
+ * 域的 MiniMax 网页登录会被一起登出（与 officeace 的 `authui/logout` 同型副作用）。
+ * 故它只作「无痕窗口不可用」时的**显式兜底**，且在 UI 上必须说明。
+ */
+export const MINIMAX_WEB_LOGOUT_PATH = '/oauth2/logout'
 /** OAuth 令牌（轮询与续期共用）。 */
 export const MINIMAX_TOKEN_PATH = '/oauth2/token'
 /** OAuth 撤销。 */

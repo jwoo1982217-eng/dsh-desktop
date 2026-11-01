@@ -39,20 +39,17 @@ export interface OpencodeAdapterOptions {
     identitySlots: () => Promise<readonly IdentitySlot[]>;
     /** 拉远端目录；缺省时直接用兜底表。 */
     fetchRemoteCatalog?: OpencodeCatalogFetcher;
-    /** 用户模型黑名单。 */
-    disabledModels?: () => ReadonlySet<string>;
     /**
-     * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+     * 账号池（**黑名单、关闭意图的唯一数据源**）。
      *
-     * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
-     * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
-     * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
-     * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+     * ⚠️⚠️ **2026-10-23 迁移**：本家此前手写 `listModels`，黑名单与关闭意图靠
+     * `disabledModels` / `providerClosed` 两个**选项回调**传进来。那两个字段
+     * 已随迁移删除 —— 现在统一由共享骨架（`model-catalog.ts`）从本池读取。
      *
-     * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
-     * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+     * ⚠️ 省略时（单测 / 嵌入方）行为退回「不过滤、不判关闭意图」；
+     * **生产接线必须传**（`index.ts` 负责，且有守卫逐家点名）。
      */
-    providerClosed?: () => boolean;
+    accountPool?: import('./account-pool.js').AccountPool;
     /** 记录受限的副作用（切槽时由接线层提供）。 */
     markLimited?: (slotId: string, modelId: string, resetAtMs: number) => Promise<void>;
     /** 诊断日志。 */
@@ -90,6 +87,11 @@ export declare function pickSlot(slots: readonly IdentitySlot[], modelId: string
 export declare function opencodeRetryAfterMs(kind: OpencodeErrorKind, retryAfterMs: number | undefined, attempt: number): number;
 export declare class OpencodeAdapter extends LlmAdapter {
     private readonly options;
+    /**
+     * 共享目录骨架（`model-catalog.ts`）——**黑名单 / 关闭意图 / 目录门控 /
+     * 模态回填 / 映射**的唯一实现处（2026-10-23 迁移，见 `listModels` 的注释）。
+     */
+    private readonly skeletonCatalog;
     constructor(options: OpencodeAdapterOptions);
     providerInfo(provider: string): LlmProviderInfo;
     private catalog;
@@ -106,7 +108,45 @@ export declare class OpencodeAdapter extends LlmAdapter {
         name: string;
         isFree?: boolean;
     }[];
+    /**
+     * 模型选择器的目录 —— **委托共享骨架**（`model-catalog.ts`）。
+     *
+     * ## ⚠️⚠️ 2026-10-23 迁移（用户要求：实体 provider 一律走共享骨架）
+     *
+     * 迁移前本方法**手写**了四件事：判 `providerClosed`、槽位门控、
+     * 「只有匿名身份时只给免费模型」、过滤 `disabledModels` + 手工 map。
+     * 其中「关闭意图 / 黑名单 / 模态回填 / `provider` 回填」与其余 13 家
+     * **逐字同义** ⇒ 各写一份正是 Gitee IKP8OF 那类漂移缺陷的温床。
+     *
+     * 现在那四条由骨架承担，**本家独有的两条**放进 `loadCatalog`
+     * （`loadCatalogEntries`）：
+     * - 无任何槽位 ⇒ 返回 `[]`（隐藏 provider 分组）；
+     * - **只有匿名身份时只给免费模型**（用户定稿的可见性口径）。
+     *
+     * ⚠️ 模态仍走 `inputModalitiesOf`（**远端能力表**），在 `toCatalogEntry` 里。
+     */
     listModels(_provider: string): Promise<readonly LlmModelInfo[]>;
+    /**
+     * 异步读目录并转成骨架的中间结构。
+     *
+     * ⚠️⚠️ **本家独有门控全在这里**（迁移前它们散在 `listModels` 里）：
+     * ① 无任何槽位 ⇒ `[]`；② 只有匿名身份 ⇒ 只留免费模型。
+     *
+     * ⚠️ **顺序约束**（2026-10-17 对抗审计实测澄清）：能力表注入发生在
+     * `catalog()` 内层（经 `loadOpencodeCatalog`），故这里**不需要**再前置读一次。
+     * 若将来 `catalog()` 出现**不经过 `loadOpencodeCatalog`** 的路径，
+     * 该约束会重新失效 —— 那时必须在这里补回并同时补一条能抓住它的守卫。
+     */
+    private loadCatalogEntries;
+    /**
+     * **同步**全量目录（`listAllModels()` 用）。
+     *
+     * ⚠️ 与 `loadCatalogEntries` 同一套转换口径（否则「设置页看到的」与
+     * 「选择器看到的」会分叉）；差别只在不打网络：这里用兜底表。
+     */
+    private syncCatalogEntries;
+    /** 本家私有形状 → 骨架的 `CatalogEntry`（**唯一**转换点）。 */
+    private toCatalogEntry;
     resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
     prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<{
         model: LlmResolvedModelInfo;
@@ -135,6 +175,33 @@ export declare class OpencodeAdapter extends LlmAdapter {
     private resolveImageUrls;
     /** 用指定槽发一次请求（轮换循环的复用单元）。 */
     protected streamVia(slot: IdentitySlot, options: GenerateOptions): AsyncIterable<StreamChunk>;
+    /**
+     * 传输层：先用 Bun 指纹发，**模块加载不到时**才回退常规 fetch。
+     *
+     * ## 为什么免费与付费共用这一条（不分叉）
+     *
+     * 两者的请求形状**逐字节相同**，差别只在「用哪个槽 / key 能不能过免费判定」
+     * （见 `pickSlot`）。传输层若按付费/免费分叉，等于凭一个未经证实的假设
+     * 分两套判据 —— 本仓库的红线。实测旁证：付费模型名 + 匿名 key 回的是
+     * **401 `AuthError`**（鉴权层拒绝，不是门禁层），说明两条通道的门禁位置不同，
+     * 但都受益于「更像官方客户端」。
+     *
+     * ## 回退的边界（只这一种）
+     *
+     * 只接 {@link BunTlsUnavailableError}：它意味着**请求还没发出去**
+     * （模块解析失败），重发不会产生双份副作用。其它错误一律原样抛给轮换层 ——
+     * 把 401/429 也回退会让同一次失败既记账又重发。
+     *
+     * ## ⚠️ 这里**刻意不调 `warn`**
+     *
+     * 回退是**静默**的。理由：本方法在 `streamVia` 里逐请求调用，而
+     * `warn` 在本仓库是**协议层诊断**的通道 —— 响应层剔调用时的用例用
+     * `toHaveBeenCalledTimes(1)` 精确计数（`opencode-stream.spec.ts` 多处）。
+     * 传输层往里插一条会让那些计数变成 2、把「剔除留痕」的判据淹成噪音。
+     * 可观测性改由 {@link bunTlsUnavailableReason} 对外暴露，由接线层
+     * （`index.ts`）在**启动期**读一次并记日志。
+     */
+    private fetchWithBunFingerprint;
 }
 /** 在 `ctx.llm` 上注册 opencode 路由。 */
 export declare function registerOpencodeLlm(ctx: Context, options: OpencodeAdapterOptions): OpencodeAdapter;

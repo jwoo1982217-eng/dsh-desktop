@@ -200,6 +200,231 @@ export declare function normalizeToolArguments(raw: string): string;
  */
 export declare function isTruncatedArguments(raw: string): boolean;
 /**
+ * 工具参数的**三态**分类：`ok` / `truncated`（流被掐断）/ `invalid`（模型写坏）。
+ *
+ * ## ⚠️⚠️ 为什么必须与 {@link isTruncatedArguments} 分开（真实缺陷，Gitee IKQ8Y1）
+ *
+ * `isTruncatedArguments` 只回答「能不能解析」，于是把**两种完全不同的病理**
+ * 混成同一个 `true`：
+ *
+ * | 病理 | 表现 | 正确处置 |
+ * |---|---|---|
+ * | **流被掐断**（分片丢失） | 参数**半截**、结构不闭合 | 报 max-tokens ⇒ dsh 丢弃并重试（实测一次即恢复） |
+ * | **模型语法写坏** | 结构**闭合配平**、引号成对，但 JSON 非法 | 重试**可能**立刻再犯；至少不该谎报「token 用满」 |
+ *
+ * 实测两例真实会话（跨 2 天、两个不同工作区、同一工具 `compress`）：
+ *
+ * ```json
+ * {"content": 【m00055–m00067 · 撰写 vibe coding 指南与技能库查询】
+ * - memory_procedure_list 查询「vibe coding 研究 检索 报告」→ 技能库无匹配（共 8 条）。
+ * …待用户决定。}
+ * ```
+ *
+ * `content` **漏了开引号**、正文是裸文本且含真实换行 ⇒ `JSON.parse` 在**第 13 个
+ * 字符**失败（`Expecting value: line 1 column 13`），而末尾 `}` 配平、引号成对。
+ * 全库统计（193 会话 / 8116 次工具调用逐块 `JSON.parse`）：参数非法**只有这 2 次**，
+ * 且都是同一个工具；`pwsh` 4274 次、`read` 774、`edit` 550、`write` 350 **全部合法**
+ * ⇒ 转发链路没有系统性破坏，坏的是模型这一次的输出。
+ *
+ * ## 判据：**结构闭合优先**
+ *
+ * 1. 能 `JSON.parse` ⇒ `ok`（含空串 —— 无参数工具只下发空分片，这是合法的）；
+ * 2. 末字符不是 `}` / `]` ⇒ `truncated`（连收尾都没有，必然是被掐断）；
+ * 3. 括号不配平 / 仍在字符串字面量里 ⇒ `truncated`；
+ * 4. 闭合、配平、引号成对却仍 parse 失败 ⇒ `invalid`。
+ *
+ * ## ⚠️ 刻意 **fail-safe**（宁可继续误报，也不错误定罪）
+ *
+ * 模型写坏但**没**以 `}` 收尾（例如多打一个引号、正文里出现奇数个 `"`）时，
+ * 本函数返回 `truncated` ⇒ 维持既有 `max-tokens` 行为。这**不是**漏判：
+ * 我们只对「结构上闭合」的样本说「模型写坏了」，因为那是唯一能被结构证明的一格。
+ *
+ * ## ⚠️ 不得放宽成「所有无法解析的 arguments 都是 invalid」
+ *
+ * {@link isTruncatedArguments} 的注释记录的 `session-23851745` 事故正是反例
+ * —— 分片丢失（只剩路径中段与尾部）**必须**判 truncated 并重试。
+ * 本函数的第 2/3 条腿就是为它保留的。
+ *
+ * @param raw - 累积后的工具参数原文（可能为空串）。
+ */
+export type ToolArgumentsClass = 'ok' | 'truncated' | 'invalid';
+export declare function classifyToolArguments(raw: string): ToolArgumentsClass;
+/**
+ * 「工具参数不是合法 JSON」的**错误码**。
+ *
+ * ## 为什么不复用 `max-tokens`（真实缺陷，Gitee IKQ8Y1）
+ *
+ * DSH 客户端对 `max-tokens` 只有一句**固定 i18n**（`dsh-client-ui-chat` 的
+ * `message.maxTokens` / `.hint`：**「已达到输出 token 上限 / 回答被截断…
+ * 发送"继续"可让模型接着输出」**），**不读适配器的任何 message** ⇒
+ * 真正的病因被吞掉，用户被引向「额度用满」这条错误处置（去查账号、等额度、
+ * 降思考档、怀疑渠道），而这些**都不会好**。实测受害轮次
+ * `usage.outputTokens = 2516`（上限 128000）—— 额度远没用满。
+ *
+ * 这与本仓库既有结论同族：`AUTH` 吞 message（IKLBSH）、思考死循环曾复用
+ * `max-tokens`（已改为 {@link REASONING_LOOP_CODE}）。本条是同一家族的第三个成员。
+ *
+ * ## 为什么必须**不可重试**
+ *
+ * 与 {@link REASONING_LOOP_CODE} 同一条纪律：它**不在** harness 的
+ * `DEFAULT_RETRYABLE_CODES`（`EMPTY_RESPONSE` / `RATE_LIMIT` / `SERVER` /
+ * `TIMEOUT` / `TRANSPORT`）里。白退避 5 次只会再烧一轮额度，而模型这一次的
+ * 输出形态**大概率原样复现**（同一个工具、同一个坏字符位，实测两例都是第 13 字符）。
+ *
+ * ⚠️ 也不能取 `AUTH` / `QUOTA` / `ACCOUNT_QUOTA`：客户端会替换文案（见
+ * {@link REASONING_LOOP_CODE} 的同一段注释）。
+ */
+export declare const TOOL_ARGS_INVALID_CODE = "TOOL_ARGS_INVALID";
+/**
+ * 判断工具参数是否是**可执行**的参数包（不只是「能 `JSON.parse`」）。
+ *
+ * ## ⚠️⚠️ 为什么不能用 `classifyToolArguments(...) === 'ok'`（对抗审计实测的真缺陷）
+ *
+ * `classifyToolArguments` 回答的是「这段字节是不是合法 JSON」，而
+ * `ok` 里**包含 JSON 标量**：`123` / `"abc"` / `null` / `true` / `[]` / `[1,2]`
+ * 全部返回 `ok`（它们确实是合法 JSON）。但接入点拿 `=== 'ok'` 判「**另一个可用
+ * 调用**」——一个参数为 `123` 的调用并不是可用调用，于是：
+ *
+ * | 观测（真实适配器） | 结果 |
+ * |---|---|
+ * | 参数为 `123` / `null` / `"abc"` / `[1,2]` 的单调用 | `tool-calls` |
+ * | **坏块 + 参数为 `123` 的另一调用** | `max-tokens`（本该 `TOOL_ARGS_INVALID`） |
+ *
+ * ## 为什么后果仍是「issue 要根除的那类症状」
+ *
+ * `normalizeToolArguments` 会把标量/数组兜底成 `{}`（见该函数注释），故 harness
+ * **不会**真的执行参数为 `123` 的调用；它拿到的是 `arguments:"{}"` ⇒ 报
+ * `missing required property` ⇒ 模型收到莫名其妙的参数错误后重试。
+ * 也就是说：**症状没消失，只是换了条出口**，且我们失去了「模型把参数写坏了」
+ * 这个有分辨力的归因。
+ *
+ * ## 判据与落盘口径**同源**
+ *
+ * 这里解析后按「是不是**非空对象**」判，而不是拿 `normalizeToolArguments` 的
+ * 产物与字面量 `'{}'` 比：
+ *
+ * ⚠️⚠️ **第一版正是 `normalizeToolArguments(raw) !== '{}'`，那是比错对象**
+ * （对抗审计实测的 P1）：`normalizeToolArguments` 对合法对象返回的是
+ * **trim 后的原文**（见该函数 `return trimmed` 那一支）⇒
+ *
+ * | 输入 | 解析后语义 | 第一版判定 |
+ * |---|---|---|
+ * | `'{}'` | 空对象（无参工具的常见形态） | **不可用** ← 错 |
+ * | `' {} '` | 空对象 | **不可用** ← 错 |
+ * | `'{ }'` | 空对象 | 可用 |
+ *
+ * `'{}'` 与 `'{ }'` 语义**完全相同**、结论相反 ⇒ 自证是比错对象而非取舍。
+ *
+ * 端到端后果：坏块 + 一个参数为 `'{}'` 的合法无参调用 ⇒ 四家全部报
+ * **`TOOL_ARGS_INVALID`**（不在 harness 可重试集合 ⇒ 硬失败），而本该报
+ * `max-tokens`（保住那个可用调用）。`'{}'` 是无参工具最常见的形态，
+ * 触发面不小 —— 故定 P1 而非 P2。
+ *
+ * ⚠️ 「空串」单独放行：无参工具也可能只下发一个空分片，那在本仓库语义里
+ * **是**可用的。
+ *
+ * ⚠️ 本函数**只用于**「是否还有另一个可用调用」这条门禁，**不用于**判断
+ * 「要不要报 `TOOL_ARGS_INVALID`」——后者看 `classifyToolArguments === 'invalid'`。
+ * 两者是不同的问题，别合并。
+ *
+ * @param raw - 累积后的工具参数原文。
+ */
+export declare function isUsableToolArguments(raw: string): boolean;
+/**
+ * 「工具参数写坏」是否构成本步的**唯一产出**（决定报 `error` 还是退回 `max-tokens`）。
+ *
+ * ## ⚠️ 为什么必须抽成**一份**实现（本仓库首条红线）
+ *
+ * 四个适配器（`buddy-adapter` / `openai-compat` / `trae-adapter` /
+ * `lobsterai-adapter`）都要判这同一件事。第一版在四处各写了一遍**逐字相同**的
+ * 三条件表达式 —— 那正是「同一语义 N 套实现必然漂移」的形态：将来只要有一处
+ * 被单独改动（例如某家把 `emittedProse` 换成别的变量、或漏掉
+ * `hasUsableToolName` 腿），症状是**只有那一家**的处置悄悄变了，且四家的用例
+ * 各自都是绿的。
+ *
+ * ## 三条门禁（缺一不可）
+ *
+ * 1. **至少一个块被判 `invalid`**（`classifyToolArguments` 的结论，调用方算好传入）；
+ * 2. **零正文** —— `error` 路径**不落 `assistant/message`**（实测 219 会话里
+ *    222 例），有正文时报 `error` 会把用户可见内容整块丢掉，只能退回 `max-tokens`
+ *    保住内容；
+ * 3. **没有另一个参数可解析的可用调用** —— 有的话照常报 `tool-calls` 让它执行，
+ *    没理由因一个坏块把可用的那些一起作废（实测线上形态正是「一个无名 + 一个
+ *    合法 pwsh」）。
+ *
+ * ## ⚠️⚠️ 另外两条「不得抢格」的排除（对抗审计实测的真回归，2026-10-25 修）
+ *
+ * 这两条**不是**可选的洁癖，是语义错位 —— 两者都由上层变量传入，因为它们
+ * 各家的取值来源不同（`finishReason` / 是否收到 `[DONE]`）。
+ *
+ * | 格子 | 为什么不得报 `TOOL_ARGS_INVALID` |
+ * |---|---|
+ * | `finishReason === 'length'` | 上游**明确宣告**「输出被 max_tokens 截断」。参数结构闭合也完全可能是「正写到一半、恰好写到 `}` 但内容被截」⇒ 把它报成「模型语法写坏」**逆了本 issue 自己的初衷**（issue 要的是不要把非额度问题报成额度，反过来也不能把真截断报成语法坏），还掩盖了「真烧满额度」这一格 |
+ * | 连接被掐断（既无 `finish_reason` 也无 `[DONE]`） | 断流时参数坏**更可能是分片丢失**而非模型写坏 ⇒ 报 `max-tokens` 触发重试更稳（`openai-compat` 的 `truncatedStream` 就是这条） |
+ *
+ * ⚠️ 第一版**漏了这两条**，实测两格都被新码抢走：
+ * `坏JSON + finish=length` 与 `坏JSON + 断流` 都报出了 `TOOL_ARGS_INVALID`。
+ * 而我原来的「finish=length 不回归」用例用的是**合法** JSON ⇒ 从未覆盖这个组合，
+ * 全量测试一直是绿的。**这就是「守卫全绿不等于守卫生效」的又一实例。**
+ *
+ * ⚠️ 第 3 条的 `hasUsableToolName` 腿不可省：一个**无名**但参数合法的块本就会被
+ * 丢弃（各家的 `droppedUnnamedCalls`），不该让它把整步从 `error` 拽回 `max-tokens`。
+ *
+ * ⚠️ `emittedProse` 必须由调用方传**同一个**已在用的值：四家对它的定义时机不同
+ * （`openai-compat` 是 DSML 清洗之后的产物），本函数不替调用方做选择。
+ *
+ * @param invalidCount - 被判 `invalid` 的块数（调用方用 `classifyToolArguments` 算）。
+ * @param emittedProse - 本步**最终发出**的正文（`block-end` 的权威文本）。
+ * @param blocks - 全部工具块（只用到 `name` 与 `text`）。
+ * @param upstreamTruncated - 上游是否**已宣告**被截断：`finishReason === 'length'`，
+ *   或「既无 `finish_reason` 也无 `[DONE]`」（连接被掐断）。任一成立即让位给
+ *   `max-tokens`。
+ */
+export declare function toolArgsInvalidIsSoleOutput(invalidCount: number, emittedProse: string, blocks: Iterable<{
+    readonly name?: string;
+    readonly text: string;
+}>, upstreamTruncated: boolean): boolean;
+/**
+ * 把「被判 invalid 的坏块」映射成 {@link toolArgsInvalidFailure} 的入参。
+ *
+ * 与上一个函数同一条理由：四处各写一遍 `map(entry => ({ name: entry.block.name,
+ * chars: entry.block.text.length }))` 是同一份语义的 N 份实现。
+ *
+ * ⚠️ 用 `text.length`（**字符数**）而不是 `Buffer.byteLength`：这是给用户看的
+ * 「这次调用有多长」，与 issue 里实测的「4757 字符」同一口径。
+ */
+export declare function toolArgsInvalidBlocks(entries: Iterable<{
+    readonly block: {
+        readonly name?: string;
+        readonly text: string;
+    };
+}>): Array<{
+    name: string | undefined;
+    chars: number;
+}>;
+/**
+ * 构造「工具参数不是合法 JSON」的**失败原因**（`finish` 报 `error`）。
+ *
+ * ## 文案要回答用户的三个问题
+ *
+ * 1. **真实原因**：参数不是合法 JSON，且**显式否认**「输出 token 上限」与
+ *    「网络中断」—— 这两个是用户最可能的错误猜想（前者来自那条固定 i18n）；
+ * 2. **具体是什么**：工具名 + 字符数（让用户能定位是哪一次调用）；
+ * 3. **该做什么**：直接重试即可；连续出现才换模型 / 缩小调用跨度。
+ *
+ * ⚠️ 文案里**不得**出现 Markdown 强调符：错误 message 是**纯文本**渲染，
+ * `**不是**` 会原样显示成四个星号。与 `contentRejectionError` 同一条纪律。
+ *
+ * @param blocks - 坏掉的工具参数块（工具名 + 字符数）。
+ */
+export declare function toolArgsInvalidFailure(blocks: readonly {
+    readonly name: string | undefined;
+    readonly chars: number;
+}[]): {
+    message: string;
+    code: string;
+};
+/**
  * 思考死循环中止的**错误码**。
  *
  * ## 为什么不复用 `max-tokens`（真实缺陷，Gitee !IKIZNK）

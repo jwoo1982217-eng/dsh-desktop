@@ -342,3 +342,35 @@ describe('★ M9：原型链键不得被当成登记项（全分支终审）', (
     }
   })
 })
+
+describe('magicrew（超级麦吉国内站，2026-10-29）：qwen 归一化补丁', () => {
+  /**
+   * ⚠️⚠️ 与 accio 那条**逐格同形**，但成因相反：accio 是「id 是代号、展示名有空格」，
+   * magicrew 是「**id 本身就带连字符**」。
+   *
+   * | 渠道 | 上游 id | 归一化后 | 与既有键同键？ |
+   * |---|---|---|---|
+   * | loomy / trae / qoder | `qwen3.8-flash` | `qwen3-8-flash` | —（既有键） |
+   * | magicrew（不加补丁） | `qwen-3.8-flash` | `qwen-3-8-flash` | ❌ **多一个连字符** |
+   *
+   * ⇒ 同一模型两个键 ⇒ 聚合的「Qwen3.8-Flash 轮换列表」里看不到 magicrew
+   *（症状**静默**：它只是不在候选表里）。故必须在 `CANONICAL_OVERRIDES` 里
+   * 显式指到既有键。
+   */
+  it('★ magicrew 的 qwen-3.8-flash 被并到既有键 qwen3-8-flash（否则聚合里看不到它）', () => {
+    // 上游 id 带连字符 ⇒ 归一化成 qwen-3-8-flash（多一个连字符）⇒ 与其它渠道分裂
+    expect(canonicalKeyFor('magicrew', 'qwen-3.8-flash', 'Qwen3.8 Flash')?.key)
+      .toBe('qwen3-8-flash')
+    // 判据是**跨渠道同键**（不是字符串相等）：与 loomy 的既有键逐字相同。
+    expect(canonicalKeyFor('magicrew', 'qwen-3.8-flash', 'Qwen3.8 Flash')?.key)
+      .toBe(canonicalKeyFor('loomy', 'qwen3.8-flash', 'qwen 3.8 flash · x0.8')?.key)
+    // 归属来源必须是 patch（人工实测结论），不是靠 id 通道撞出来的
+    expect(canonicalKeyFor('magicrew', 'qwen-3.8-flash', 'Qwen3.8 Flash')?.via).toBe('patch')
+    // 反面：其余 26 个不需要补丁，归一化结果本来就一致
+    expect(canonicalKeyFor('magicrew', 'deepseek-v4.1-flash', 'DeepSeek V4.1 Flash')?.via)
+      .toBe('id')
+    // 且它的键与既有渠道逐字一致（否则「不登记」这句话就是空话）
+    expect(canonicalKeyFor('magicrew', 'deepseek-v4.1-flash', 'DeepSeek V4.1 Flash')?.key)
+      .toBe(canonicalKeyFor('buddy', 'deepseek-v4.1-flash', 'Deepseek-V4.1-Flash')?.key)
+  })
+})

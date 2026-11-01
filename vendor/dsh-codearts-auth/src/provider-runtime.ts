@@ -84,7 +84,9 @@ import type {
  * |---|---|---|
  * | `accountPool` | **2 处** | ✅ **活的**：`provider-credits.ts` 里 TRAE 的 `claim` 读写设备指纹代次（这是 `claim` 必须收 `entry` 的唯一理由）|
  * | `resolveCredential` | **0 处** | 实现侧目前都自带凭据解析路径（各 auth / 适配器有各自的 `resolveCredential` 选项），未经本字段 |
- * | `warn` | **0 处** | 实现侧改用 `console.warn`（如 `buddy-growth.ts` 的 `user_id` 缺失告警）**绕过了**本出口 |
+ * | `warn` | **2 处** | AutoClaw 的 `claim`（2026-10-27 起：刷新失败 / 轮换落盘失败必须出声）；其余实现仍用 `console.warn` 绕过本出口 |
+ * | `persistCredential` | **1 处** | AutoClaw 的 `claim`（2026-10-27 新增：刷新**轮换**出的 `refresh_token` 必须写回，否则账号续期能力被逐日烧掉）|
+ * | `accountId` | **1 处** | Gemini 的出口代理选择 |
  *
  * ⚠️ **`resolveCredential` / `warn` 零读取是「尚无」而非「无用」**：
  * 两者都是实现侧**本该**走的共享入口（`warn` 尤其 —— 绕过它意味着告警不进宿主
@@ -107,6 +109,28 @@ export interface ProviderCallContext {
    * **不得**猜一个账号去用它的出口（那是把请求发到错误的出口上）。
    */
   readonly accountId?: string
+  /**
+   * 把**续期/刷新后**的凭据写回 store（2026-10-27 新增，Gitee PR #153 审计 P0）。
+   *
+   * ## 为什么需要它
+   *
+   * `claim` 这类能力内部会做「刷新 token 以制造一次登录事件」（AutoClaw 的活动
+   * 奖励由**登录事件**触发）。而刷新**可能轮换 `refresh_token`**（OAuth 2.1 RTR）
+   * —— 一旦轮换而新值没人接住，旧值立即作废 ⇒ 账号的续期能力被**逐日烧掉**，
+   * 表现为 `RefreshTokenExpiredError` → `refreshable:false` → 要求重登，
+   * 而重登拿到的 token 又会在下一次刷到时被同样烧掉。
+   *
+   * ⚠️ 判据不是我猜的：`src/jet-hub-rpc.ts` 的续期注释明写「续期**会轮换**
+   * refresh_token」，同 provider 的 `autoclaw-auth.ts` 那条腿**会**
+   * `credentials.set` 落盘 ⇒ 同一字段两套口径；而
+   * `docs/agent-notes/providers-autoclaw.md` 把「续期端点是否仍接受这批
+   * refresh_token」登记为**未测**。⇒ 给刷新腿一条正规的落盘出口，
+   * 让它与既有续期腿同源，而不是各自决定要不要存。
+   *
+   * ⚠️ 与 {@link resolveCredential} **同源**：两者都按 ref 名操作，实现方
+   * 与调用方共用同一套 ref 约定（不要自己拼 ref）。
+   */
+  readonly persistCredential?: (refName: string, value: string) => Promise<void>
 }
 
 /**

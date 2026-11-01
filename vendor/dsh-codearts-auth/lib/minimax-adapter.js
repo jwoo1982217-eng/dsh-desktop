@@ -37,7 +37,20 @@ import { describeMinimaxGeoRoute, minimaxInferHeadersFor } from './minimax.js';
 import { planSessionTitleThinking } from './session-title.js';
 import { registerAdapterIdempotent, } from './llm-register-compat.js';
 import { buildMinimaxMessagesPayload, consumeMinimaxSse, } from './minimax-messages.js';
-import { isMinimaxExpired, minimaxFallbackEntries, minimaxFetch, } from './minimax.js';
+import { isMinimaxExpiringWithin, minimaxFallbackEntries, minimaxFetch, } from './minimax.js';
+/**
+ * 请求前预判的**最小剩余有效期**（2026-10-24 本地试验版）。
+ *
+ * 旧判据是 `isMinimaxExpired`（已过期才续）—— 401 都发出去一轮了才补。
+ * 改成「剩余不足 60s 就先续」，与官方 `oauth-core` 的
+ * `getAccessToken({minValidityMs})` 同语义：让 token 在**临死前**换新，
+ * 而不是让用户的请求撞在正在死掉的 token 上。60s 取官方 30s 的两倍宽：
+ * 一次续期 grant 实测 ~300ms，60s 足够覆盖慢网络下的整轮续期。
+ *
+ * ⚠️ 巡检（60s tick、5min margin）正常在跑时，这里的命中应**接近于零**；
+ * 命中变多说明巡检没跟上（宿主刚唤醒 / 巡检被阻塞），它兜的是那个底。
+ */
+const MINIMAX_ONDEMAND_MIN_VALIDITY_MS = 60_000;
 /**
  * 前缀识别「必须 adaptive thinking」的模型。
  *
@@ -367,6 +380,26 @@ export class MinimaxAdapter extends LlmAdapter {
         return { id, name: this.product.displayName };
     }
     /**
+     * 取**某个账号**该走的 fetcher（MiniMax 国际站代理支持）。
+     *
+     * ⚠️⚠️ **必须按账号现取，不能在构造 / 循环外固化**：本适配器在一轮请求内会
+     * **换号**（限流 / 额度时 `getAvailableAccount` 换人），出口必须跟着换 ——
+     * 固化一份会让换号后**仍走旧账号的出口**（症状「换了号还是被分流」，零报错）。
+     *
+     * ⚠️ 优先级：`fetchImpl`（单测替身）> `fetchFor(accountId)` > 全局 `fetch`。
+     * 未注入 `fetchFor`（中国站 / 旧接线）⇒ 恒走既有路径，**行为逐字节不变**。
+     *
+     * ⚠️ 空账号 id（`''`）= 直连：`fetchFor` 的解析器按「空 id = 没配代理」处理
+     * （见 `minimax-proxy.ts`）—— 拿不到账号时不该去查一个空 id。
+     */
+    fetcherFor(accountId) {
+        if (this.options.fetchImpl !== undefined)
+            return this.options.fetchImpl;
+        if (this.options.fetchFor !== undefined)
+            return this.options.fetchFor(accountId);
+        return fetch;
+    }
+    /**
      * 取远端模型目录；**失败时不把兜底表写进缓存**。
      *
      * ⚠ 原实现是 `this.remoteModels = fallback; return fallback` —— 把兜底表当成
@@ -513,22 +546,59 @@ export class MinimaxAdapter extends LlmAdapter {
          */
         let geoRouted = false;
         let credential = await this.options.resolveCredential(options.model);
-        if (credential === undefined || isMinimaxExpired(credential)) {
-            await this.options.refresh();
-            credential = await this.options.resolveCredential(options.model);
+        if (credential === undefined || isMinimaxExpiringWithin(credential, MINIMAX_ONDEMAND_MIN_VALIDITY_MS)) {
+            /**
+             * ⚠️⚠️ **续期失败不得让请求直接死掉**（2026-10-27 审计修）。
+             *
+             * ## 修前的缺陷
+             *
+             * 这里是裸 `await this.options.refresh()`。而 `isMinimaxExpiringWithin`
+             * 是 **fail-open** 的（读不到 `expires_at` ⇒ 返回 `true` = 该续）
+             * ⇒ 对于「凭据缺 / 非法 `expires_at`」的账号，**每个请求**都会走到这里；
+             * 一旦续期抛错，请求**一次上游都不发**就失败了。
+             *
+             * 实测（构造一条无 `expires_at` 的凭据 + refresh 抛 `invalid_grant`）：
+             * `fetch` 调用 **0 次**、请求直接失败 —— 而旧判据（`isMinimaxExpired`）
+             * 会正常放行，让请求用掉最后那段时间。
+             *
+             * ## 修法：降级为「用现有凭据继续发」
+             *
+             * 手上有 `credential` 且 `access_token` 非空 ⇒ 先发出去，让**上游**来否决
+             * （它才是权威）。401 之后下面还有一条专门的「401 先续期再重发」路径兜底，
+             * 那一步的 `refresh()` 失败会正确地报 `AUTH`。
+             *
+             * ⚠️ 这一格**不会**掩盖真终态：续期失败的原因会进 `warn`（含 error message），
+             *   且 401 兜底那条路径仍按原语义分类。它只把「预判失败」与「请求失败」
+             *   解耦 —— 预判是**优化**，不该是**门禁**。
+             */
+            try {
+                await this.options.refresh();
+                credential = await this.options.resolveCredential(options.model);
+            }
+            catch (error) {
+                if (credential === undefined || credential.access_token === '') {
+                    // 手上根本没有可用凭据 ⇒ 只能报错（与原行为一致）
+                    throw error;
+                }
+                this.options.warn?.(`[minimax] 请求前预判续期失败，改用现有凭据继续发送（由上游判定是否有效）：`
+                    + `${error instanceof Error ? error.message : String(error)}`);
+            }
         }
         if (credential === undefined || credential.access_token === '') {
             throw new LlmError('minimax: no usable credential; log in first', 'MISSING_CREDENTIAL');
         }
         /**
-         * 本次请求实际使用的账号 id（请求级轮换的记账键）。语义与 loomy / raccoon 同款：
-         * 按 access_token 反查池内条目；单凭据回退时保持空串（无池即无「下一个号」，
-         * 轮换自然失效，不误标）。
+         * 本次请求实际使用的账号 id（请求级轮换的记账键 **且是取出口的键**）。
+         * 语义与 loomy / raccoon 同款：按 access_token 反查池内条目；单凭据回退时
+         * 保持空串（无池即无「下一个号」，轮换自然失效，不误标）。
          *
          * ⚠️ 反查的第二参是**凭据内容**而不是 ref 名（传 ref 名会恒匹配失败且**静默**）。
+         *
+         * ⚠️ `accountIdOverride` **优先于**反查：探测路径拿不到池，只能靠调用方
+         * 显式说明「我代表这个账号」（见该字段的注释）。
          */
-        let activeAccountId = '';
-        if (this.options.accountPool) {
+        let activeAccountId = this.options.accountIdOverride ?? '';
+        if (activeAccountId === '' && this.options.accountPool) {
             try {
                 activeAccountId = await this.options.accountPool.findAccountIdByCredential(this.product.id, credential.access_token) ?? '';
             }
@@ -670,15 +740,31 @@ export class MinimaxAdapter extends LlmAdapter {
              * `this.options.accountPool?.minimaxXff()` 会在那种替身上抛 `TypeError`
              * （`?.` 只挡 `null`/`undefined`，挡不住「对象上没有这个方法」）。
              * 实测后果：`minimax-adapter.spec.ts` 的轮换组 16 条用例全红。
+             *
+             * ⚠️ **探测路径（无池）必须仍能拿到 XFF**：探测适配器刻意不传
+             * `accountPool`（既定语义：不写任何标记），那 XFF 就读不到 ⇒ 大陆出口
+             * 的「测试」恒 307→401，与「凭据失效」同形（2026-10-24 活体实测：
+             * 用户已设 XFF，`account.test` 仍报 invalid access token）。
+             * 故提供 `xffOverride`：探测槽显式传入池里的当前值 —— 它是**只读**的
+             * 展示性设置，探测带它不违反「不写状态」的语义。
              */
             const pool = this.options.accountPool;
-            const xff = typeof pool?.minimaxXff === 'function' ? pool.minimaxXff() : undefined;
+            const xff = this.options.xffOverride
+                ?? (typeof pool?.minimaxXff === 'function' ? pool.minimaxXff() : undefined);
             return minimaxFetch(`${this.product.apiHost}${MINIMAX_INFER_PATH}`, () => ({
                 method: 'POST',
                 headers: minimaxInferHeadersFor(current, xff, this.product.id),
                 body: JSON.stringify(payload),
                 signal: options.signal,
             }), {
+                /**
+                 * ⚠️ **推理主路径必须走该账号的出口**（国际站代理）。
+                 *
+                 * `send()` 会被**多次**调用（401 续期后重发、轮换换号后重发），故这里
+                 * 必须**每次按当时的 `activeAccountId` 现取** fetcher —— 在闭包外固化
+                 * 一份会让换号后**仍走旧账号的出口**（症状「换了号还是被分流」，零报错）。
+                 */
+                fetcher: this.fetcherFor(activeAccountId),
                 signal: options.signal,
                 // 记下「地理路由」：跟随后 401 与「凭据失效」同形，只能在此刻判。
                 onGeoRoute: () => { geoRouted = true; },
@@ -766,11 +852,38 @@ export class MinimaxAdapter extends LlmAdapter {
          *
          * 必要性：本家凭据可能被服务端提前撤销而本地 `expiresAt` 仍在未来 —— 只靠
          * 上面的过期预判不会续期，401 会白打一轮。
+         *
+         * ⚠️⚠️ **续期失败必须分类处理**（2026-10-27 第二轮审计打穿）：
+         * `minimax-auth` 的续期会抛 `MinimaxRefreshTokenExpiredError`（RT 确实已死）。
+         * 那种情形下正确的出口是**把「请重新登录」这条指路文案传出去**，而不是吞成
+         * `AUTH` —— `AUTH` 会被客户端替换成固定文案「API 密钥无效」并丢掉原文
+         *（本仓库的既有纪律：`IKLBSH`，凡「文案本身就是出路」的错误必须避开 `AUTH`）。
+         *
+         * ⚠️ 同时留一条 warn，让「续期失败」与「续了但没用」可分。
          */
         if (response.status === 401 || response.status === 403) {
-            await this.options.refresh();
-            const refreshed = await this.options.resolveCredential(options.model);
+            let refreshError;
+            try {
+                await this.options.refresh();
+            }
+            catch (error) {
+                refreshError = error;
+                this.options.warn?.(`[minimax] 401 后按需续期失败：${error instanceof Error ? error.message : String(error)}`);
+            }
+            const refreshed = refreshError === undefined
+                ? await this.options.resolveCredential(options.model)
+                : undefined;
             if (refreshed === undefined || refreshed.access_token.length === 0) {
+                /**
+                 * ⚠️ 终态（RT 已死）⇒ 抛出**带指路文案**的错误，**不用 `AUTH`**。
+                 * 其余情形（续期成功了但拿不到凭据 / 网络类失败）仍按原 `AUTH` 口径 ——
+                 * 那是「凭据暂时取不到」，与「需要重新登录」是两件事。
+                 */
+                const terminal = refreshError !== undefined
+                    && refreshError.name === 'MinimaxRefreshTokenExpiredError';
+                if (terminal) {
+                    throw new LlmError(`minimax: refresh_token 已失效，请重新登录（${refreshError instanceof Error ? refreshError.message : String(refreshError)}）`, 'INVALID_REQUEST', { status: response.status });
+                }
                 throw new LlmError('minimax: credential expired and refresh failed', 'AUTH', { status: response.status });
             }
             credential = refreshed;
@@ -987,6 +1100,10 @@ export function registerMinimaxLlm(ctx, options) {
         // ⚠️ 注入**唯一**的广播实现（`src/catalog-broadcast.ts`），不要在这里
         // 另写一份 emit —— 两份实现必然漂移（issue IKJVTF 的缺陷① 就是「十处全漏」）。
         onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+        // ⚠️ 告警必须真的能被看见（2026-10-27 审计）：`warn` 承载
+        // 「预判续期失败 → 降级发送」这条**静默风险**，缺省退回 `console.warn`
+        // 而不是吞掉（与 autoclaw / astudio 同约定）。
+        warn: options.warn ?? ((message) => { ctx.logger.warn(message); }),
     });
     registerAdapterIdempotent(ctx.llm, [product.id], adapter);
     return adapter;

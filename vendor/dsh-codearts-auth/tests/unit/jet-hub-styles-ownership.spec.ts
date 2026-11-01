@@ -55,7 +55,19 @@ const require = createRequire(import.meta.url)
 const PACKAGE_ID = (JSON.parse(readFileSync(resolve(REPO_ROOT, 'package.json'), 'utf8')) as { name: string }).name
 
 interface StyleHost {
-  claimStyles: (id: string) => string[]
+  /**
+   * 宿主认领样式的入口。
+   *
+   * ⚠️⚠️ **第二个参数 `before` 是宿主 2026-10 新增的**（2026-10-21 定位）：
+   * 宿主把 `claimStyles` 从 `(id)` 改成 `(id, before)` —— `before` 是
+   * 「factory 执行**之前**就存在的无主 `<style>` 集合」，宿主只认领
+   * 「无主**且不在 before 里**」的那些（让 factory 自己注入的无主标签归它）。
+   *
+   * ⚠️ 对**本插件无影响**：我们注入的标签**带 `data-plugin` 署名**
+   * ⇒ 根本不在 `untaggedStyles()` 里 ⇒ 永不被认领 ⇒ `before` 参数与我们无关。
+   * 但**测试**必须跟上宿主签名，否则会连锁出三处失效（见 `extractHostBehavior`）。
+   */
+  claimStyles: (id: string, before?: Set<unknown>) => string[]
   removeOwnedStyles: (id: string) => void
 }
 
@@ -64,17 +76,42 @@ interface StyleHost {
  *
  * 抽取失败（宿主改名 / 重构）时返回 null，让用例走内联实现并**明确报告**
  * 「本次没验到宿主真身」，而不是静默降级。
+ *
+ * ## ⚠️⚠️ 抽取正则必须**容忍宿主改签名**（2026-10-21 定位并修）
+ *
+ * 宿主把 `claimStyles` 从 `(id) => {` 改成了 `(id, before) => {`（新增 `before`
+ * 参数，见 `StyleHost` 的注释）⇒ 原正则 `/const claimStyles = \(id\) => \{…\}/`
+ * **匹配不上** ⇒ `extractHostBehavior()` 返回 `null`
+ * ⇒ ①「宿主真身与内联实现同结论」那条对拍用例被**静默 skip**（vitest 输出里的
+ * `↓`），②「扫描面有效性」那条用例红。
+ *
+ * ⇒ 教训（本仓已记录过同型）：**抽取正则绑死签名 = 宿主一改签名就静默降级**。
+ * ⇒ 修法：参数表用 `[^)]*` 宽松匹配，**只锚住函数名与箭头**。
  */
 function extractHostBehavior(): StyleHost | null {
   const path = locateHostClient()
   if (path === null) return null
   const source = readFileSync(path, 'utf8')
-  const claim = source.match(/const claimStyles = \(id(?:, before)?\) => \{[\s\S]*?\n\t+\};/)
-  const snapshot = source.match(/const untaggedStyles = [^\n]+;/)
-  const remove = source.match(/function removeOwnedStyles\(id\) \{[\s\S]*?\n\t+\}/)
+  // ⚠️ 参数表用 `[^)]*`（不写死 `(id)`）⇒ 宿主加参数时不至于整条失效。
+  const claim = source.match(/const claimStyles = \([^)]*\) => \{[\s\S]*?\n\t+\};/)
+  const remove = source.match(/function removeOwnedStyles\([^)]*\) \{[\s\S]*?\n\t+\}/)
   if (!claim || !remove) return null
   try {
-    return new Function(`${snapshot?.[0] ?? ''}\n${claim[0]}\n${remove[0]}\nreturn { claimStyles: id => claimStyles(id, new Set()), removeOwnedStyles }`)() as StyleHost
+    // ⚠️⚠️ **必须连宿主真身的辅助函数一起抽**（2026-10-21 定位并修）：
+    // 宿主新的 `claimStyles` 依赖同作用域的 `untaggedStyles` 辅助函数
+    // （`document.querySelectorAll("style:not([data-plugin])")` 的包装）。
+    // 只抽 `claimStyles` 本身 ⇒ 求值时抛 `ReferenceError: untaggedStyles is not defined`
+    // ⇒ 被下面的 `catch` 吞掉、返回 `null` ⇒ **对拍用例被静默 skip**
+    // （vitest 输出里的 `↓`）—— 与「抽不出来」**同一种失败**，却更难察觉。
+    // ⇒ 判据：抽出来的源码里若引用了 `untaggedStyles`，就把它一并抽出来。
+    const needsUntagged = /\buntaggedStyles\b/.test(claim[0])
+    const untagged = needsUntagged
+      ? source.match(/const untaggedStyles = \([^)]*\) => [\s\S]*?;\n/)
+      : null
+    if (needsUntagged && untagged === null) return null
+    return new Function(
+      `${untagged?.[0] ?? ''}\n${claim[0]}\n${remove[0]}\nreturn { claimStyles, removeOwnedStyles }`,
+    )() as StyleHost
   } catch {
     return null
   }
@@ -85,14 +122,24 @@ const hostBehavior = extractHostBehavior()
 /**
  * 内联的**同语义**实现 —— 逐条对应宿主 `lib/client.js`：
  *
- * - `claimStyles`：`for (const el of querySelectorAll('style:not([data-plugin])'))`
- *   `el.setAttribute('data-plugin', id)`；
+ * - `claimStyles(id, before)`：`for (const el of querySelectorAll('style:not([data-plugin])'))`
+ *   **只认领不在 `before` 里的**（`before` = factory 执行前就存在的无主标签集合）
+ *   ⇒ `el.setAttribute('data-plugin', id)`；
  * - `removeOwnedStyles`：`for (const el of querySelectorAll('style[data-plugin]'))`
  *   `if (el.getAttribute('data-plugin') === id) el.remove()`。
+ *
+ * ⚠️⚠️ **必须与宿主当前的签名与语义逐条对齐**（2026-10-21 定位并修）：
+ * 宿主给 `claimStyles` 加了 `before` 参数（见 `StyleHost` 的注释）。
+ * 内联实现若**不**认 `before`（把 `before` 里的标签也认领了）⇒ 对拍用例
+ * 「宿主真身与内联实现同结论」会**变红** —— 那正是它该抓的漂移。
  */
 const inlineBehavior: StyleHost = {
-  claimStyles(id) {
-    for (const el of document.querySelectorAll('style:not([data-plugin])')) el.setAttribute('data-plugin', id)
+  claimStyles(id, before) {
+    for (const el of document.querySelectorAll('style:not([data-plugin])')) {
+      // ⚠️ 宿主语义：只认领「factory 期间新出现的」无主标签。
+      if (before !== undefined && before.has(el)) continue
+      el.setAttribute('data-plugin', id)
+    }
     const owned: string[] = []
     for (const el of document.querySelectorAll(`style[data-plugin=${JSON.stringify(id)}]`)) {
       owned.push(el.getAttribute('data-plugin-css') ?? id)
@@ -369,7 +416,21 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
     expect(source, '宿主认领的判据必须仍是「无主」').toContain('style:not([data-plugin])')
     expect(source, '宿主必须按 data-plugin 精确匹配来删除')
       .toMatch(/querySelectorAll\("style\[data-plugin\]"\)[\s\S]{0,80}?getAttribute\("data-plugin"\) === id/)
-    expect(source, '宿主必须在 factory 之后认领样式').toMatch(/factory\([\s\S]{0,120}?claimStyles\(ownerId(?:, before)?\)/)
+    // ⚠️⚠️ **判据改成「顺序」而非「字符距离」**（2026-10-21 定位并修）：
+    // 旧正则 `/factory\([\s\S]{0,120}?claimStyles\(ownerId\)/` 锚的是**两个调用
+    // 之间隔了多少字符** ⇒ 宿主把 `claimStyles(ownerId)` 改成
+    // `claimStyles(ownerId, before)`（多 8 个字符、且中间多了 `styles:` 一段）后，
+    // 那 120 字符的窗口**装不下了** ⇒ 断言变红 —— 而宿主的**语义没变**
+    // （仍是「factory 执行完之后才认领」）。
+    //
+    // ⇒ 锚点改为「`factory(...)` 的调用结果出现在 `claimStyles(...)` **之前**」，
+    //   不再关心中间隔了多少字符 ⇒ 宿主加参数不会误伤，而**顺序颠倒仍会被抓住**。
+    const factoryAt = source.indexOf('registered.factory(')
+    const claimAt = source.indexOf('claimStyles(ownerId')
+    expect(
+      factoryAt >= 0 && claimAt > factoryAt,
+      '宿主必须在 factory 之后认领样式（factory 的调用结果先于 claimStyles 出现）',
+    ).toBe(true)
     // 两个函数都能被抽取出来（抽取失败时对拍会静默降级，这里挡住）
     expect(hostBehavior, `已定位 ${path} 却未能抽出归属函数`).not.toBeNull()
   })
@@ -380,6 +441,14 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
   itWithHost('宿主真身与内联实现同结论（防「我们只是在测自己的想象」）', async () => {
     await withDom(async () => {
       // 同一批报文喂两个实现，断言逐条同结论
+      //
+      // ⚠️⚠️ **`before` 必须按宿主真实调用点传**（2026-10-21 定位并修）：
+      // 宿主现在在 `materialize()` 里先取 `const before = untaggedStyles()`、
+      // 再调 `claimStyles(ownerId, before)` ⇒ `before` 是「factory 执行**之前**
+      // 就存在的无主标签集合」。
+      // ⚠️ 不传它 ⇒ 宿主真身抛 `TypeError: Cannot read properties of undefined
+      // (reading 'has')`（`before.has(el)`），而内联实现不抛 ⇒ 两侧结论不同形
+      // ⇒ 对拍用例**变红**（但那是「调用方式不对」而非「语义漂移」）。
       const run = (host: StyleHost) => {
         head.children.length = 0
         const owned = makeElement('style')
@@ -390,7 +459,9 @@ describe('Jet Hub 样式表归属（IKK764）', () => {
         unowned.textContent = '.b{}' // 无主
         head.children.push(unowned)
 
-        const claimed = host.claimStyles('owner-b')
+        // ⚠️ 宿主真身要求 `before` 是**元素集合**（`Set`，用 `.has(el)` 判成员）。
+        const before = new Set<unknown>(head.children.filter(el => el.getAttribute('data-plugin') === null))
+        const claimed = host.claimStyles('owner-b', before)
         const afterClaim = styleTags().map(e => e.getAttribute('data-plugin'))
         host.removeOwnedStyles('owner-b')
         return { claimed, afterClaim, remaining: styleTags().map(e => e.getAttribute('data-plugin')) }

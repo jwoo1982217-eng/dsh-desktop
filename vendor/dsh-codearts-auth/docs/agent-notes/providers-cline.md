@@ -2072,3 +2072,70 @@ empty / 列表四个分支**全部**在 modalBody 里，只有 modalHead / modal
 三轮有界**，客户端两个轮询（5 秒 `readActiveProvider`、60 秒余额）都是**纯内存读**、
 不触达宿主目录重建。故周期数字**未定案**；但缺陷本身与周期无关：任何一次模型选择器
 打开 / 目录事件都会吃满一次 N² 重建。
+
+---
+
+## ⚠️⚠️ 审计补记（2026-10-21，!138 合并后 5 路 subagent 审计）
+
+完整报告：`docs/audit/pr135-138-merge-audit.md`。
+
+### 真缺陷（**未修**，已登记）：`maxTokens` 只有一个来源 ⇒ 系统性缺口 ≈482 个模型
+
+!138 补了 `cline-free/minimax-m3.1-flash` 的 `maxTokens`（点状修复，正确且真下发），
+但**故障链对其它模型逐字成立**：
+
+**机制**（代码事实，不是推断）—— cline 的 `maxTokens` **只来自 4 条静态表条目**：
+
+- `parseEntryList`（`src/cline-models.ts`）只取 `{id, name, description}`，
+  **把 `maxTokens` / `contextWindow` 直接丢弃**（下游即便下发也进不来）；
+- `mergeClineModels` 只从 `fallback` 取；
+- `cline-models-dev.ts` 口径 3 **刻意不取** `limit.output`
+  （理由：本仓有过「据印象填大值 → 400」的事故 ⇒ 保守选择，**不是疏忽**）。
+
+**实测（2026-10-21 匿名只读 GET `recommended-models`，HTTP 200，未用凭据）**：
+
+```
+free 6 条：cline-free/minimax-m3.1-flash, reflection/beam-free,
+           cline-free/nemotron-3.5-super-vl, nvidia/nemotron-3.5-lightning-free,
+           poolside/laguna-s-2.1-free, cline-free/solar-mini4
+recommended 6 / clinePass 13 / clineCloud 1
+⇒ **全表每条只有 {id,name,description,tags}，maxTokens 零命中**
+```
+
+⇒ free 6 条里**只有 `minimax-m3.1-flash` 在静态表里** ⇒ 另 **5 条拿不到
+`maxTokens`** ⇒ 请求体不发 `max_tokens` ⇒ 退回网关默认 **4096**
+⇒ 长回答 `finish_reason=length` **静默截断**。加上 `/api/v1/models` 的 460 条
+按量模型 ⇒ 同类缺口 **≈482 个**。
+
+⚠️ 另：静态表 4 条 free 里 **3 条已不在 live free 数组**
+（`stealth/space-bunny-alpha`、`cline-free/mimo-v2.6-flash`、
+`cline-free/muse-spark-1.3-contributor`）。本文件上面的规矩是
+「表里有而远端已撤的必须同步删掉」，**这次没执行**。
+风险面：远端失败时兜底表整表生效 ⇒ 用户看到已下架的免费模型。
+⚠️ 是否真 404 **未实测**（需凭据）。
+
+### ⚠️ 新增守卫的**射程**（这条比缺陷本身更该记）
+
+`tests/unit/cline.spec.ts` 新增的「兜底表里每个免费模型都声明了 maxTokens」
+只遍历**表自己的条目** —— 而本次故障是「**模型压根不在表里**」。
+
+**变异实测**：整条删除新条目（= PR 前形态）⇒ **该守卫仍全绿**
+（只有被 !138 改了期望值的**快照用例**变红）。
+⇒ 「直接锁死本条故障链」的说法**不成立**：快照守住了**这一个实例**，
+**类别**（远端新增免费模型）无人守。
+
+另：`filter(m => m.maxTokens === undefined)` 放过 `0 / -1 / NaN`，
+而它们与 `undefined` **后果完全相同**（`Number.isSafeInteger && > 0` 都丢掉）
+⇒ 正是本仓记过的「「守卫有牙」≠「取值域正确」」。
+
+### 正确的修法方向（**不是**继续补表）
+
+让**远端/模型元数据成为来源**：`parseEntryList` 透出 `maxTokens`/`contextWindow`
+并让远端优先；或给「兜底表没有 + 远端不下发」的模型一个**经实测的**保守默认值。
+⚠️ 后者要先验「哪个值不会被网关 400」——本仓在 gemini 上踩过
+「照抄邻居的 131072 ⇒ `supported range is from 1 to 65537`」。
+⚠️ 本 PR 的 `131072` 对**本模型**未实测（提交信息只测到 32768），
+且提交信息引用的本文件那段说的**恰恰相反**（那正是 400 事故，
+结论是「兜底表数值**凭印象填**」）。
+⚠️ 本 PR 引的 5 个 `scripts/probe-cline-*.mjs` **全仓不存在**
+⇒ 提交信息里的「实测」无入库脚本可复现。

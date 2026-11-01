@@ -134,8 +134,16 @@ export interface ModelCatalogConfig {
      * 反之若把 `buddy` 统一成 `['text']`，会**静默关掉图片能力**（见
      * `CatalogEntry.inputModalities` 的说明）。
      * ⇒ **两个方向都会出真缺陷，故本回调必须逐家提供**，骨架不替各家决定。
+     *
+     * ⚠️⚠️ **必须传 `modelId`**（2026-10-21 接 codearts 图片时踩到）：`codearts` 的
+     * VL 模型（`kimi-k2.6-vl` / `Qwen3-VL-235B`）**刻意不进对话目录**（上下文小、
+     * 不支持工具调用），但它们**能收图**、且识图工具要按 id 借它们 ⇒ 它们走的正是
+     * 本回调这条「目录外」路径。不传 id 就只能在「恒 `['text']`」与「全都给 image」
+     * 之间二选一：前者让 VL 模型永远声明不了 image（DSH 在入库阶段拒图，真缺陷），
+     * 后者让文本模型也能被发图（上游 406，每轮都失败）。
+     * ⇒ 传 id 后实现方才能**按 id 判能力**，两个方向都正确。
      */
-    unknownModelInputModalities?(): readonly ('text' | 'image')[] | undefined;
+    unknownModelInputModalities?(modelId: string): readonly ('text' | 'image')[] | undefined;
     /**
      * **目录里没有该 id** 时 `resolveModel` 该报什么思考档位。
      *
@@ -153,6 +161,33 @@ export interface ModelCatalogConfig {
      * 失去思考档位选择器（它们的档位本就与模型无关）。
      */
     unknownModelReasoning?(): LlmResolvedModelInfo['reasoning'];
+    /**
+     * **目录里没有该 id** 时 `resolveModel` 该报什么上下文窗口。
+     *
+     * ⚠️ 与上面两个回调**同一个形态**：各家处理不同，且**不能统一**。
+     *
+     * | 家 | 未知 id ⇒ | 理由 |
+     * |---|---|---|
+     * | `codearts` | **仍给具名兜底**（`CODEARTS_FALLBACK_CONTEXT_WINDOW`） | 本家目录的窗口**全部来自本地静态表**（上游端点不下发），且缺窗口会让用户的上下文占用条**整条消失**、自动压缩阈值失去唯一输入 |
+     * | 其余 | 不提供 ⇒ 未知模型**不声明** context | 多数家的窗口来自**远端该模型的**配置，未知 id 无从得知 ⇒ 编一个就是假窗口 |
+     *
+     * ⚠️ **不提供本回调 ⇒ 沿用旧行为**（`entry` 缺失时不落 `context`），
+     * 这是刻意的：本字段是为 codearts 那个真实报障加的，**不得**顺手把其余
+     * 12 家也改成「未知 id 给兜底」—— 那会给它们造出**假窗口**（分母错 ⇒ 占用比
+     * 与压缩阈值一起错，且比"不显示"更难发现）。
+     *
+     * ⚠️ 与 `CatalogEntry.contextWindow` 的关系：**后者管目录内条目，本回调管
+     * 目录外 id**，两条路径必须都覆盖，否则「选择器里能选到的」与「手填的」
+     * 会分叉（codearts 的报障正是从「目录内条目漏了」来的）。
+     *
+     * ⚠️⚠️ **必须传 `modelId`**（2026-10-21 全量测试实测踩到）：本回调最初没有入参，
+     * 于是「目录里没有该 id」时只能给一个**与模型无关**的常数 ⇒ 真实缺陷：
+     * `glm-5.3` 在静态窗口表里是 1M，却**不在静态兜底目录**（`DEFAULT_MODELS`）里
+     * ⇒ 离线/首次启动时它算「目录外 id」⇒ 拿到常数兜底 524_288 ⇒ **占用比分母错
+     * 2 倍**（而用户报障的正是这个模型）。传 `modelId` 后实现方才能做
+     * 「**表内优先、查不到才兜底**」，与目录内路径**同口径**。
+     */
+    unknownModelContextWindow?(modelId: string): number | undefined;
     /**
      * 异步读原始目录并**转换**成 `CatalogEntry[]`。
      *

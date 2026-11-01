@@ -22,7 +22,6 @@ import {
 import { CODEBUDDY } from '../../src/product.js'
 import type { BuddyCredential } from '../../src/buddy.js'
 import type { CreditBalance, CreditPackage } from '../../src/credits.js'
-
 const DAY = 24 * 60 * 60 * 1000
 const NOW = Date.UTC(2026, 9, 1, 12, 0, 0)
 
@@ -605,3 +604,122 @@ describe('pickBuddyAccount（选号 + 取凭据的编排）', () => {
     expect(result.reason).toEqual({ kind: 'exhausted' })
   })
 })
+
+/**
+ * `fetchBalanceDetailed`（带原因变体）—— 修的是**真实报障**（2026-10-21，Qoder）。
+ *
+ * 用户原话是两条互相矛盾的观察：
+ * ```
+ * 面板：连不上 https://openapi.qoder.sh（UND_ERR_CONNECT_TIMEOUT）…请导出 HTTPS_PROXY
+ * 报错：余额查询失败（凭据失效或响应异常）
+ * ```
+ * ⇒ 同一份数据，**面板说得明明白白，报错里反而无从下手**。
+ *
+ * 根因：选号这条腿只注入 `fetchBalance`（`CreditBalance | null`），`null` 把
+ * 「网络不通 / 401 / 响应缺字段 / 不是 JSON」四件事抹成同一格。
+ *
+ * ⚠️ 这些用例守的是**契约**（选号器必须把 `error` 透传出来），不是某家 provider
+ * 的文案 —— 文案在各自 `*-credits.ts` 里，由那家的 spec 守。
+ */
+describe('BuddyBalanceSelector：fetchBalanceDetailed（锁定时必须说出「为什么查不到」）', () => {
+  const pickWith = async (
+    balanceImpl: Parameters<typeof makeDetailedSelector>[0],
+    ids: readonly string[] = ['a1'],
+  ) => {
+    const { selector } = makeDetailedSelector(balanceImpl)
+    return pickBuddyAccount(selector, ids.map(account), {
+      allowPermanent: false,
+      resolveCredential: async () => ({ access_token: 'tok' }) as BuddyCredential,
+    })
+  }
+
+  it('★★ 详细变体的 error 必须原样进 reason.errors（不许退化成那句概括文案）', async () => {
+    const result = await pickWith({
+      balance: null,
+      error: '连不上 https://openapi.qoder.sh（UND_ERR_CONNECT_TIMEOUT）：请导出 HTTPS_PROXY',
+    })
+    expect(result.kind).toBe('locked')
+    // @ts-expect-error 本分支必然是 unknown（见上一行断言）
+    expect(result.reason.kind).toBe('unknown')
+    // @ts-expect-error 同上
+    expect(result.reason.errors).toEqual([
+      '连不上 https://openapi.qoder.sh（UND_ERR_CONNECT_TIMEOUT）：请导出 HTTPS_PROXY',
+    ])
+    // ⚠️ 反向断言：那句会把用户引向「查凭据」的概括文案**不得**出现
+    // @ts-expect-error 同上
+    expect(result.reason.errors.join('\n')).not.toContain('凭据失效或响应异常')
+  })
+
+  it('★ 传了详细变体就不再调 fetchBalance（严格超集，不许两条腿各查一次）', async () => {
+    const { thin } = await (async () => {
+      const calls: string[] = []
+      const selector = new BuddyBalanceSelector({
+        product: CODEBUDDY,
+        now: () => NOW,
+        resolveCredential: async () => ({ access_token: 'tok' }) as BuddyCredential,
+        fetchBalance: async () => { calls.push('thin'); return null },
+        fetchBalanceDetailed: async () => ({ balance: null, error: '查不到的原因' }),
+      })
+      await selector.select([account('a1')], { allowPermanent: false })
+      return { thin: calls }
+    })()
+    expect(thin).toEqual([])
+  })
+
+  it('详细变体给了 balance ⇒ 正常分档，error 被忽略（有余额时不该报失败）', async () => {
+    const result = await pickWith({
+      balance: balance(pkg({ remaining: 500, deductionEndTime: NOW + 3 * DAY })),
+      error: '这条不该被读到',
+    })
+    expect(result.kind).toBe('account')
+    expect(result.kind === 'account' ? result.account.id : undefined).toBe('a1')
+  })
+
+  it('⚠️ 详细变体返回 null 但**没给** error ⇒ 报「未提供具体原因」，不得回落概括文案', async () => {
+    const result = await pickWith({ balance: null })
+    expect(result.kind).toBe('locked')
+    // @ts-expect-error 同上
+    expect(result.reason.errors).toEqual(['余额查询失败（未提供具体原因）'])
+    // @ts-expect-error 同上
+    expect(result.reason.errors.join('\n')).not.toContain('凭据失效或响应异常')
+  })
+
+  it('⚠️ 详细变体**抛错**仍是「余额查询异常：<message>」（异常腿不许被吞）', async () => {
+    const result = await pickWith(new Error('boom'))
+    expect(result.kind).toBe('locked')
+    // @ts-expect-error 同上
+    expect(result.reason.errors).toEqual(['余额查询异常：boom'])
+  })
+
+  it('未传详细变体时行为不变（仍报概括文案）—— 保证既有 provider 不受影响', async () => {
+    const selector = new BuddyBalanceSelector({
+      product: CODEBUDDY,
+      now: () => NOW,
+      resolveCredential: async () => ({ access_token: 'tok' }) as BuddyCredential,
+      fetchBalance: async () => null,
+    })
+    const result = await pickBuddyAccount(selector, [account('a1')], {
+      allowPermanent: false,
+      resolveCredential: async () => ({ access_token: 'tok' }) as BuddyCredential,
+    })
+    // @ts-expect-error locked 分支一定有 reason
+    expect(result.reason.errors).toEqual(['余额查询失败（凭据失效或响应异常）'])
+  })
+})
+
+/** 只注入 `fetchBalanceDetailed` 的选号器（`balanceImpl` 为 `Error` 时抛错）。 */
+function makeDetailedSelector(
+  balanceImpl: { balance: CreditBalance | null; error?: string } | Error,
+) {
+  return {
+    selector: new BuddyBalanceSelector({
+      product: CODEBUDDY,
+      now: () => NOW,
+      resolveCredential: async () => ({ access_token: 'tok' }) as BuddyCredential,
+      fetchBalanceDetailed: async () => {
+        if (balanceImpl instanceof Error) throw balanceImpl
+        return balanceImpl
+      },
+    }),
+  }
+}

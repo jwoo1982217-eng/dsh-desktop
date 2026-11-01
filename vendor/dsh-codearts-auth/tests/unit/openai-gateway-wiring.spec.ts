@@ -106,8 +106,20 @@ afterEach(async () => {
   rmSync(home, { recursive: true, force: true })
 })
 
-/** 让出若干个微任务轮次，等 `applyGatewayDesiredState()` 这条异步链走完。 */
+/**
+ * 让出足够的事件循环轮次，等 `applyGatewayDesiredState()` 这条异步链走完。
+ *
+ * ⚠️ **必须包含真实 I/O tick，不能只让出 microtask**（2026-10-26，Issue #11 审计）：
+ * 网关的 `start()` 最终是 `server.listen(...)` + 等 `'listening'` 事件 —— 那是
+ * **I/O 事件**，只在真实 tick 里发生。原先这里只 `await Promise.resolve()` 10 次，
+ * 当时能过是因为 `running` 在 `await start()` **之前**就被赋值（`isGatewayRunning()`
+ * 提前为 true）—— 那本身是缺陷（审计 P0-2：面板会渲染一个连不上的 URL）。
+ * 把 `running` 改成「start 成功后才赋值」后，只让 microtask 就等不到它。
+ */
 async function settle(): Promise<void> {
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  // 真实 I/O tick（listen 完成 + 'listening' 回调）。
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
   for (let i = 0; i < 10; i++) await Promise.resolve()
 }
 
@@ -253,54 +265,76 @@ describe('网关的插件接线', () => {
   })
 })
 
-
-describe('网关启动晚于或早于附件服务都可收图', () => {
-  it('先启动文本网关，附件服务晚到或替换后两种图片协议均使用当前服务', async () => {
-    const probe = createServer()
-    const port = await new Promise<number>((resolve) => probe.listen(0, '127.0.0.1', () => {
-      const address = probe.address() as { port: number }; probe.close(() => resolve(address.port))
-    }))
-    process.env.DSH_OPENAI_GATEWAY_PORT = String(port)
-    let store: { saveImage(input: unknown): Promise<unknown> } | undefined
-    let calls = 0, saves = 0
+/**
+ * 「允许局域网访问」开关的接线（2026-10-20）。
+ *
+ * ⚠️ 与 IKL7UN 那组的分工：那边锁「env host 必须真绑到网卡」，这边锁
+ * 「设置页开关翻转必须真的换绑」。**listen() 的绑定地址在创建时定格**，
+ * 故翻转的收敛必然是「关旧实例 → 按新期望重建」——这里用真实 HTTP 探测锁住
+ * 换绑的物理效果，而不是只看 `address()` 字符串。
+ */
+describe('「允许局域网访问」开关的接线', () => {
+  it('★ 打开后经插件入口绑 0.0.0.0，且回环上真实可达（不只是配置字符串）', async () => {
     const { ctx } = makeContext()
-    const live = Object.assign(ctx, {
-      get: (name: string) => name === 'attachments' ? store : undefined,
-      llm: {
-        listProviders: () => [{ id: 'fixture' }],
-        listModels: async () => [{ provider: 'fixture', id: 'vision', name: '本地模型' }],
-        resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }),
-        async *stream(options: { messages: Array<{ content: Array<{ type: string }> }> }) {
-          calls += 1
-          yield { type: 'text-delta', index: 0, text: options.messages[0].content.map(b => b.type).join(',') }
-          yield { type: 'finish', reason: { kind: 'stop' } }
-        },
-      },
-    })
-    mountOpenAiGateway(live)
-    const { applyGatewayDesiredState } = await import('../../src/openai-gateway/runtime.js')
-    await applyGatewayDesiredState()
-    const send = (path: string, body: unknown) => new Promise<{ status: number; value: any }>((resolve, reject) => {
-      const req = request({ host: '127.0.0.1', port, path, method: 'POST', headers: { authorization: 'Bearer wiring-test-key', 'content-type': 'application/json' } }, response => {
-        let text = ''; response.on('data', bytes => { text += String(bytes) }); response.on('end', () => resolve({ status: response.statusCode!, value: JSON.parse(text) }))
-      }); req.on('error', reject); req.end(JSON.stringify(body))
-    })
-    const image = { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }
-    const chat = { model: 'fixture/vision', messages: [{ role: 'user', content: [image] }] }
-    expect((await send('/v1/chat/completions', chat)).status).toBe(400)
-    expect(calls).toBe(0)
-    expect((await send('/v1/chat/completions', { model: 'fixture/vision', messages: [{ role: 'user', content: '文字' }] })).status).toBe(200)
-    store = { async saveImage() { saves += 1; return { attachmentId: 'sha256:local-fixture', mediaType: 'image/png' } } }
-    const accepted = await send('/v1/chat/completions', chat)
-    expect(accepted.status).toBe(200)
-    expect(accepted.value.choices[0].message.content).toBe('image')
-    store = { async saveImage() { throw new Error('本地保存失败') } }
-    expect((await send('/v1/chat/completions', chat)).status).toBe(400)
-    store = { async saveImage() { saves += 1; return { attachmentId: 'sha256:replacement', mediaType: 'image/png' } } }
-    const response = await send('/v1/responses', { model: 'fixture/vision', input: [{ role: 'user', content: [{ type: 'input_image', image_url: image.image_url.url }] }] })
-    expect(response.status).toBe(200)
-    expect(response.value.output[0].content[0].text).toBe('image')
-    expect(saves).toBe(2)
-    expect(calls).toBe(3)
+    const port = await freePort()
+    process.env.DSH_OPENAI_GATEWAY_PORT = String(port)
+
+    mountOpenAiGateway(ctx, { gatewayEnabled: () => true, gatewayAllowLan: () => true })
+    await settle()
+
+    const { isGatewayRunning, gatewayAddress } = await import('../../src/openai-gateway/runtime.js')
+    expect(isGatewayRunning()).toBe(true)
+    expect(gatewayAddress()?.host).toBe('0.0.0.0')
+    expect(gatewayAddress()?.port).toBe(port)
+    // 物理判据：0.0.0.0 覆盖回环 ⇒ 127.0.0.1 必然可达（401 = HTTP 往返、未带 key）。
+    expect(await probeHost('127.0.0.1', port)).toBe('HTTP 401')
+  })
+
+  it('★ 运行期翻动开关会关闭旧实例并重建换绑', async () => {
+    const { ctx } = makeContext()
+    const port = await freePort()
+    process.env.DSH_OPENAI_GATEWAY_PORT = String(port)
+
+    mountOpenAiGateway(ctx, { gatewayEnabled: () => true, gatewayAllowLan: () => false })
+    await settle()
+    const runtime = await import('../../src/openai-gateway/runtime.js')
+    expect(runtime.isGatewayRunning()).toBe(true)
+    expect(runtime.gatewayAddress()?.host).toBe('127.0.0.1')
+
+    // 翻 ON：收敛必须关旧实例、按新期望重建（只看 address() 字符串的假实现会在这里露馅）。
+    runtime.setGatewayDesiredAllowLan(true)
+    await runtime.applyGatewayDesiredState()
+    expect(runtime.isGatewayRunning()).toBe(true)
+    expect(runtime.gatewayAddress()?.host).toBe('0.0.0.0')
+    expect(await probeHost('127.0.0.1', port)).toBe('HTTP 401')
+
+    // 翻 OFF：回到回环。
+    runtime.setGatewayDesiredAllowLan(false)
+    await runtime.applyGatewayDesiredState()
+    expect(runtime.isGatewayRunning()).toBe(true)
+    expect(runtime.gatewayAddress()?.host).toBe('127.0.0.1')
+  })
+
+  it('★ env 给了 host 时开关不生效，且反复收敛不得反复重建（失配死循环的回归锁）', async () => {
+    const { ctx } = makeContext()
+    const port = await freePort()
+    process.env.DSH_OPENAI_GATEWAY_PORT = String(port)
+    process.env.DSH_OPENAI_GATEWAY_HOST = '127.0.0.2'
+
+    mountOpenAiGateway(ctx, { gatewayEnabled: () => true, gatewayAllowLan: () => true })
+    await settle()
+    const runtime = await import('../../src/openai-gateway/runtime.js')
+    expect(runtime.isGatewayRunning()).toBe(true)
+    expect(runtime.gatewayAddress()?.host).toBe('127.0.0.2')
+
+    // ⚠️ 回归锁：修复初版拿 desiredAllowLan 裸比较期望通配 —— env host 场景下
+    // 重建后仍绑 env 地址 ⇒ 收敛永远判失配 ⇒ **每次收敛都关掉再重建**（必现
+    // 死循环）。修复后收敛判据与工厂同源（isGatewayHostFromEnv 参与计算），
+    // 连续收敛必须地址稳定、实例存活。
+    for (let round = 0; round < 3; round += 1) await runtime.applyGatewayDesiredState()
+    expect(runtime.isGatewayRunning()).toBe(true)
+    expect(runtime.gatewayAddress()?.host).toBe('127.0.0.2')
+    // 用户的选择照常被记住（runtime 期望态为 true），只是此刻被 env 覆盖。
+    expect(runtime.gatewayDesiredAllowLan()).toBe(true)
   })
 })

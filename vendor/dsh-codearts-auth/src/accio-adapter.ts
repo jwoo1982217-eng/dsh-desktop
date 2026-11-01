@@ -416,8 +416,44 @@ export function toAccioWireMessages(
   }
 
   const wire: Array<Record<string, unknown>> = []
+  /**
+   * 待发的「工具结果内嵌图片」—— **跨消息累积**（2026-10-21 修，与 trae 同因）。
+   *
+   * ⚠️⚠️ **原实现把它声明在循环体内、并在每条消息末尾无条件 flush** ⇒ 当一个
+   * assistant 发 **≥2 个 `tool_call`**、且**非最后一个**结果内嵌图片时，图片被 push
+   * 成一条独立 user 消息**插在两条 `functionResponse` 之间** ⇒ 配对约束被破坏。
+   *
+   * ⚠️ 该约束本文件自己逐字记过（见上面 `deferred` 的注释）：「Accio 是 Gemini 风格
+   * ⇒ **函数响应必须紧跟发起该调用的 model 消息** —— 中间插任何东西都会破坏配对」，
+   * 并引用了 `trae-adapter.ts` 的 4027 事故。⇒ 这次修的是**同一条约束的第二个入口**：
+   * `deferred` 只守住了「本条自己的正文/图片」，**没守住工具结果内嵌图的跨消息批处理**。
+   *
+   * ⚠️ 实测（修复前，2 个 tool_call、图在第 1 个结果里）：
+   * ```
+   * model[functionCall×2] → user[functionResponse] → user[图片] → user[functionResponse]
+   *                                                   ↑ 插在配对之间
+   * ```
+   * 对照：同一夹具喂共享实现 `openai-compat.ts`（10 家共用）得
+   * `assistant → tool → tool → user`（相邻、正确）⇒ 缺陷只在**本文件自己的**组装里。
+   * ⚠️ trae 那次是用户报障（4027 明确报错）；本家是 Gemini 形态，配对破裂的**上游表现
+   * 未实测**（可能报错、也可能被静默丢弃）⇒ 两种都不可接受。
+   *
+   * ⇒ 只在两处落地：① 进入下一条 assistant 之前；② 循环结束之后。
+   */
+  const pending: Array<Record<string, unknown>> = []
+  /** 把累积的图片作为一条 user 消息发出（**幂等**：无挂起时 no-op）。 */
+  const flushToolImages = (): void => {
+    if (pending.length === 0) return
+    // `functionResponse` 只吃 `responseJson` 字符串，没有承载图的位置 ⇒ 只能单独成条。
+    wire.push({ role: 'user', content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pending] })
+    pending.length = 0
+  }
   for (const message of normalized) {
     if (message.role === 'assistant') {
+      // ⚠️ **进入新的 assistant 之前必须 flush**（2026-10-21 修）：上一批工具结果
+      // **已经全部下发完毕**（`role:'tool'` 只会紧跟其 assistant）⇒ 此时落地安全，
+      // 且不会过界到下一批。⚠️ 不在这里 flush 会让图片一直挂到循环结束、被挤到更后面。
+      flushToolImages()
       const content = Array.isArray(message.content) ? message.content : []
       const toolCalls = content
         .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
@@ -501,7 +537,6 @@ export function toAccioWireMessages(
       }
     }
     if (hasOwn && !deferred) wire.push(ownFrame())
-    const pending: Array<Record<string, unknown>> = []
     for (const result of toolResults) {
       const id = String(result.toolCallId)
       // 丢弃孤儿工具结果（没有对应 tool_call 同样会被上游拒绝）。
@@ -518,12 +553,13 @@ export function toAccioWireMessages(
     }
     // 延后的本消息正文/图片：排在 `role:'tool'` **之后**（成因见上 `deferred`）。
     if (deferred && hasOwn) wire.push(ownFrame())
-    // 工具结果内嵌图片：同样排在 `role:'tool'` **之后**的独立 user 消息
-    //（`functionResponse` 只吃 `responseJson` 字符串，没有承载图的位置）。
-    if (pending.length > 0) {
-      wire.push({ role: 'user', content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pending] })
-    }
+    // ⚠️⚠️ **这里绝不能无条件 flush**（2026-10-21 修）：原实现在每条消息末尾都发一次
+    // ⇒ 同一批工具结果里**非最后一个**结果的图会被插到下一条 `role:'tool'` 之前
+    //（实测：`user[functionResponse] → user[图片] → user[functionResponse]`）。
+    // ⇒ 图片改为跨消息累积，只在「进入下一条 assistant 前」与「循环收尾」两处落地。
   }
+  // 循环收尾：把最后一批挂起的图片发出去（此时所有 tool 消息已下发完毕）。
+  flushToolImages()
   return wire
 }
 

@@ -29,7 +29,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { BuddyBalanceSelector } from '../../src/buddy-balance-selector.js'
-import { createCredentialResolver } from '../../src/credential-resolver.js'
+import { createCredentialResolver, NO_FREE_MODEL } from '../../src/credential-resolver.js'
 import type { BuddyCredential } from '../../src/buddy.js'
 import type { CreditBalance } from '../../src/credits.js'
 import type { LoomyCredential } from '../../src/loomy.js'
@@ -567,9 +567,12 @@ describe('createCredentialResolver 与旧闭包对拍', () => {
             selector,
             lockedError,
             reportPickedAccount: reportOnPick,
-            ...config.isFreeModel === undefined
-              ? {}
-              : { isFreeModel: async () => config.isFreeModel === true },
+            // ⚠️ `isFreeModel` 现为**必填**（原为可选，见 `NO_FREE_MODEL` 的事故
+            //    说明）：未声明免费的对拍组用 `NO_FREE_MODEL`，与参照实现里
+            //    `config.isFreeModel === true` 为假时走付费路径**逐字等价**。
+            isFreeModel: config.isFreeModel === undefined
+              ? NO_FREE_MODEL
+              : async () => config.isFreeModel === true,
           },
           fallback: { kind: 'ref', refName: FALLBACK },
         },

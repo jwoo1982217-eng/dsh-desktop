@@ -44,16 +44,45 @@ describe('Cline 产品配置', () => {
   })
 
   it('兜底表含远端 free 数组的全部免费模型', () => {
-    // 远端 `recommended-models` 的 free 数组实测（2026-10-05 复测，共 **3** 个）。
+    // 远端 `recommended-models` 的 free 数组实测（**2026-10-21 复测，共 6 个**）。
+    //
     // ⚠️ 本表是**编译期快照**，上游每撤一个免费模型就要同步一次，已发生两次：
     // `gemini-3.8-flash`（2026-10-03）、`deepseek-v4.1-flash`（2026-10-05）——
     // 直连它们都回 `404 model not found`，故两处保持一致、都删掉。
+    //
+    // ⚠️ 本断言只覆盖**兜底表里有的那些**：远端 free 数组（2026-10-21 实测 6 个）
+    //   还有 `reflection/beam-free`、`cline-free/nemotron-3.5-super-vl`、
+    //   `nvidia/nemotron-3.5-lightning-free`、`poolside/laguna-s-2.1-free`、
+    //   `cline-free/solar-mini4` **不在**本表里 —— 兜底表**不必**收全远端 free 集，
+    //   它只收「内嵌目录没有、且我们需要给它补元数据」的条目。
+    //   反过来，**表里有而远端已撤的**才是必须同步删掉的（否则复活下架模型）。
+    //
+    // 2026-10-21 新增 `cline-free/minimax-m3.1-flash`：它**在册**（远端 free 数组
+    // 里正有），但此前不在本表 ⇒ 拿不到 `maxTokens` ⇒ 宿主拿不到
+    // `defaultMaxTokens` ⇒ 请求体不带 `max_tokens` ⇒ 退回 cline 网关默认 4096
+    // ⇒ 长回答被静默截断（`finish_reason=length`）。详见 `cline-product.ts` 该条注释。
     const freeIds = CLINE.fallbackModels.filter((m) => m.isFree === true).map((m) => m.id)
     expect(freeIds.sort()).toEqual([
       'cline-free/mimo-v2.6-flash',
+      'cline-free/minimax-m3.1-flash',
       'cline-free/muse-spark-1.3-contributor',
       'stealth/space-bunny-alpha',
     ].sort())
+  })
+
+  it('兜底表里每个免费模型都声明了 maxTokens（否则会退回网关默认值）', () => {
+    // ⚠️ 这条是**回归守卫**（2026-10-21 加）：远端 `recommended-models` **不下发**
+    // `maxTokens`（实测 6 个 free 模型全部只有 `{id,name,description,tags}`），
+    // 而 `mergeClineModels` 的 `build()` 里 `maxTokens` **只**取自本兜底表。
+    // ⇒ 本表某条缺 `maxTokens` ⇒ catalog entry 缺它 ⇒ 宿主桥接不出
+    //   `defaultMaxTokens` ⇒ 请求体**整个不发** `max_tokens`
+    // ⇒ 退回网关自己的默认值（cline 网关实测 4096，且 `finish=length` 静默截断）。
+    //
+    // 见 `cline-product.ts` 里 `cline-free/minimax-m3.1-flash` 那条的完整故障链。
+    const missing = CLINE.fallbackModels
+      .filter((m) => m.maxTokens === undefined)
+      .map((m) => m.id)
+    expect(missing).toEqual([])
   })
 
   it('兜底表 id 唯一', () => {
@@ -138,7 +167,7 @@ describe('parseClineTokenPayload', () => {
     success: true,
     data: {
       accessToken: 'workos:eyJhbGciOiJSUzI1NiIs',
-      refreshToken: 'tmgEeM2rd9ybYoWpXl8JqUfvK',
+      refreshToken: 'synthetic-cline-refresh-fixture-0000',
       expiresAt: '2026-09-25T05:23:47.000Z',
       tokenType: 'Bearer',
       userInfo: {
@@ -154,7 +183,7 @@ describe('parseClineTokenPayload', () => {
   it('解析 {success, data} 信封（字段是驼峰）', () => {
     const payload = parseClineTokenPayload(envelope)
     expect(payload.accessToken).toBe('workos:eyJhbGciOiJSUzI1NiIs')
-    expect(payload.refreshToken).toBe('tmgEeM2rd9ybYoWpXl8JqUfvK')
+    expect(payload.refreshToken).toBe('synthetic-cline-refresh-fixture-0000')
     expect(payload.expiresAt).toBe(Date.parse('2026-09-25T05:23:47.000Z'))
     expect(payload.accountId).toBe('usr-01M3BCV4FYCGJKAWD3MJG3DBQM')
     expect(payload.email).toBe('ijetlee@163.com')

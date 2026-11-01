@@ -54,7 +54,7 @@ describe('buddy fetchAuthState', () => {
     expect(result).toEqual({ state: STATE, authUrl: AUTH_URL })
     // 必须带 platform=ide 查询参数与免鉴权头。
     const [url, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
-    expect(url).toContain('platform=ide')
+    expect(url).toContain('platform=workbuddy')
     expect((init.headers as Record<string, string>)['X-No-Authorization']).toBe('true')
   })
 
@@ -460,7 +460,7 @@ describe('buddy fetchModels', () => {
 
   // 回归（Task 3 审查遗留）：默认仍发 codebuddy 身份，传 WorkBuddy 时必须
   // 换成 workbuddy —— 否则 WorkBuddy 会拿 CodeBuddy 的产品码请求 /v3/config。
-  it('默认以 codebuddy 身份请求 /v3/config', async () => {
+  it('默认以国内 WorkBuddy 身份请求 /v3/config', async () => {
     const fetcher = routeFetch([{
       when: () => true,
       respond: () => new Response(JSON.stringify({ data: { agents: [{ name: 'craft', models: [] }] } }), { status: 200 }),
@@ -468,8 +468,8 @@ describe('buddy fetchModels', () => {
     await fetchModels(makeCredential(), fetcher)
     const [, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
     const headers = init.headers as Record<string, string>
-    expect(headers['X-Product-Code']).toBe('codebuddy')
-    expect(headers['User-Agent']).toBe('CodeBuddyIDE/1.106.1')
+    expect(headers['X-Product-Code']).toBe('workbuddy')
+    expect(headers['User-Agent']).toBe(CODEBUDDY.userAgent)
     // X-Product 是部署类型，两个产品共用 SaaS。
     expect(headers['X-Product']).toBe('SaaS')
   })
@@ -729,7 +729,7 @@ describe('buddy runBuddyLoginFlow', () => {
         }), { status: 200 }),
       },
       {
-        when: (url) => url.includes('/login/account'),
+        when: (url) => url.endsWith('/v2/plugin/account'),
         respond: () => new Response(JSON.stringify({ code: 0, data: { uid: 'u1', nickname: 'nick', enterpriseId: '', type: 'personal' } }), { status: 200 }),
       },
     ])
@@ -740,8 +740,11 @@ describe('buddy runBuddyLoginFlow', () => {
       openBrowser: (url) => { opened.push(url) },
     })
 
-    expect(opened).toEqual([AUTH_URL])
-    expect(result.loginUrl).toBe(AUTH_URL)
+    expect(opened).toHaveLength(1)
+    const openedLogin = new URL(opened[0])
+    expect(openedLogin.searchParams.get('state')).toBe(STATE)
+    expect(openedLogin.searchParams.get('version')).toBe(CODEBUDDY.pluginVersion)
+    expect(result.loginUrl).toBe(opened[0])
     expect(result.refreshable).toBe(true)
     expect(result.expires).toBe(Date.parse('2026-08-30T00:00:00Z'))
     const credential = JSON.parse(result.access) as BuddyCredential
@@ -763,7 +766,7 @@ describe('buddy runBuddyLoginFlow', () => {
 })
 
 describe('产品参数化', () => {
-  it('fetchAuthState 默认使用 CodeBuddy 的 platform=ide', async () => {
+  it('fetchAuthState 默认使用国内 WorkBuddy 的 platform=workbuddy', async () => {
     const fetcher = routeFetch([{
       when: (url) => url.includes('/auth/state'),
       respond: () => new Response(JSON.stringify({
@@ -772,7 +775,7 @@ describe('产品参数化', () => {
     }])
     await fetchAuthState(fetcher)
     const [url] = (fetcher as unknown as { mock: { calls: Array<[string]> } }).mock.calls[0]
-    expect(url).toContain('platform=ide')
+    expect(url).toContain('platform=workbuddy')
   })
 
   it('fetchAuthState 传入 WorkBuddy 配置时使用 platform=workbuddy', async () => {
@@ -787,7 +790,7 @@ describe('产品参数化', () => {
     expect(url).toContain('platform=workbuddy')
   })
 
-  it('runBuddyLoginFlow 在 CodeBuddy 下不追加 version/loginSessionId', async () => {
+  it('runBuddyLoginFlow 在国内 WorkBuddy 下追加版本与会话参数', async () => {
     let openedUrl = ''
     const fetcher = routeFetch([
       {
@@ -803,7 +806,7 @@ describe('产品参数化', () => {
         }), { status: 200 }),
       },
       {
-        when: (url) => url.includes('/login/account'),
+        when: (url) => url.endsWith('/v2/plugin/account'),
         respond: () => new Response(JSON.stringify({ code: 0, data: { uid: 'u', nickname: 'n', type: 'personal' } }), { status: 200 }),
       },
     ])
@@ -811,8 +814,8 @@ describe('产品参数化', () => {
       fetcher, pollIntervalMs: 0, product: CODEBUDDY,
       openBrowser: (url) => { openedUrl = url },
     })
-    expect(openedUrl).not.toContain('loginSessionId')
-    expect(openedUrl).not.toContain('version=')
+    expect(openedUrl).toContain('loginSessionId=')
+    expect(openedUrl).toContain('version=5.8.3')
   })
 
   it('runBuddyLoginFlow 在 WorkBuddy 下追加 version 与 loginSessionId', async () => {
@@ -898,7 +901,7 @@ describe('decorateLoginUrl', () => {
 
   it('appendSessionParams 为 false 时原样返回同一个字符串', () => {
     const authUrl = 'https://copilot.tencent.com/login?platform=ide&state=S'
-    expect(decorateLoginUrl(authUrl, CODEBUDDY)).toBe(authUrl)
+    expect(decorateLoginUrl(authUrl, { ...CODEBUDDY, appendSessionParams: false })).toBe(authUrl)
   })
 
   it('URL 非法时原样返回', () => {

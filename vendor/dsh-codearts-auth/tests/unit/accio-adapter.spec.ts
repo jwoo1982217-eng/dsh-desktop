@@ -1069,6 +1069,89 @@ describe('AccioAdapter · 图片（issue IKLR7V 接线）', () => {
     expect(JSON.stringify(contents[imageIdx]!.parts)).toContain('tool result')
   })
 
+  /**
+   * ⚠️⚠️ **一个 assistant 发多个 `tool_call` 时，全部 `functionResponse` 必须紧密相邻**
+   * （2026-10-21 合并审计发现，与 trae 的 4027 同一条约束的**第二个入口**）。
+   *
+   * ## 缺陷
+   *
+   * 原实现把 `pending` 声明在**循环体内**、并在**每条消息末尾**无条件 flush
+   * ⇒ 当一个 assistant 发 ≥2 个 `tool_call`、且**非最后一个**结果内嵌图片时，
+   * 图片被 push 成一条独立 user 消息**插在两条 `functionResponse` 之间**。
+   *
+   * 实测（修复前，最终 Gemini 形态）：
+   * ```
+   * model[functionCall×2] → user[functionResponse] → user[图片] → user[functionResponse]
+   *                                                   ↑ 插在配对之间
+   * ```
+   * 对照：**同一夹具**喂共享实现 `openai-compat.ts`（10 家共用）得
+   * `assistant → tool → tool → user`（相邻、正确）⇒ 缺陷只在**本文件自己的**组装里。
+   *
+   * ⚠️ 该约束本文件自己的 `deferred` 注释已逐字记过（「Accio 是 Gemini 风格 ⇒
+   * **函数响应必须紧跟发起该调用的 model 消息** —— 中间插任何东西都会破坏配对」，
+   * 并引用了 trae 的 4027 事故）—— 但 `deferred` 只守住了「本条自己的正文/图片」，
+   * **没守住工具结果内嵌图的跨消息批处理**。
+   *
+   * ## 为什么既有用例（上面那条「图片必须排到 role:tool 之后」）抓不到
+   *
+   * 它的夹具只有 **1 个** `tool_call` ⇒ 「处理完这条消息」= 「处理完这批工具结果」，
+   * 无条件 flush 恰好安全 ⇒ 对多调用路径**零判别力**（实测：修复前该用例仍绿）。
+   *
+   * 变异：把 `flushToolImages()` 改回「每条消息末尾无条件调用」⇒ 本条红
+   * （修前实测报 `第二条 functionResponse 必须紧邻第一条… expected 3 to be 2`）。
+   */
+  it('⚠️⚠️ 多个 tool_call 且「非最后一个」结果内嵌图片时，全部 functionResponse 必须紧密相邻', async () => {
+    const { adapter, fetcher } = makeAdapter({
+      responses: [okResponse()],
+      readImage: async () => ({ data: PNG_BYTES, mediaType: 'image/png' }),
+    })
+    await collect(adapter, {
+      ...BASIC_OPTIONS,
+      messages: [
+        { role: 'user', content: '看图并读文件' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', id: 'c_img', name: 'screenshot', arguments: '{}' },
+            { type: 'tool-call', id: 'c_txt', name: 'read', arguments: '{}' },
+          ],
+        },
+        // ⚠️ 图片在**第一个**结果里（= 缺陷格）。
+        {
+          role: 'tool',
+          toolCallId: 'c_img',
+          content: [
+            { type: 'text', text: '截图如下' },
+            { type: 'image', attachment: { attachmentId: 'att-nested', width: 16, height: 16 } },
+          ],
+        },
+        { role: 'tool', toolCallId: 'c_txt', content: [{ type: 'text', text: '文件内容' }] },
+      ],
+    } as unknown as GenerateOptions)
+
+    const contents = sentBody(fetcher).contents as Array<{
+      role: string
+      parts: Array<Record<string, unknown>>
+    }>
+    const isFunctionResponse = (c: { parts: Array<Record<string, unknown>> }): boolean =>
+      c.parts.some((p) => p.function_response !== undefined)
+    const responseIdx = contents
+      .map((c, i) => (isFunctionResponse(c) ? i : -1))
+      .filter((i) => i >= 0)
+
+    expect(responseIdx.length, '两条 functionResponse 都必须下发').toBe(2)
+    // 🔴 核心断言：两条 `functionResponse` 必须**紧挨着**，中间不得插入任何消息
+    //（尤其带图的 user 消息）—— Gemini 要求函数响应紧跟发起该调用的 model 消息。
+    expect(
+      responseIdx[1],
+      '★★ 第二条 functionResponse 必须紧邻第一条，中间不得插入 user 消息',
+    ).toBe(responseIdx[0]! + 1)
+    // 图片不得静默丢失，且必须排在**所有** functionResponse 之后。
+    const imageIdx = contents.findIndex((c) => c.parts.some((p) => p.inline_data !== undefined))
+    expect(imageIdx, '⚠️ 内嵌图片不得被静默丢弃').toBeGreaterThanOrEqual(0)
+    expect(imageIdx, '⚠️ 图片必须排在全部 functionResponse 之后').toBeGreaterThan(responseIdx[1]!)
+  })
+
   it('⚠️⚠️ 0.1.5 包裹形态里**第二层**的嵌套图片也必须被提升（递归的判别用例）', async () => {
     // ⚠️ 这条是**判别用例**：图片在 `tool-result` 块的 `content` 里（真正的第二层），
     // 且该块被包在一条 **user** 消息里（0.1.5 形状）。只扫顶层 `message.content` 的

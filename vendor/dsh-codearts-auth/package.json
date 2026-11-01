@@ -4,10 +4,10 @@
   "description": "DeepSeek Harness plugin: one hub for AI coding providers — account login, multi-account pools, silent credential refresh, credit claiming, and a local OpenAI-compatible gateway",
   "type": "module",
   "main": "lib/index.js",
-  "types": "lib/types/index.d.ts",
+  "types": "lib/index.d.ts",
   "exports": {
     ".": {
-      "types": "./lib/types/index.d.ts",
+      "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
     "./client": "./lib/client/jet-hub.js",
@@ -17,18 +17,20 @@
   "files": [
     "lib",
     "locale/*.json",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "customization-contract.json",
+    "scripts/verify-customizations.mjs"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:client": "node plugin-src/client/build.mjs",
     "build:assets": "node scripts/copy-assets.mjs",
     "qoder:wasm": "node scripts/extract-qoder-wasm.mjs",
-    "build:all": "pnpm build && pnpm build:assets && pnpm build:client",
-    "prepare": "pnpm build:all",
+    "build:all": "tsc -p tsconfig.json && node scripts/copy-assets.mjs && node plugin-src/client/build.mjs && node scripts/sync-bootstrap-lib.mjs",
+    "prepare": "tsc -p tsconfig.json && node scripts/copy-assets.mjs && node plugin-src/client/build.mjs && node scripts/sync-bootstrap-lib.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:tests": "tsc -p tsconfig.tests.json",
-    "pretest": "pnpm typecheck:tests",
+    "pretest": "npm run typecheck:tests",
     "test": "vitest run",
     "test:e2e:login": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/login.e2e.spec.ts",
     "test:e2e:officeace": "cross-env DSH_OFFICEACE_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/officeace-incognito-login.e2e.spec.ts",
@@ -41,6 +43,7 @@
     "test:e2e:buddy-pool": "cross-env DSH_BUDDY_POOL_E2E=1 DSH_BUDDY_POOL_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-pool-probe.e2e.spec.ts",
     "test:e2e:buddy-conv": "cross-env DSH_BUDDY_CONV_E2E=1 DSH_BUDDY_CONV_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-conversation-headers.e2e.spec.ts",
     "test:e2e:buddy-ratelimit": "cross-env DSH_BUDDY_RATELIMIT_E2E=1 DSH_BUDDY_RATELIMIT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-ratelimit-probe.e2e.spec.ts",
+    "test:e2e:buddy-fingerprint": "cross-env DSH_BUDDY_FINGERPRINT_E2E=1 DSH_BUDDY_FINGERPRINT_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/buddy-fingerprint-roles.e2e.spec.ts",
     "test:e2e:codearts": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/v4-models.e2e.spec.ts tests/e2e/v4-large-write.e2e.spec.ts",
     "test:e2e:codearts-credits": "cross-env DSH_CODEARTS_E2E=1 vitest run --config vitest.e2e.config.ts tests/e2e/codearts-credits-probe.e2e.spec.ts",
     "test:e2e:codearts-claim": "cross-env DSH_CODEARTS_E2E=1 DSH_CODEARTS_CLAIM_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/codearts-claim-probe.e2e.spec.ts",
@@ -81,8 +84,10 @@
     "test:e2e:accio-tools": "cross-env DSH_ACCIO_TOOLS_E2E=1 DSH_ACCIO_TOOLS_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-tools-probe.e2e.spec.ts",
     "test:e2e:accio-refresh": "cross-env DSH_ACCIO_REFRESH_E2E=1 DSH_ACCIO_REFRESH_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-refresh-probe.e2e.spec.ts",
     "test:e2e:accio-image": "cross-env DSH_ACCIO_IMAGE_E2E=1 DSH_ACCIO_IMAGE_E2E_CONFIRM=yes vitest run --config vitest.e2e.config.ts tests/e2e/accio-image-probe.e2e.spec.ts",
-    "build:desktop": "tsc -p tsconfig.product.json",
-    "build:all:desktop": "pnpm build:desktop && pnpm build:assets && pnpm build:client"
+    "verify:customizations": "node scripts/verify-customizations.mjs",
+    "smoke:runtime": "node scripts/runtime-smoke.mjs",
+    "prepack": "node scripts/verify-customizations.mjs",
+    "verify:source": "node scripts/verify-customizations.mjs --source"
   },
   "dsh": {
     "bundle": {
@@ -93,7 +98,8 @@
       "inject": [
         "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-model-selection"
+        "@deepseek-ai/dsh-client-ui-model-selection",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
       ]
     }
   },
@@ -108,7 +114,8 @@
     "@deepseek-ai/cosmokit": "^1.8.5",
     "@deepseek-ai/schemastery": "^3.18.4",
     "jose": "^6.1.3",
-    "undici": "^8.11.2"
+    "undici": "^8.11.2",
+    "wreq-js": "^3.2.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
@@ -129,8 +136,19 @@
   },
   "license": "MIT",
   "dshLocalIntegration": {
-    "upstreamCommit": "78dc506cf42bb1821a20cd4378f2b81cd8de8ded",
+    "upstreamCommit": "2bf76ce66f1214f18ee3202238fb0f2d02cc791f",
     "desktopSdk": "0.2.1-alpha.4",
-    "preservesLocalFeatures": true
+    "preservesLocalFeatures": true,
+    "localCustomBaseCommit": "78dc506cf42bb1821a20cd4378f2b81cd8de8ded",
+    "preservedEmbeddedSourceBase": "9bdd34a9c5668f3daccf78305bf436b869cdfacc",
+    "desktopCustomBaseCommit": "ff16e517f27c054f05e657d8216867e02a0575bd",
+    "preservedSourceUnion": [
+      "phone-custom",
+      "desktop-custom",
+      "desktop-live-runtime",
+      "upstream-master",
+      "embedded-signed-outlet"
+    ],
+    "phoneLoginContract": "phone-browser-sms-native-callback-v1"
   }
 }

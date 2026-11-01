@@ -1,5 +1,6 @@
 import type { ApiKeySource } from './auth.js';
-import type { OpenAiGateway } from './server.js';
+import { type OpenAiGateway } from './server.js';
+import type { RpcGatewayLastError } from '../types.js';
 /**
  * 网关的**运行时控制面**：让 Jet Hub 设置页能在不重启 DSH 的情况下启停网关。
  *
@@ -42,6 +43,10 @@ export declare function registerGatewayFactory(create: GatewayFactory): void;
 export declare function gatewayDesiredEnabled(): boolean;
 /** 记录用户选择的期望状态（**不**启停，由 {@link applyGatewayDesiredState} 收敛）。 */
 export declare function setGatewayDesiredEnabled(enabled: boolean): void;
+/** 读取「允许局域网访问」的期望状态。 */
+export declare function gatewayDesiredAllowLan(): boolean;
+/** 记录「允许局域网访问」的期望状态（**不**重建实例，由收敛完成换绑）。 */
+export declare function setGatewayDesiredAllowLan(allowLan: boolean): void;
 /** 网关当前是否真的在监听端口。 */
 export declare function isGatewayRunning(): boolean;
 /** 网关当前实际监听的地址；未运行时返回 `undefined`（设置页据此显示端口）。 */
@@ -67,8 +72,27 @@ export declare function gatewayApiKey(): ApiKeySource | null;
  * 启动失败（端口冲突等）只记日志并把 `running` 复位，**不抛**——调用方是
  * 设置页的同步 handler，抛错会变成用户可见的报错弹窗，而网关失败本来就不该
  * 影响 Jet Hub 其它功能。
+ *
+ * ⚠️ **host 也是期望状态的一部分**（v7，2026-10-20）：「允许局域网访问」开关
+ * 翻转会改变监听地址，而 `listen()` 的绑定地址在创建时定格——改绑只能**关闭
+ * 旧实例再重建**。收敛判据必须与工厂**同源**（`isGatewayHostFromEnv` 参与
+ * 计算）：env 显式给了 host 时开关不生效，期望通配恒为 `false`，此时若拿
+ * `desiredAllowLan` 裸比较，会因「重建后仍绑 env 地址」而**永远失配、反复重建**。
+ *
+ * ⚠️ **本函数必须可重入**（Issue #11 审计发现）：用户连点开关时两次收敛会重叠，
+ * 而原实现是「读 `running` → 置 `undefined` → `await close()` → 重建」，两次
+ * 调用会各自持有一个旧实例、各自重建，实测事件序列为
+ * `close#1:begin → start#2 → close#1:end → start#3`（**start 2 次、close 只
+ * 完成 1 次**）⇒ 第一个实例被永久泄漏。修法是把整个收敛体串行化。
  */
 export declare function applyGatewayDesiredState(): Promise<void>;
+/**
+ * 最近一次收敛留下的「期望运行但未监听」原因（`null` = 无异常）。
+ *
+ * ⚠️ 与 `isGatewayRunning()` 配对使用：`running === false` 且本值为 `null`
+ * 表示「用户/env 主动关闭」，非 `null` 才是异常 —— 面板据此区分两种「没在跑」。
+ */
+export declare function gatewayLastError(): RpcGatewayLastError | null;
 /** 插件卸载时调用：停掉网关并清空工厂，避免热重载后残留旧实例的引用。 */
 export declare function disposeGatewayRuntime(): Promise<void>;
 export {};

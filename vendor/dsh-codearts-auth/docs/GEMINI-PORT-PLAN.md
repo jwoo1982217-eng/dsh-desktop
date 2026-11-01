@@ -108,7 +108,7 @@
 - **必需移植**:
   - OAuth 全流程(`oauth.go` 883 行,移植后约 200 行):授权 `accounts.google.com/o/oauth2/v2/auth`,
     token 端点 `oauth2.googleapis.com/token`,userinfo `www.googleapis.com/oauth2/v2/userinfo`;
-    内置 Cloud Code installed-app 公开 client_id/secret(``,
+    内置 Cloud Code installed-app 公开 client_id/secret(`<CMDC_PAK_GOOGLE_CLIENT_ID>`,
     env `CMDC_PAK_GOOGLE_CLIENT_ID/SECRET` 可覆盖);**无 PKCE**,授权 URL 参数
     `access_type=offline&prompt=consent&include_granted_scopes=true`(缺 consent 拿不到 refresh_token);
     scope 六项:`openid cloud-platform userinfo.email userinfo.profile cclog experimentsandconfigs`;

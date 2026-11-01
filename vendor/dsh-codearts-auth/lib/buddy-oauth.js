@@ -37,7 +37,13 @@ async function request(method, url, headers, options) {
         : AbortSignal.any([AbortSignal.timeout(options.timeoutMs), options.signal]);
     let response;
     try {
-        response = await options.fetcher(url, { method, headers, signal });
+        response = await options.fetcher(url, {
+            method, headers, signal,
+            ...options.jsonBody !== undefined ? {
+                headers: { ...headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify(options.jsonBody),
+            } : {},
+        });
     }
     catch (error) {
         throw new Error(`CodeBuddy ${method} ${url} network error: ${String(error)}`);
@@ -67,6 +73,7 @@ export async function fetchAuthState(fetcher = fetch, signal, product = CODEBUDD
     };
     const { status, body } = await request('POST', url, headers, {
         fetcher, timeoutMs: STATE_REQUEST_TIMEOUT_MS, ...signal !== undefined ? { signal } : {},
+        ...product.accountProtocol === 'account-scoped' ? { jsonBody: {} } : {},
     });
     if (status !== 200) {
         throw new Error(`auth/state HTTP ${status}: ${responseMessage(body)}`);
@@ -143,7 +150,10 @@ export async function loopGetToken(state, options = {}) {
 export async function getAccount(state, token, options = {}) {
     const fetcher = options.fetcher ?? fetch;
     const product = options.product ?? CODEBUDDY;
-    const url = `${product.endpoint}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(state)}`;
+    const accountScoped = product.accountProtocol === 'account-scoped';
+    const url = accountScoped
+        ? `${product.endpoint}/v2/plugin/account`
+        : `${product.endpoint}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(state)}`;
     const headers = {
         // ⚠️ `||` 而非裸 `token.domain`：token 由 `parseTokenData` → `readStringField`
         // 产出，该函数在字段缺失/类型不符时返回**空串**（不是 `undefined`），裸用会
@@ -160,8 +170,10 @@ export async function getAccount(state, token, options = {}) {
         // 的「token.domain 为空串时…」与「token.domain 非空时…」两条。
         [HTTP_HEADER_DOMAIN]: token.domain || product.apiDomain,
         Authorization: `Bearer ${token.accessToken}`,
-        [HTTP_HEADER_NO_USER_ID]: 'true',
-        [HTTP_HEADER_NO_ENTERPRISE_ID]: 'true',
+        ...accountScoped ? {} : {
+            [HTTP_HEADER_NO_USER_ID]: 'true',
+            [HTTP_HEADER_NO_ENTERPRISE_ID]: 'true',
+        },
         'User-Agent': (options.product ?? CODEBUDDY).userAgent,
     };
     const deadline = Date.now() + (options.timeoutMs ?? LOGIN_TIMEOUT_MS);
@@ -191,7 +203,7 @@ export async function getAccount(state, token, options = {}) {
         const code = responseCode(body);
         if (code === CODE_ACCOUNT_NOT_READY)
             continue;
-        throw new Error(`login/account HTTP ${status} code=${code}: ${responseMessage(body)}`);
+        throw new Error(`${accountScoped ? 'account' : 'login/account'} HTTP ${status} code=${code}: ${responseMessage(body)}`);
     }
 }
 /**
@@ -213,14 +225,16 @@ export async function refreshToken(credential, fetcher = fetch, signal, product 
         ...credentialRequestHeaders(credential),
         // credentialRequestHeaders 走的是 CodeBuddy 的 UA/域名常量，这里按产品覆盖，
         // 否则 WorkBuddy 续期时会以 CodeBuddy 的身份标识发请求。
-        [HTTP_HEADER_DOMAIN]: product.apiDomain,
+        [HTTP_HEADER_DOMAIN]: product.accountProtocol === 'account-scoped'
+            ? credential.domain || product.apiDomain : product.apiDomain,
         'User-Agent': product.userAgent,
         Authorization: `Bearer ${credential.access_token}`,
         [HTTP_HEADER_REFRESH_TOKEN]: credential.refresh_token,
-        [HTTP_HEADER_AUTH_REFRESH_SOURCE]: AUTH_REFRESH_SOURCE,
+        [HTTP_HEADER_AUTH_REFRESH_SOURCE]: product.accountProtocol === 'account-scoped' ? 'plugin' : AUTH_REFRESH_SOURCE,
     };
     const { status, body } = await request('POST', url, headers, {
         fetcher, timeoutMs: REQUEST_TIMEOUT_MS, ...signal !== undefined ? { signal } : {},
+        ...product.accountProtocol === 'account-scoped' ? { jsonBody: {} } : {},
     });
     if (status !== 200) {
         const code = responseCode(body);
@@ -465,6 +479,7 @@ export function decorateLoginUrl(authUrl, product) {
  * 与 CodeArts 的 runOAuthFlow 保持一致的分层。
  */
 export async function runBuddyLoginFlow(options = {}) {
+    options.signal?.throwIfAborted();
     const fetcher = options.fetcher ?? fetch;
     const open = options.openBrowser ?? defaultOpenBrowser;
     const product = options.product ?? CODEBUDDY;
@@ -476,7 +491,7 @@ export async function runBuddyLoginFlow(options = {}) {
     }
     else {
         // 用产品配置取 state（platform 随产品变化）
-        const result = await fetchAuthState(fetcher, undefined, product);
+        const result = await fetchAuthState(fetcher, options.signal, product);
         state = result.state;
         authUrl = result.authUrl;
         // WorkBuddy 的登录 URL 需要追加 version 与 loginSessionId；
@@ -487,6 +502,7 @@ export async function runBuddyLoginFlow(options = {}) {
     }
     const pollOptions = {
         fetcher,
+        signal: options.signal,
         ...options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {},
         ...options.pollIntervalMs !== undefined ? { pollIntervalMs: options.pollIntervalMs } : {},
         // 轮询 token / 账户两步同样带产品身份标识，否则 WorkBuddy 登录会以
@@ -495,6 +511,7 @@ export async function runBuddyLoginFlow(options = {}) {
     };
     const token = await loopGetToken(state, pollOptions);
     const account = await getAccount(state, token, pollOptions);
+    options.signal?.throwIfAborted();
     const credential = buildCredential(token, account);
     return {
         access: JSON.stringify(credential),

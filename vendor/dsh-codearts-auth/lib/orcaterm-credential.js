@@ -31,6 +31,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { desktopCredentialImportAvailable } from './login-platform.js';
 /** 钥匙串项候选（实测内置浏览器用第一个）。 */
 const KEYCHAIN_CANDIDATES = ['Chrome Safe Storage', 'Chromium Safe Storage'];
 /** 承载登录态的域，最长匹配优先。 */
@@ -112,6 +113,8 @@ function querySqlite(dbPath, sql) {
  * @returns 网页形态凭据；库缺失、无登录、或解不出可打印值时返回 null
  */
 export function harvestBrowserSession(cookieDb = defaultCookieDb()) {
+    if (!desktopCredentialImportAvailable())
+        return null;
     if (!fs.existsSync(cookieDb))
         return null;
     const password = keychainPassword();

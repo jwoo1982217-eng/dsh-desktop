@@ -361,7 +361,7 @@ describe('请求形状：与客户端原生实现对齐', () => {
     }
   })
 
-  it('buddy 渠道用 copilot.tencent.com（与插件 product.ts 一致）', async () => {
+  it('buddy 渠道用 www.workbuddy.cn（保留 buddy 路由）', async () => {
     // ⚠️ 端点前缀由**产品配置**决定，故这里必须绑 `CODEBUDDY`（不是默认的 WORKBUDDY）。
     const adapter = makeProductAdapter(CODEBUDDY)
     const run = mount({ buddy: adapter })
@@ -370,7 +370,7 @@ describe('请求形状：与客户端原生实现对齐', () => {
     try {
       await run(makeExec({ provider: 'buddy', args: { queries: ['x'] } }))
       const [url] = fetchMock.mock.calls[0]! as unknown as [string]
-      expect(url).toBe('https://copilot.tencent.com/agenttool/v1/search')
+      expect(url).toBe('https://www.workbuddy.cn/agenttool/v1/search')
     } finally {
       vi.unstubAllGlobals()
     }

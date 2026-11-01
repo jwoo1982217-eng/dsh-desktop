@@ -377,7 +377,7 @@ describe('请求指纹', () => {
     expect(seen['x-opencode-client']).toBe('cli')
   })
 
-  it('body 恒带 stream:true 与 read 门禁工具（不注入 shell）', async () => {
+  it('body 恒带 stream:true 与整套内置工具（描述已换成禁止调用）', async () => {
     let body: Record<string, unknown> = {}
     vi.stubGlobal('fetch', async (_u: string, init: RequestInit) => {
       body = JSON.parse(String(init.body)) as Record<string, unknown>
@@ -386,8 +386,9 @@ describe('请求指纹', () => {
     const a = new OpencodeAdapter({ identitySlots: async () => [ANON()] })
     await run(a)
     expect(body.stream).toBe(true)
-    const names = (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name)
-    expect(names).toEqual(['read'])
+    const tools = body.tools as Array<{ function: { name: string; description: string } }>
+    expect(tools.map((t) => t.function.name)).toEqual(['edit', 'glob', 'grep', 'question', 'read', 'shell', 'skill', 'subagent', 'webfetch', 'websearch', 'write', 'execute'])
+    expect(tools.every((t) => t.function.description === 'Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead.')).toBe(true)
   })
 
   it('同一会话内 session id 稳定（跨请求不漂移）', async () => {

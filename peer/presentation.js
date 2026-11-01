@@ -291,4 +291,20 @@
   new MutationObserver(queue).observe(document.body, { childList:true, subtree:true, attributes:true, attributeFilter:['aria-selected','title'] });
   media.addEventListener('change', queue); window.addEventListener('resize',queue); document.addEventListener('focusin',queue);
   window.visualViewport?.addEventListener('resize',queue); window.visualViewport?.addEventListener('scroll',queue); adapt();
+  if (window.__dshPeerRemote) {
+    let readingRoute = false;
+    const readRoute = async () => {
+      if (document.hidden || readingRoute) return;
+      readingRoute = true;
+      try {
+        const response = await fetch('/__dsh_peer_status', { cache: 'no-store', signal: AbortSignal.timeout(2500) });
+        if (!response.ok) return;
+        const status = await response.json(), badge = document.querySelector('.dsh-peer-badge');
+        const route = status.online ? status.route === 'lan' ? '局域网直连' : '云中继' : '连接中';
+        const text = '电脑 · ' + (window.__dshPeerName || '家里的电脑') + ' · ' + route;
+        if (badge && badge.textContent !== text) { badge.textContent = text; badge.title = text + '，任务在电脑执行；点击返回手机'; }
+      } catch {} finally { readingRoute = false; }
+    };
+    readRoute(); setInterval(readRoute, 5000); document.addEventListener('visibilitychange', readRoute);
+  }
 })();

@@ -1,0 +1,94 @@
+{
+  "name": "dsh-our-free-model",
+  "version": "2.8.0",
+  "private": true,
+  "type": "module",
+  "description": "Our Free Model — DSH owner-managed 2.8.0 integration, preserving account pools, 24 account-channel cards, routing/token savers and Android/shared-backend compatibility.",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "scripts": {
+    "pack:standalone": "node scripts/pack-standalone.mjs",
+    "test:package": "node scripts/standalone-package-test.mjs",
+    "start:standalone": "node packages/standalone/cli.mjs",
+    "test:standalone": "node scripts/standalone-test.mjs",
+    "test:management": "node scripts/standalone-management-test.mjs",
+    "build:standalone-channels": "node scripts/build-standalone-channels.mjs",
+    "build:standalone-ui": "node scripts/build-standalone-ui.mjs",
+    "typecheck:standalone": "npm --prefix packages/standalone run typecheck",
+    "test:standalone-channels": "node scripts/standalone-channels-test.mjs",
+    "test": "node scripts/test-all.mjs",
+    "test:contributor": "node scripts/test-all.mjs --mode contributor",
+    "test:release": "node scripts/test-all.mjs --mode release",
+    "manifest": "node scripts/build-manifest.mjs",
+    "channel-pack": "node scripts/build-channel-pack.mjs",
+    "manifest:check": "node scripts/build-manifest.mjs --check",
+    "selftest": "node scripts/host-selftest.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build:legacy-payload": "node scripts/build-legacy-payload.mjs"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "adapter",
+    "src",
+    "vendor/channel-pack/pack.js",
+    "vendor/channel-pack/qoder-auth-wasm.wasm",
+    "vendor/channel-pack/NOTICE.md",
+    "vendor/channel-pack/LICENSE",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "LICENSE",
+    "customization-contract.json"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "free-model",
+    "llm-provider"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2 || 4.0.5-alpha.2",
+    "@deepseek-ai/dsh-commands": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || 0.2.1-alpha.1 || 0.2.1-alpha.4",
+    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || 0.2.1-alpha.1 || 0.2.1-alpha.4",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || 0.2.1-alpha.1 || 0.2.1-alpha.4",
+    "@deepseek-ai/schemastery": "^3.18.4 || 3.18.5-alpha.2"
+  },
+  "devDependencies": {
+    "jose": "6.1.3",
+    "undici": "8.11.2",
+    "typescript": "^5.9.2",
+    "esbuild": "0.25.9",
+    "dsh-llm-legacy": "npm:@deepseek-ai/dsh-llm@0.1.5-rc.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ebony-Vinyl/dsh-our-free-model.git"
+  },
+  "dshCustomization": {
+    "id": "dsh-owner-managed-channels-mobile-v1",
+    "contract": "customization-contract.json",
+    "ofmUpstream": "999e9f784ea3ea7a11cae383b142697b1ff2c42f",
+    "jetHubUpstream": "2bf76ce66f1214f18ee3202238fb0f2d02cc791f",
+    "distribution": "locally managed; not an official upstream release-sign artifact"
+  }
+}

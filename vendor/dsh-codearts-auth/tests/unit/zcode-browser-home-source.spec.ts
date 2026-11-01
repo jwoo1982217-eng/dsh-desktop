@@ -121,8 +121,20 @@ describe('ZCode 家目录来源（行为判据）', () => {
      * ⚠ 必须把**真实的 `process.env`** 传进去 —— 这正是
      * `findBrowserExecutable()` 的调用形态（`browserCandidates()` 默认吃 `process.env`）。
      * 若只传一个干净 env，就测不到「实现会不会从 env 里偷家目录」。
+     *
+     * ⚠️⚠️ **必须注入 `exists: () => false`**（2026-10-24，IKQ4JN 修法引入的必需项）：
+     * 候选链新增了「从 `PATH` 反推 scoop 根」一档（`scoopRootFromPath`），
+     * 它**按设计**要读 `env.PATH` —— 而本用例传的是**真实** `process.env`，
+     * 于是开发机自己的 `C:\Users\<me>\scoop`（真实存在 `scoop.cmd`）会被反推出来，
+     * 排在默认 `~/scoop`（哨兵）**之前** ⇒ `list.find(c => c.includes('scoop'))`
+     * 取到反推那条、不含哨兵 ⇒ **正确实现被误判成红的**（已实测）。
+     *
+     * 注入 `exists: () => false` 让反推档自然缺席，判据回到它真正要问的问题上：
+     * **默认 `~/scoop` 那一档的家目录来自 `homedir()` 还是 `USERPROFILE`**。
+     * （「反推档本身是否正确」由 `zcode-browser-detection.spec.ts` 的
+     * 「scoop 非默认根」组逐格覆盖，两处不重叠。）
      */
-    const list = browserCandidates({ platform: 'win32', env: process.env })
+    const list = browserCandidates({ platform: 'win32', env: process.env, exists: () => false })
 
     // ① 默认 `~/scoop` 候选必须建立在**哨兵**（= `homedir()`）之上。
     const scoopCandidate = list.find((c) => c.includes('scoop'))
@@ -239,10 +251,27 @@ describe('ZCode 家目录来源（行为判据）', () => {
         list.join('\n'),
         '无参调用时不得从 process.env.USERPROFILE 取家目录（条件门绕过）',
       ).not.toContain(evilRoot)
+      /**
+       * ⚠️⚠️ **这里不能再用 `list.find(c => c.includes('scoop'))`**（2026-10-24 修正）。
+       *
+       * 候选链新增「从 `PATH` 反推 scoop 根」一档后，开发机上**真实**的
+       * `C:\Users\<me>\scoop` 会被反推出来并**排在默认 `~/scoop` 之前**
+       * （这是刻意的优先级：实测到的根 > 默认推导）。
+       * 于是 `find(...)` 取到的是反推那条、不含哨兵 ⇒ **正确实现被误判成红**
+       *（已实测：本条与上一条同时变红，而实现是对的）。
+       *
+       * ⇒ 判据改成**定点查默认那一档**：它恒为 `join(homedir(),'scoop',…)`。
+       * 反推档由 `zcode-browser-detection.spec.ts` 的「scoop 非默认根」组覆盖。
+       */
+      const defaultScoopCandidate = join(
+        MOCKED_HOME, 'scoop', 'apps', 'chromium', 'current', 'chrome.exe',
+      )
       expect(
-        list.find((c) => c.includes('scoop')),
-        '无参调用时默认家目录仍须来自 homedir()',
-      ).toContain(SENTINEL_HOME)
+        list,
+        '无参调用时默认 ~/scoop 那一档仍须来自 homedir()（哨兵）',
+      ).toContain(defaultScoopCandidate)
+      // 且它必须**真的出现在候选链里**（不是被去重逻辑连带丢掉）。
+      expect(list.filter((c) => c === defaultScoopCandidate).length).toBe(1)
 
       // ② 真正的生产出口：它内部就是无参 `browserCandidates()`。
       //    `USERPROFILE` 下那个 exe **真实存在** ⇒ 若实现读了 env，这里必然返回它。

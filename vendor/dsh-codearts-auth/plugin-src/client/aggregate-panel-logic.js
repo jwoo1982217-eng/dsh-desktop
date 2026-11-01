@@ -300,25 +300,52 @@ export function expiryLabel(expiry, nowMs = Date.now()) {
 }
 
 /**
+ * 一条候选的**结构化**展示信息（渠道 / 真实 id / 倍率 / 是否补丁）。
+ *
+ * ⚠️ 为什么要有它，而不只是 `candidateRowLabel` 那个字符串：
+ * 聚合页的候选行现在要把这四项**分成不同的视觉格子**渲染
+ * （渠道名次要色小字、模型 id 主要色、倍率进徽章、补丁进角标）——
+ * 而「从 `buddy · m · x0.15` 再 split 回来」是拿展示结果反推数据，
+ * 模型 id 里本来就含 `·` 时立刻错位（真实存在：`foo · bar` 这类 id）。
+ * ⇒ 拆分必须在这里做完，渲染层只消费字段。
+ *
+ * ⚠️ `price === Infinity` 是「无标注」的哨兵 ⇒ 这里给 `null`（不是 Infinity），
+ * 渲染层只要判 `!== null` 就够，不会有人不小心把 Infinity 拼进界面。
+ * `price === 0` 保留 0（渲染层据此显示「免费」），**不得**当假值丢掉。
+ * ⚠️ 畸形入参不抛错（面板不能因一条坏数据整体崩掉）。
+ *
+ * @param {{ provider?: string, realId?: string, price?: number, viaPatch?: boolean }} candidate
+ * @returns {{ provider: string, realId: string, price: number | null, patched: boolean }}
+ */
+export function candidateRowParts(candidate) {
+  const provider = typeof candidate?.provider === 'string' ? candidate.provider : '?'
+  const realId = typeof candidate?.realId === 'string' ? candidate.realId : '?'
+  const rawPrice = candidate?.price
+  const price = typeof rawPrice === 'number' && Number.isFinite(rawPrice) ? rawPrice : null
+  return { provider, realId, price, patched: candidate?.viaPatch === true }
+}
+
+/**
  * 一条候选的展示文案（如 `buddy · deepseek-v4.1-flash · x0.15`）。
  *
  * ⚠️ **倍率为 `Infinity` 时不显示倍率**（那是「无标注」的哨兵，直接拼进文案会让
  * 用户看到 `xInfinity` —— 明显的渲染缺陷）。倍率 `0` 显示「免费」（本仓库既有口径）。
  * ⚠️ 畸形入参不抛错：面板渲染不能因一条坏数据整体崩掉。
  *
+ * ⚠️ 本函数与 `candidateRowParts` 是**同一份判据的两种出口**（字符串 / 字段），
+ * 前者给「一行纯文本」的场景（徽标、tooltip），后者给聚合页的分格渲染。
+ * 判定逻辑只写在 `candidateRowParts` 里，这里只做拼接 —— 否则两处各改一半时
+ * 必然出现「tooltip 说不含倍率、界面却显示 xInfinity」这类分裂。
+ *
  * @param {{ provider?: string, realId?: string, price?: number, viaPatch?: boolean }} candidate
  * @returns {string}
  */
 export function candidateRowLabel(candidate) {
-  const provider = typeof candidate?.provider === 'string' ? candidate.provider : '?'
-  const realId = typeof candidate?.realId === 'string' ? candidate.realId : '?'
+  const { provider, realId, price, patched } = candidateRowParts(candidate)
   const parts = [provider, realId]
-  const price = candidate?.price
-  if (typeof price === 'number' && Number.isFinite(price)) {
-    parts.push(price === 0 ? '免费' : `x${price}`)
-  }
+  if (price !== null) parts.push(price === 0 ? '免费' : `x${price}`)
   let label = parts.join(' · ')
-  if (candidate?.viaPatch === true) label += ' ⚠️补丁'
+  if (patched) label += ' ⚠️补丁'
   return label
 }
 

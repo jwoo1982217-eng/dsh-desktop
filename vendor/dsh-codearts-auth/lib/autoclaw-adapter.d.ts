@@ -17,22 +17,48 @@ export interface AutoclawAdapterOptions {
     probeCredential?: () => Promise<AutoclawCredential | undefined>;
     /** 覆盖默认的 fetch（测试注入）。 */
     fetchImpl?: typeof fetch;
-    /** 凭据刷新回调。 */
-    refresh?: () => Promise<void>;
-    /** 黑名单模型过滤。 */
-    disabledModels?: () => ReadonlySet<string>;
     /**
-     * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+     * 凭据续期回调。
      *
-     * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
-     * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
-     * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
-     * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+     * ## ⚠️⚠️ 签名为什么带参数（2026-10-27 审计修的 P1）
      *
-     * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
-     * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+     * 修前是**零参** `refresh()`，调用方（`index.ts`）只能自己再问池要一个账号
+     * （`pool.getAvailableAccount(provider, '')`）。而请求实际用的凭据来自
+     * `resolveCredential` → `createCredentialResolver`，本家接了
+     * `balance: { kind: 'buddy' }` ⇒ **用哪个号由余额分档决定**，与
+     * `getAvailableAccount` 的「手动序第一个」**是两套规则**：
+     *
+     * | 判据 | 分档（请求用） | `getAvailableAccount`（续期用） |
+     * |---|---|---|
+     * | 排序 | 按到期档位（`pickBuddyAccount`） | 用户手动序第一个 |
+     * | 限流过滤 | 按**真 modelId** | 传 `''` ⇒ **整体短路**（`account-pool.ts` 的 `modelId.length === 0`） |
+     *
+     * 实测（真跑 `createCredentialResolver` + 复刻池逻辑）：请求用 B 号，
+     * 续期却续 A 号 ⇒ **续了 A、重发仍用 B 的旧 token** ⇒ 401 原样复现，
+     * 而 A 被白轮换一把 RT。端到端三次请求的结果是 `["AUTH","AUTH","AUTH"]`。
+     *
+     * ⇒ 现在把**本次实际用的凭据**交给回调，并允许它**直接返回续好的新凭据**：
+     *   ① 续的必定是刚才那次请求用的那个号（不再二次选号）；
+     *   ② 重发用的就是返回值，**不再** `resolveCredential`（那会重新选号，
+     *      即使续对了也可能挑回另一个号）。
+     *
+     * ⚠️ 返回值保持**可选**（`void | AutoclawCredential`）：既有的零参实现、
+     *   `probeById` 里的 `refresh: async () => {}` 都仍然合法 —— 返回 `undefined`
+     *   时退回旧行为（重新 `resolveCredential`），不破坏任何调用方。
      */
-    providerClosed?: () => boolean;
+    refresh?: (used?: AutoclawCredential) => Promise<void | AutoclawCredential>;
+    /**
+     * 账号池（**黑名单、关闭意图、目录门控的唯一数据源**）。
+     *
+     * ⚠️⚠️ **2026-10-23 迁移**：本家此前手写 `listModels`，黑名单与关闭意图靠
+     * `disabledModels` / `providerClosed` 两个**选项回调**传进来。那两个字段
+     * 已随迁移删除 —— 现在统一由共享骨架（`model-catalog.ts`）从本池读取。
+     *
+     * ⚠️ 省略时（单测 / 嵌入方）行为退回「不过滤、不判关闭意图」；
+     * **生产接线必须传**（`index.ts` 负责，且 `ikp8of-provider-closed.spec.ts`
+     * 会逐家点名）。
+     */
+    accountPool?: import('./account-pool.js').AccountPool;
     /**
      * 读取图片附件字节（**图片通路必需**，2026-10-17 审计 P0 修复）。
      *
@@ -67,6 +93,11 @@ export declare class AutoclawAdapter extends LlmAdapter {
     private readonly options;
     private readonly product;
     private readonly warnImpl;
+    /**
+     * 共享目录骨架（`model-catalog.ts`）——**黑名单 / 关闭意图 / 目录门控 /
+     * 映射**的唯一实现处（2026-10-23 迁移，见 `listModels` 的注释）。
+     */
+    private readonly skeletonCatalog;
     private announced;
     /**
      * 远端模型规格缓存（2026-10-17 审计 P1 修复）。
@@ -109,7 +140,51 @@ export declare class AutoclawAdapter extends LlmAdapter {
         name: string;
         isFree?: boolean;
     }[];
+    /**
+     * 模型选择器的目录 —— **委托共享骨架**（`model-catalog.ts`）。
+     *
+     * ## ⚠️⚠️ 2026-10-23 迁移（用户要求：实体 provider 一律走共享骨架）
+     *
+     * 迁移前本方法**手写**了四件事：判 `providerClosed`、过滤 `disabledModels`、
+     * 凭据探活门控、手工 map 成 `LlmModelInfo`。其中「关闭意图 / 黑名单 /
+     * `provider` 回填」与其余 13 家**逐字同义** ⇒ 各写一份正是 Gitee IKP8OF
+     * 那类漂移缺陷的温床。
+     *
+     * 现在那三条由骨架承担，**本家独有的两条**放进 `loadCatalog`
+     * （`loadCatalogEntries`）：
+     * - **凭据探活门控**（`probeCredential()` 拿不到凭据 ⇒ 隐藏整个分组）；
+     * - 探活成功后**真读远端规格**（`loadRemoteMeta()`）+ 广播（`announceLater`）。
+     *
+     * ⚠️ **门控口径变更（刻意，已与用户确认）**：骨架额外要求「账号池里有已登录
+     * 账号」（`providerCatalogVisible`）。对本家而言这比原来的单凭据探活更贴近
+     * 用户预期 —— 池里没有账号时那个 provider 本就没有可用号，显示出来只会让
+     * 用户选中一个必然失败的模型。
+     */
     listModels(_provider: string): Promise<readonly LlmModelInfo[]>;
+    /**
+     * 异步读目录并转成骨架的中间结构。
+     *
+     * ⚠️⚠️ **本家独有门控全在这里**：
+     * ① 凭据探活（拿不到 ⇒ `[]` ⇒ 隐藏分组）；
+     * ② 探活成功 ⇒ 真读远端规格并广播（原 `listModels` 的主体）。
+     */
+    private loadCatalogEntries;
+    /** **同步**全量目录（`listAllModels()` 用；同样读已缓存的远端校正值）。 */
+    private syncCatalogEntries;
+    /**
+     * 本家私有形状 → 骨架的 `CatalogEntry`（**唯一**转换点）。
+     *
+     * ⚠️⚠️ **必须复用 `entryOf` + `inputModalitiesOf`，不得硬编码 `['text']`**
+     * （2026-10-17 审计 P0 修复）。原写法全模型一刀切 `['text']`，而
+     * `resolveModel` 按 `supportsImage` 给 `['text','image']` ⇒ **同一模型在两个
+     * 入口对宿主说了两套相反的话**：
+     *   • 宿主拿 `resolveModel` 那份做**请求前门禁**（不声明 image 就把图片投影成占位符）
+     *   • `listModels` 那份进模型选择器与聚合目录
+     * ⇒ 对 `zai_auto-fast`（`supportsImage: true`）用户在选择器看到「支持图片」，
+     *   而门禁放行后 `stream()` 必然抛错。
+     * ⚠️ 走 `entryOf`（**远端校正后**的条目）⇒ 远端若改模态，两处仍**同向**。
+     */
+    private toCatalogEntry;
     /**
      * 拉取并解析远端模型规格（**失败/形状不认识一律返回 `undefined`**）。
      *

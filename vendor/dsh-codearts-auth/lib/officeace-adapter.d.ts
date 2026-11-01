@@ -92,19 +92,17 @@ export interface OfficeAceAdapterOptions {
         mediaType: string;
     } | undefined>;
     /** 黑名单模型 id（面板「显示列表」开关）。 */
-    disabledModels?: () => ReadonlySet<string>;
     /**
-     * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+     * 账号池（**黑名单、关闭意图、目录门控的唯一数据源**）。
      *
-     * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
-     * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
-     * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
-     * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+     * ⚠️⚠️ **2026-10-23 迁移**：本家此前手写 `listModels`，黑名单与关闭意图靠
+     * `disabledModels` / `providerClosed` 两个**选项回调**传进来。那两个字段
+     * 已随迁移删除 —— 现在统一由共享骨架（`model-catalog.ts`）从本池读取。
      *
-     * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
-     * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+     * ⚠️ 省略时（单测 / 嵌入方）行为退回「不过滤、不判关闭意图」；
+     * **生产接线必须传**（`index.ts` 负责，且有守卫逐家点名）。
      */
-    providerClosed?: () => boolean;
+    accountPool?: import('./account-pool.js').AccountPool;
     /**
      * 目录新鲜度用的时钟（**只**用于 `isCatalogFresh`，不参与任何业务判定）。
      *
@@ -142,6 +140,11 @@ export declare class OfficeAceAdapter extends LlmAdapter {
      * ⚠️ 判据只有一份：`model-catalog.ts` 的 `isCatalogFresh`（周期 20 分钟）。
      */
     private catalogAt;
+    /**
+     * 共享目录骨架（`model-catalog.ts`）——**黑名单 / 关闭意图 / 目录门控 /
+     * 映射**的唯一实现处（2026-10-23 迁移，见 `listModels` 的注释）。
+     */
+    private readonly skeletonCatalog;
     constructor(options?: OfficeAceAdapterOptions);
     /**
      * 取当前可用凭据；STS 临期（10 分钟内）先静默刷新。
@@ -168,7 +171,43 @@ export declare class OfficeAceAdapter extends LlmAdapter {
      * 目录：凭据可读 + `/v2/models` 可达才暴露（隐藏不可恢复的分组，
      * 与 AutoClaw 同一约定：空目录 = 隐藏，而不是报错）。
      */
+    /**
+     * 模型选择器的目录 —— **委托共享骨架**（`model-catalog.ts`）。
+     *
+     * ## ⚠️⚠️ 2026-10-23 迁移（用户要求：实体 provider 一律走共享骨架）
+     *
+     * 迁移前本方法**手写**了四件事：判 `providerClosed`、过滤 `disabledModels`、
+     * 凭据探测门控、手工 map 成 `LlmModelInfo`。其中「关闭意图 / 黑名单 /
+     * `provider` 回填」与其余 13 家**逐字同义** ⇒ 各写一份正是 Gitee IKP8OF
+     * 那类漂移缺陷的温床。
+     *
+     * 现在那三条由骨架承担，**本家独有的三条**放进 `loadCatalog`
+     * （`loadCatalogEntries`）：
+     * - 只读探测凭据门控（`probeCredential()` 抛不出「锁定」错）；
+     * - **20 分钟 TTL**（`isCatalogFreshFor`，判据仍只有 `model-catalog.ts` 一份）；
+     * - 倍率（`/v1/model-token-rates`）拼进展示名。
+     *
+     * ⚠️ **门控口径变更（刻意，已与用户确认）**：骨架额外要求「账号池里有已登录
+     * 账号」（`providerCatalogVisible`）。对本家而言这更贴近用户预期 —— 池里
+     * 没有账号时那个 provider 本就没有可用号。
+     */
     listModels(_provider: string): Promise<readonly LlmModelInfo[]>;
+    /**
+     * 异步读目录并转成骨架的中间结构。
+     *
+     * ⚠️⚠️ **本家独有逻辑全在这里**（迁移前它们在 `listModels` 里）：
+     * ① 只读探测凭据门控；② 20 分钟 TTL + 探测；③ 倍率取数。
+     */
+    private loadCatalogEntries;
+    /** **同步**全量目录（`listAllModels()` 用；同样带缓存倍率）。 */
+    private syncCatalogEntries;
+    /**
+     * 本家私有形状 → 骨架的 `CatalogEntry`（**唯一**转换点）。
+     *
+     * ⚠️ 倍率拼进 `name` 是**本家既有口径**（`resolveModel` 也这么做，两处必须
+     * 同源，否则选择器显示 `GLM-5.2 · x0.7`、选中后底部胶囊只显示 `GLM-5.2`）。
+     */
+    private toCatalogEntry;
     private announceLater;
     resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
     /** 探测：模型端点 200 且 JSON（凭据有效即通过）。 */

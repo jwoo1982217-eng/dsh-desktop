@@ -83,7 +83,7 @@ function userInfoFetcher(overrides: Record<string, unknown> = {}): typeof fetch 
     data: {
       name: 'RaccoonAva',
       id: '7445120',
-      phone: '13011111100',
+      phone: '13999991100',
       office_identity: '',
       ...overrides,
     },
@@ -112,14 +112,14 @@ describe('repairAccountNicknames', () => {
     expect(updates).toEqual([{ id: 'raccoon-b4c18de9', nickname: 'RaccoonAva (1100)' }])
     // 凭据被补上 phone
     const saved = JSON.parse(credentials.store.get('RACCOON_ACCOUNT_ABD05EAC') ?? '{}') as { phone?: string }
-    expect(saved.phone).toBe('13011111100')
+    expect(saved.phone).toBe('13999991100')
   })
 
   it('**幂等**：昵称已是目标形态时不重复写', async () => {
     const { ctx, credentials } = makeCtx()
     credentials.store.set('RACCOON_ACCOUNT_ABD05EAC', JSON.stringify({
       access_token: JWT, refresh_token: 'r', user_id: '7445120',
-      nickname: 'RaccoonAva', phone: '13011111100',
+      nickname: 'RaccoonAva', phone: '13999991100',
     }))
     // 账号池里的昵称已是目标值
     const { pool, updates } = makePool([accountOf({ nickname: 'RaccoonAva (1100)' })])
@@ -133,7 +133,7 @@ describe('repairAccountNicknames', () => {
   it('凭据已有 phone 时不发 user_info 请求（省一次网络往返）', async () => {
     const { ctx, credentials } = makeCtx()
     credentials.store.set('RACCOON_ACCOUNT_ABD05EAC', JSON.stringify({
-      access_token: JWT, refresh_token: 'r', user_id: '7445120', phone: '13011111100',
+      access_token: JWT, refresh_token: 'r', user_id: '7445120', phone: '13999991100',
     }))
     const { pool } = makePool([accountOf()])
     const fetcher = vi.fn(async () => new Response('{}', { status: 200 })) as unknown as typeof fetch
@@ -202,7 +202,7 @@ describe('repairAccountNicknames', () => {
     const fetcher = vi.fn(async (url: string) => {
       calls.push(String(url))
       return new Response(JSON.stringify({
-        code: 0, data: { name: 'RaccoonAva', id: '7445120', phone: '13011111100' },
+        code: 0, data: { name: 'RaccoonAva', id: '7445120', phone: '13999991100' },
       }), { status: 200 })
     }) as unknown as typeof fetch
     const { pool } = makePool([accountOf()])

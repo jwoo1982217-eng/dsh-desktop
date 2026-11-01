@@ -29,11 +29,27 @@ function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 }
 
-/** 切出 `loomyLockedError` 那个函数的函数体。 */
+/**
+ * 切出 `loomyLockedError` 那个函数的函数体。
+ *
+ * ⚠️⚠️ **终点必须是「下一个同级 `const` 声明」，不能用一个语义无关的锚点**
+ *   （2026-10-20 踩到）：原先终点写的是 `indexOf('const buddy = new BuddyAuth', start)`
+ *   —— 那只是**当时恰好**紧跟在 `loomyLockedError` 之后的那个声明。任何人在这
+ *   两者之间插入一个无关的 `const`，它的错误码就会被本用例当成 Loomy 的码去
+ *   核对 `DEFAULT_RETRYABLE_CODES`，于是**生产代码要为迁就这条断言而改变声明
+ *   顺序**（实际发生过：`astudioLockedError` 用 `QUOTA_EXCEEDED`（不在可重试
+ *   集合内），被逼着挪到 `loomyLockedError` 之前）。
+ *   那是本末倒置 —— 断言应当描述「这个函数用了哪些码」，不是「这个函数后面
+ *   跟着谁」。
+ *
+ * ⚠️ 用 `'\n  const '` 作为终点：两个空格正好是 `apply()` 函数体里的顶层声明
+ *   缩进。函数体内部更深缩进（如 `'\n    const '`）不会误命中 —— 第 4 个字符
+ *   是空格而非 `c`，`indexOf` 匹配不上。
+ */
 function lockedErrorBody(): string {
   const start = indexSource.indexOf('const loomyLockedError')
   expect(start, '★ 必须能定位到 loomyLockedError').toBeGreaterThan(-1)
-  const end = indexSource.indexOf('const buddy = new BuddyAuth', start)
+  const end = indexSource.indexOf('\n  const ', start)
   return indexSource.slice(start, end === -1 ? start + 4000 : end)
 }
 

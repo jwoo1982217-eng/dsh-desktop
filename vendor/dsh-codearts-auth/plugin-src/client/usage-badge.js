@@ -53,6 +53,8 @@ import {
   formatExpirySplitLine,
   formatPoolSplitLine,
   splitCreditsByExpiry,
+  exclusivePoolRemainingOf,
+  isExclusivePool,
 } from './credit-expiry.js';
 import { ensureJetHubStyles } from './jet-hub-styles.js';
 
@@ -635,6 +637,24 @@ function UsageBadgeActive(props) {
   const popRef = React.useRef(null);
   /** 供定时器与按钮调用的「读一次」入口（每次渲染替换，避免闭包过期）。 */
   const read = React.useRef(() => {});
+  /**
+   * **签到重入闸门**（同步，不经 React 调度）。
+   *
+   * ⚠️⚠️ 存在的理由（2026-10-27 审计，与 `jet-hub.js` 的 `claimInFlightRef` 同款）：
+   * 本组件此前只用 `claiming` 这个**异步 state** 禁用按钮，而 state 更新要等下一帧
+   * ⇒ **同一 tick 内连点两次会穿透**，起两轮 `credits.claimAll`。
+   *
+   * 为什么这在 AutoClaw 上后果重：该渠道的签到腿会**先刷新 token 制造一次「登录
+   * 事件」**（活动奖励依赖它）。两轮并发 ⇒ 两次刷新；而刷新会**轮换
+   * `refresh_token`**，两次写回的先后由网络抖动决定 ⇒ 晚到的旧值会把已作废的
+   * token 覆盖回盘上 ⇒ 账号续期能力失效（详见 `src/autoclaw-credits.ts` 的
+   * `inflightRefreshes`）。服务端那条腿已加单飞，客户端这层闸门是**第二道**：
+   * 它挡的是「白打两轮上游请求」，顺带把并发面收窄。
+   *
+   * ⚠️ 必须是 `useRef` 而不是 state：ref 的写入**同步生效**，同一 tick 内的第二次
+   * 点击才能被拦住（state 的 `disabled` 只挡下一帧之后的点击）。
+   */
+  const claimInFlightRef = React.useRef(false);
 
   /**
    * 样式表自愈 + 定位自检（issue IKKGYN 的最后一道保险）。
@@ -918,6 +938,20 @@ function UsageBadgeActive(props) {
    * 按钮只在能力表允许的渠道渲染（`supportsDailyCheckin`）。
    */
   const onClaim = async () => {
+    /**
+     * ⚠️ **同步闸门必须在第一个 `await` 之前**（见 `claimInFlightRef` 的说明）。
+     * ⚠️ 拦住后**不能静默 return**（本仓库记过「点了没反应」这条教训，IKJLK3 B）：
+     *    用户分不清「没反应」与「正在跑」，而签到所有渠道可能几十秒。
+     */
+    if (claimInFlightRef.current) {
+      setClaimNotice({
+        tone: 'warn',
+        text: '上一次签到仍在进行中，请等它结束。',
+        notes: [],
+      });
+      return;
+    }
+    claimInFlightRef.current = true;
     setClaiming('current');
     setClaimNotice(null);
     try {
@@ -928,6 +962,8 @@ function UsageBadgeActive(props) {
     } catch (error) {
       setClaimNotice({ tone: 'warn', text: error?.message || '签到失败', notes: [] });
     } finally {
+      // ⚠️ 闸门与 UI state **必须一起释放**：只清 state 会让后续点击被永久挡住。
+      claimInFlightRef.current = false;
       setClaiming(null);
     }
   };
@@ -949,77 +985,101 @@ function UsageBadgeActive(props) {
    * - `actionRequired` 的提示单独列出（后端显式字段，不靠文案匹配）。
    */
   const onClaimAll = async () => {
-    const providers = checkinProviders();
-    setClaiming('all');
-    setClaimNotice(null);
-    setClaimProgress({ done: 0, total: providers.length });
-    const parts = [];
-    const notes = [];
-    // ★ 按单位分组的合计（2026-10-04，真实缺陷）：见下方累加处的说明。
-    // ⚠️ 刻意不设 `totalCredit` 标量（跨单位求和的数，展示路径不得使用）；
-    //   旧宿主兜底发生在逐渠道的 `summary.totalByUnit || {...}` 那一跳。详见
-    //   `jet-hub.js` 同处的说明（本 PR 首版那个三元分支永远走不到）。
-    const totalByUnit = { token: 0, credit: 0 };
-    let failed = 0;
-    for (let index = 0; index < providers.length; index += 1) {
-      const id = providers[index];
-      try {
-        const result = await claimCredits(id);
-        const summary = result?.summary || {};
-        const bits = [];
-        if (summary.claimed > 0) {
-          // ★ 按单位分别累加（2026-10-04，真实缺陷）：`summary.totalCredit` 是
-          //   **跨单位求和**，会把 ZCode 的 1 亿 token 与积分加成一个数并标成
-          //   「积分」（用户报障原文：`（共 +100000100）`）。单位必须一路带着走。
-          const byUnit = summary.totalByUnit || { credit: summary.totalCredit, token: 0 };
-          totalByUnit.credit += Number(byUnit.credit) || 0;
-          totalByUnit.token += Number(byUnit.token) || 0;
-          // ⚠️ **不要在这里再拼 `+`**：`formatClaimGains` 的返回值**自带**每个单位
-          //   的 `+`（`+100.00MToken, +100积分`），再拼一次会渲染成 `++100.00MToken`。
-          //   与 `jet-hub.js` 同因（2026-10-05 复审实测），详见该处注释。
-          const amount = formatClaimGains(byUnit);
-          if (amount !== null) bits.push(amount);
-        }
-        if (summary.alreadyClaimed > 0) bits.push(`${summary.alreadyClaimed} 个今日已领`);
-        if (summary.inactive > 0) bits.push(`${summary.inactive} 个暂无活动`);
-        if (summary.failed > 0) {
-          failed += summary.failed;
-          const reason = (result?.results || [])
-            .map((item) => item?.outcome?.message)
-            .find((message) => typeof message === 'string' && message.length > 0);
-          bits.push(`${summary.failed} 个失败${reason ? `（${reason}）` : ''}`);
-        }
-        parts.push(`${providerLabel(id)} ${bits.length > 0 ? bits.join('，') : '无账号'}`);
-        for (const item of result?.results || []) {
-          const outcome = item?.outcome || {};
-          if (outcome.actionRequired !== true) continue;
-          const message = outcome.message;
-          if (typeof message !== 'string' || message.length === 0) continue;
-          if (!notes.includes(message)) notes.push(message);
-        }
-      } catch (error) {
-        failed += 1;
-        parts.push(`${providerLabel(id)} 失败（${error?.message || '未知原因'}）`);
-      }
-      setClaimProgress({ done: index + 1, total: providers.length });
+    /**
+     * ⚠️ 与 {@link onClaim} **共用同一个闸门**：两个入口都是「真领积分」的写操作，
+     * 若各用一个 ref，用户在两个按钮间交替点击仍能穿透。
+     */
+    if (claimInFlightRef.current) {
+      setClaimNotice({
+        tone: 'warn',
+        text: '上一次签到仍在进行中，请等它结束。',
+        notes: [],
+      });
+      return;
     }
-    // ★ 汇总行按单位分别报（2026-10-04，真实缺陷）：原先写 `（共 +${totalCredit} 积分）`，
-    //   而 `totalCredit` 是跨单位求和 —— 用户报障的 `（共 +100000100）` 就是它。
-    //
-    // ⚠️ **不能再拼 `+`**：`formatClaimGains` 已自带每个单位的 `+`，本行原写作
-    //   `（共 +${totalAmount}）` ⇒ 渲染出 `（共 ++100.00MToken, +100积分）`
-    //   （2026-10-05 复审实测，与 `jet-hub.js` 同因）。
-    // ⚠️ 兜底只在逐渠道累加处做一次，这里直接用 `totalByUnit`（见该处注释）。
-    const totalAmount = formatClaimGains(totalByUnit);
-    setClaimNotice({
-      tone: failed > 0 || notes.length > 0 ? 'warn' : 'ok',
-      text: parts.length > 0
-        ? `全部渠道：${parts.join('；')}${totalAmount === null ? '' : `（共 ${totalAmount}）`}`
-        : '全部渠道：没有可领取的渠道',
-      notes,
-    });
-    setClaimProgress(null);
-    setClaiming(null);
+    claimInFlightRef.current = true;
+    /**
+     * ⚠️⚠️ **整段必须包在 try/finally 里**：闸门是同步 ref，任何一个未捕获的
+     * 异常都会让它**永久占住** —— 此后用户点「签到」只会看到「上一次仍在进行中」，
+     * 直到重载插件。而 `checkinProviders()` 就在 try 之前（它读能力表，理论上
+     * 不该抛，但本仓库的红线是「不该抛」不等于「不会抛」）。
+     */
+    try {
+      const providers = checkinProviders();
+      setClaiming('all');
+      setClaimNotice(null);
+      setClaimProgress({ done: 0, total: providers.length });
+      const parts = [];
+      const notes = [];
+      // ★ 按单位分组的合计（2026-10-04，真实缺陷）：见下方累加处的说明。
+      // ⚠️ 刻意不设 `totalCredit` 标量（跨单位求和的数，展示路径不得使用）；
+      //   旧宿主兜底发生在逐渠道的 `summary.totalByUnit || {...}` 那一跳。详见
+      //   `jet-hub.js` 同处的说明（本 PR 首版那个三元分支永远走不到）。
+      const totalByUnit = { token: 0, credit: 0 };
+      let failed = 0;
+      for (let index = 0; index < providers.length; index += 1) {
+        const id = providers[index];
+        try {
+          const result = await claimCredits(id);
+          const summary = result?.summary || {};
+          const bits = [];
+          if (summary.claimed > 0) {
+            // ★ 按单位分别累加（2026-10-04，真实缺陷）：`summary.totalCredit` 是
+            //   **跨单位求和**，会把 ZCode 的 1 亿 token 与积分加成一个数并标成
+            //   「积分」（用户报障原文：`（共 +100000100）`）。单位必须一路带着走。
+            const byUnit = summary.totalByUnit || { credit: summary.totalCredit, token: 0 };
+            totalByUnit.credit += Number(byUnit.credit) || 0;
+            totalByUnit.token += Number(byUnit.token) || 0;
+            // ⚠️ **不要在这里再拼 `+`**：`formatClaimGains` 的返回值**自带**每个单位
+            //   的 `+`（`+100.00MToken, +100积分`），再拼一次会渲染成 `++100.00MToken`。
+            //   与 `jet-hub.js` 同因（2026-10-05 复审实测），详见该处注释。
+            const amount = formatClaimGains(byUnit);
+            if (amount !== null) bits.push(amount);
+          }
+          if (summary.alreadyClaimed > 0) bits.push(`${summary.alreadyClaimed} 个今日已领`);
+          if (summary.inactive > 0) bits.push(`${summary.inactive} 个暂无活动`);
+          if (summary.failed > 0) {
+            failed += summary.failed;
+            const reason = (result?.results || [])
+              .map((item) => item?.outcome?.message)
+              .find((message) => typeof message === 'string' && message.length > 0);
+            bits.push(`${summary.failed} 个失败${reason ? `（${reason}）` : ''}`);
+          }
+          parts.push(`${providerLabel(id)} ${bits.length > 0 ? bits.join('，') : '无账号'}`);
+          for (const item of result?.results || []) {
+            const outcome = item?.outcome || {};
+            if (outcome.actionRequired !== true) continue;
+            const message = outcome.message;
+            if (typeof message !== 'string' || message.length === 0) continue;
+            if (!notes.includes(message)) notes.push(message);
+          }
+        } catch (error) {
+          failed += 1;
+          parts.push(`${providerLabel(id)} 失败（${error?.message || '未知原因'}）`);
+        }
+        setClaimProgress({ done: index + 1, total: providers.length });
+      }
+      // ★ 汇总行按单位分别报（2026-10-04，真实缺陷）：原先写 `（共 +${totalCredit} 积分）`，
+      //   而 `totalCredit` 是跨单位求和 —— 用户报障的 `（共 +100000100）` 就是它。
+      //
+      // ⚠️ **不能再拼 `+`**：`formatClaimGains` 已自带每个单位的 `+`，本行原写作
+      //   `（共 +${totalAmount}）` ⇒ 渲染出 `（共 ++100.00MToken, +100积分）`
+      //   （2026-10-05 复审实测，与 `jet-hub.js` 同因）。
+      // ⚠️ 兜底只在逐渠道累加处做一次，这里直接用 `totalByUnit`（见该处注释）。
+      const totalAmount = formatClaimGains(totalByUnit);
+      setClaimNotice({
+        tone: failed > 0 || notes.length > 0 ? 'warn' : 'ok',
+        text: parts.length > 0
+          ? `全部渠道：${parts.join('；')}${totalAmount === null ? '' : `（共 ${totalAmount}）`}`
+          : '全部渠道：没有可领取的渠道',
+        notes,
+      });
+    } finally {
+      // ⚠️ 闸门与 UI state **必须一起释放**（见 `claimInFlightRef` 的说明）。
+      claimInFlightRef.current = false;
+      setClaimProgress(null);
+      setClaiming(null);
+    }
     read.current();
   };
 
@@ -1462,7 +1522,20 @@ function UsageBadgeActive(props) {
         key: part.key,
         className: 'dim-jh-badgeNotePart',
         'data-tone': part.tone,
-        ...(part.countdown === undefined ? {} : { title: `最早作废：${part.countdown}后` }),
+        // ⚠️⚠️ **不得无条件追加「后」**（2026-10-21 合并审计发现，!135 引入的回归）。
+        //
+        // `expirySplitParts` 的 `countdown` 已从「裸时长」改为「**可能是完整短语**」：
+        // 倒计时只覆盖其中一批时它是 `其中 500 于 6 天 0 小时后到期`。旧代码在这里
+        // 无条件拼 `后` ⇒ 实测得到残句：
+        //   `最早作废：其中 500 于 6 天 0 小时后到期后`
+        // （!135 只改了生产者、没同步这个消费者；本处此前**零用例**，变异实测全绿。）
+        //
+        // ⇒ 直接用它，两种形态都自洽：
+        //   `最早作废：6 天 0 小时`                    ← 倒计时覆盖全部临期时
+        //   `最早作废：其中 500 于 6 天 0 小时后到期`  ← 只覆盖其中一批时
+        // ⚠️ **不要**在这里按「短语/时长」分支 —— 那是在消费方复制生产者才知道的
+        //   形态知识，必然再次漂移（本仓头号缺陷形态）。
+        ...(part.countdown === undefined ? {} : { title: `最早作废：${part.countdown}` }),
       }, part.countdown === undefined ? part.text : `${part.text}（${part.countdown}）`));
     });
     return React.createElement('div', { key: 'note', className: 'dim-jh-badgeRowNote' }, children);
@@ -1656,7 +1729,24 @@ function splitParts(balance, windowDays, provider) {
   // 当日池（loomy / raccoon）：池按名字分，没有到期维度 ⇒ 单段无色。
   if (poolText !== null) return [{ key: 'pool', text: poolText, tone: 'muted' }];
   // 其余渠道：按到期时间分**三档**，逐段带色（永久绿 / 长期黄 / 临期红 + 倒计时）。
-  return expirySplitParts(splitCreditsByExpiry(packages, windowDays, Date.now()), format, Date.now());
+  const now = Date.now();
+  const parts = expirySplitParts(splitCreditsByExpiry(packages, windowDays, now), format, now);
+  /**
+   * **独立池**（AStudio 星火积分等）追加一段无色说明。
+   *
+   * ⚠️ 为什么这里也要加（2026-10-21 真实缺陷）：设置页的账号卡片（`jet-hub.js`
+   *    的 `CreditBalanceRow`）与**本弹窗**是**两套独立渲染代码** —— 前者改了
+   *    后者没改，用户看到「设置页有、徽标弹窗没有」。本仓反复记录过这种
+   *    「同一语义两处渲染」的漂移，故两处必须同时改。
+   *
+   * ⚠️ `splitCreditsByExpiry` 已把独立池**摘出**三档（不进 `permanent`），
+   *    故这里从 `packages` 现算，不能从 `split` 里取。
+   */
+  const exclusive = exclusivePoolRemainingOf(packages);
+  if (exclusive > 0) {
+    parts.push({ key: 'exclusive', text: `另有 ${format(exclusive)} 专属（不计入）`, tone: 'muted' });
+  }
+  return parts;
 }
 
 /**

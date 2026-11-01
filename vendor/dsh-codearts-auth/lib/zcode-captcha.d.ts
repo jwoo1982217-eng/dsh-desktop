@@ -77,7 +77,7 @@
  *    `chromium-session.ts` —— 那是**代码真正所在**的文件，否则断言会打空、
  *    变成假绿。
  */
-export { browserCandidates, browserNotFoundMessage, buildLinuxSkipTaskbarArgs, buildMacosMiniaturizeArgs, findBrowserExecutable, isEdgeExecutable, parseWmctrlList, } from './chromium-session.js';
+export { browserCandidates, browserNotFoundMessage, buildLinuxSkipTaskbarArgs, buildMacosMiniaturizeArgs, findBrowserExecutable, isBrowserDeploymentError, isEdgeExecutable, parseWmctrlList, } from './chromium-session.js';
 /** 阿里云 captcha 配置（服务端下发；此处为实测兜底值）。 */
 export interface ZcodeCaptchaConfig {
     /** 区域：`cn`。 */

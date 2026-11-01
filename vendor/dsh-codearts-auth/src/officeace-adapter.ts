@@ -21,7 +21,7 @@ import { OFFICEACE, OFFICEACE_MODELS } from './officeace-product.js'
 import { basicAuthorization, fetchModelTokenRates, isExpiring, readOfficeAceCredential, refreshStoredCredential, type OfficeAceCredential } from './officeace-auth.js'
 import { collectImages, consumeOpenAiSse, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
-import { isCatalogFreshFor } from './model-catalog.js'
+import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { buildDsmlSystemPrompt, needsDsmlToolMode, type DsmlToolSpec } from './dsml.js'
 import {
   isBasicCredentialRejection,
@@ -134,19 +134,17 @@ export interface OfficeAceAdapterOptions {
    */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 黑名单模型 id（面板「显示列表」开关）。 */
-  disabledModels?: () => ReadonlySet<string>
   /**
-   * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+   * 账号池（**黑名单、关闭意图、目录门控的唯一数据源**）。
    *
-   * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
-   * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
-   * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
-   * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+   * ⚠️⚠️ **2026-10-23 迁移**：本家此前手写 `listModels`，黑名单与关闭意图靠
+   * `disabledModels` / `providerClosed` 两个**选项回调**传进来。那两个字段
+   * 已随迁移删除 —— 现在统一由共享骨架（`model-catalog.ts`）从本池读取。
    *
-   * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
-   * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+   * ⚠️ 省略时（单测 / 嵌入方）行为退回「不过滤、不判关闭意图」；
+   * **生产接线必须传**（`index.ts` 负责，且有守卫逐家点名）。
    */
-  providerClosed?: () => boolean
+  accountPool?: import('./account-pool.js').AccountPool
   /**
    * 目录新鲜度用的时钟（**只**用于 `isCatalogFresh`，不参与任何业务判定）。
    *
@@ -195,8 +193,28 @@ export class OfficeAceAdapter extends LlmAdapter {
    */
   private catalogAt = 0
 
+  /**
+   * 共享目录骨架（`model-catalog.ts`）——**黑名单 / 关闭意图 / 目录门控 /
+   * 映射**的唯一实现处（2026-10-23 迁移，见 `listModels` 的注释）。
+   */
+  private readonly skeletonCatalog: ModelCatalog
+
   constructor(private readonly options: OfficeAceAdapterOptions = {}) {
     super()
+    // ⚠️⚠️ **`accountPool` 必须是真池**：骨架里 `deps.accountPool?.disabledModelsFor`
+    //    与 `providerClosedFor?.(...)` 全靠它；传 `{}` 或 `undefined` 会让
+    //    `?.` 变成静默 no-op（Gitee IKP8OF 实测过的形态）。
+    this.skeletonCatalog = createModelCatalog(
+      this.options.accountPool === undefined ? {} : { accountPool: this.options.accountPool },
+      {
+        product: OFFICEACE,
+        loadCatalog: () => this.loadCatalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        // ⚠️ 未知 id **保守报 `['text']`**：与本家 `resolveModel` 的取向一致
+        //    （6 个纯文本模型不声明 image、也不给未知 id 编造能力）。
+        unknownModelInputModalities: () => ['text'] as const,
+      },
+    )
   }
 
   /**
@@ -240,12 +258,37 @@ export class OfficeAceAdapter extends LlmAdapter {
    * 目录：凭据可读 + `/v2/models` 可达才暴露（隐藏不可恢复的分组，
    * 与 AutoClaw 同一约定：空目录 = 隐藏，而不是报错）。
    */
+  /**
+   * 模型选择器的目录 —— **委托共享骨架**（`model-catalog.ts`）。
+   *
+   * ## ⚠️⚠️ 2026-10-23 迁移（用户要求：实体 provider 一律走共享骨架）
+   *
+   * 迁移前本方法**手写**了四件事：判 `providerClosed`、过滤 `disabledModels`、
+   * 凭据探测门控、手工 map 成 `LlmModelInfo`。其中「关闭意图 / 黑名单 /
+   * `provider` 回填」与其余 13 家**逐字同义** ⇒ 各写一份正是 Gitee IKP8OF
+   * 那类漂移缺陷的温床。
+   *
+   * 现在那三条由骨架承担，**本家独有的三条**放进 `loadCatalog`
+   * （`loadCatalogEntries`）：
+   * - 只读探测凭据门控（`probeCredential()` 抛不出「锁定」错）；
+   * - **20 分钟 TTL**（`isCatalogFreshFor`，判据仍只有 `model-catalog.ts` 一份）；
+   * - 倍率（`/v1/model-token-rates`）拼进展示名。
+   *
+   * ⚠️ **门控口径变更（刻意，已与用户确认）**：骨架额外要求「账号池里有已登录
+   * 账号」（`providerCatalogVisible`）。对本家而言这更贴近用户预期 —— 池里
+   * 没有账号时那个 provider 本就没有可用号。
+   */
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️⚠️ 「供应商整体关闭」⇒ 一条都不播（Gitee issue IKP8OF）。
-    // 必须在探测凭据与打上游之前：关闭态下那两次往返（`/v2/models` +
-    // `/v1/model-token-rates`）纯属浪费，且新模型不在黑名单里会被漏掉。
-    if (this.options.providerClosed?.() === true) return []
-    const disabled = this.options.disabledModels?.() ?? new Set<string>()
+    return await this.skeletonCatalog.listModels(_provider)
+  }
+
+  /**
+   * 异步读目录并转成骨架的中间结构。
+   *
+   * ⚠️⚠️ **本家独有逻辑全在这里**（迁移前它们在 `listModels` 里）：
+   * ① 只读探测凭据门控；② 20 分钟 TTL + 探测；③ 倍率取数。
+   */
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
     // ⚠️ 目录用**只读探测凭据**（见 `probeCredential` 的长注释）：恒不抛「锁定」错。
     //    `/v2/models` 与倍率都是只读端点，不扣积分，锁定它们只会得到一串
     //    与锁定毫不相干的症状（面板「读取模型列表失败」、关不掉供应商、分组消失）。
@@ -298,23 +341,30 @@ export class OfficeAceAdapter extends LlmAdapter {
 
       }
     }
-    // ⚠️ TTL 内的读数走**缓存倍率**（`rateCache`）；倍率拉不到时它是空表，
-    //    名字后不带 x 系数 —— 与首次拉取失败时的降级形态一致。
-    const rates = this.rateCache
-    return OFFICEACE_MODELS
-      .filter((m) => !disabled.has(m.id))
-      .map((m) => {
-        const coeff = rates.get(m.id)
-        return {
-          provider: OFFICEACE.id,
-          id: m.id,
-          name: coeff !== undefined ? `${m.name} · x${coeff}` : m.name,
-          // ⚠️ **图片准入闸门**（实测表见 `OFFICEACE_MODELS` 的 `multimodal` 注）：
-          //    不声明 `image` 时附件在入库阶段就被拒（用户看到「当前模型不支持
-          //    图片」）—— 这是对 6 个纯文本模型的**诚实**行为。
-          inputModalities: isMultimodalModel(m.id) ? (['text', 'image'] as const) : (['text'] as const),
-        }
-      })
+    return OFFICEACE_MODELS.map((m) => this.toCatalogEntry(m))
+  }
+
+  /** **同步**全量目录（`listAllModels()` 用；同样带缓存倍率）。 */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    return OFFICEACE_MODELS.map((m) => this.toCatalogEntry(m))
+  }
+
+  /**
+   * 本家私有形状 → 骨架的 `CatalogEntry`（**唯一**转换点）。
+   *
+   * ⚠️ 倍率拼进 `name` 是**本家既有口径**（`resolveModel` 也这么做，两处必须
+   * 同源，否则选择器显示 `GLM-5.2 · x0.7`、选中后底部胶囊只显示 `GLM-5.2`）。
+   */
+  private toCatalogEntry(m: (typeof OFFICEACE_MODELS)[number]): CatalogEntry {
+    const coeff = this.rateCache.get(m.id)
+    return {
+      id: m.id,
+      name: coeff !== undefined ? `${m.name} · x${coeff}` : m.name,
+      // ⚠️ **图片准入闸门**（实测表见 `OFFICEACE_MODELS` 的 `multimodal` 注）：
+      //    不声明 `image` 时附件在入库阶段就被拒（用户看到「当前模型不支持
+      //    图片」）—— 这是对 6 个纯文本模型的**诚实**行为。
+      inputModalities: isMultimodalModel(m.id) ? (['text', 'image'] as const) : (['text'] as const),
+    }
   }
 
   private announceLater(): void {

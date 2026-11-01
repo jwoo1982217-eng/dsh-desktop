@@ -23,7 +23,7 @@ function DshTurnOutcome({turn}) {
           ? '本轮未完成：输出达到上限，回复未正常结束。'
           : '本轮未完成：模型调用失败。详见本轮错误信息。';
   }
-  return {$typeof: Symbol.for('react.element'), type: 'div', key: null, ref: null, _owner: null,
+  return {$$typeof: Symbol.for('react.element'), type: 'div', key: null, ref: null, _owner: null,
     props: {'data-dsh-turn-outcome': reason.kind, role: 'status', children: text,
       style: {width: '100%', color: 'var(--dsw-alias-label-secondary)', fontSize: 13, lineHeight: '20px', padding: '6px 0'}}};
 }

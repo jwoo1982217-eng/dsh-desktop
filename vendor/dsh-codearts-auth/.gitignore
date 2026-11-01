@@ -26,10 +26,37 @@ commit-msg.tmp
 
 # 其它任务的本地取证目录（非本插件运行时依赖）。
 .minimax-forensics/
+
 .research/
 
+# Codely 官方 CLI 的**本地会话导出**（`auto-saves/`）。
+#
+# ⚠️⚠️ 这些是**机器本地的聊天记录**，不是源码、不是夹具、也不是运行时依赖：
+#   每个文件含**完整会话正文** + 本机绝对路径（`F:\AIProject\deepseek-harness-codearts`）。
+#   2026-10-22 合并审计实测：PR #1 把 6 个这样的文件（约 223 KB）**提交进了仓库**，
+#   而 `.gitignore` 当时没有任何规则挡住它 —— 与 `.e2e-logs/` 完全同型
+#   （那次也是「运行产物被 `git add .` 一起带上」）。
+#
+# ⚠️ 用目录前缀匹配（`.codely-cli/`），不用 `auto-saves/`：
+#   后者会顺手忽略掉别处的同名目录，看起来像无关文件莫名消失。
+.codely-cli/
+
+
 ide-models.json
-scripts
+scripts/*
+# ⚠️ 白名单：部署产物的打包脚本与安装模板是**交付物**（service.bat -Mode standalone /
+#    -Mode bootstrap 调用它们），必须入库；而 `scripts` 整目录忽略会误伤它们
+#    （注意：已入库的 scripts/*.mjs 不受影响，只有**新增**文件会被这条规则挡住，
+#     所以要改成「目录内通配 + 显式例外」的形式）。
+!scripts/build-standalone.mjs
+!scripts/build-bootstrap.mjs
+!scripts/local-agent.mjs
+# ⚠️ 由 package.json 的 build:all / prepare **直接调用**，属交付链的一环：
+#    不入库 ⇒ 别人 clone 后 `npm run build:all` 会因找不到该脚本直接失败
+#    （`scripts/*` 只挡新增文件，已入库的不受影响，所以必须显式加进来）。
+!scripts/sync-bootstrap-lib.mjs
+!scripts/templates/
+!scripts/templates/install-bootstrap.ps1
 .minimax-forensics/
 
 # Qoder 私有签名体系的复现脚本（研究工具，仅本地保留）
@@ -103,6 +130,9 @@ tests/fixtures/test.png
 # 打包产物：npm/pnpm pack 生成的 tarball 不入库（2026-10-01）
 *.tgz
 
+# 打包产物目录（service.bat package / package -Mode standalone 的输出，体积数百 MB）
+dist/
+
 # 账号池备份（dsh-codearts-auth 导出的加密备份件）：凭据备份一律不入库（含加密码，2026-10-05 核查实锤 51 账号 blob）
 _过程归档/
 
@@ -129,3 +159,15 @@ docs/zcode-protocol-notes.md
 # ⚠️ 这是**知识库**而非运行时依赖：`src/` 不引用它。
 # 需要改动实现、排查协议问题或重新校准结论时读它。
 docs/implementation-notes.md
+docs/audit/
+
+# Codegraph 本地索引（94 MB，纯本地生成物，不入库）
+.codegraph/
+
+# 本机定制维护与隔离验收入口必须随维护源码保留。
+!scripts/runtime-smoke.mjs
+!scripts/verify-customizations.mjs
+!scripts/guard-test.mjs
+!scripts/codearts-rpc-context-test.mjs
+!scripts/lib/
+!scripts/lib/channel-pack-kernel.mjs

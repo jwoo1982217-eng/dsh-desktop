@@ -14,6 +14,8 @@ import type { ZcodeCredential } from './zcode.js';
  * 单测使用。结构化类型同时让单测可以传**只带一个方法的替身**。
  */
 export interface ProviderCreditsDeps {
+    /** 当前插件实例的签名传输，避免跨实例出口与凭据错配。 */
+    readonly codeartsFetch?: typeof fetch;
     readonly zcodeSourceInfo?: (accountId: string) => ReturnType<ZcodeSources['list']>;
     /** Loomy auth 实例（省略时回退到自由函数 + 全局 fetch）。 */
     readonly loomy?: {
@@ -59,6 +61,27 @@ export interface ProviderCreditsDeps {
      * 固化成一份 fetcher —— 账号可能随时在面板里改代理。
      */
     readonly geminiFetchFor?: (accountId: string) => typeof fetch;
+    /**
+     * MiniMax **国际站**的按账号 fetcher（PR !145 审计 P0 修法）。
+     *
+     * ## ⚠️⚠️ 为什么必须有它（真实缺陷，本 PR 自己声称要修却没修）
+     *
+     * PR !145 的提交说明与 `index.ts` 注释都写「登录 / 续期 / 目录 / 身份 / 推理 /
+     * **积分**六条链路都走 `minimaxIntlFetchForAccount`」，但本文件（三个积分入口
+     * 的所在处）**一行都没改** —— 三个原语的第二参仍是 `undefined`（⇒ 默认参数
+     * = 全局 `fetch`）。而 `agent.minimax.io` 按出口 IP 国别分流，大陆出口直连
+     * 恒 307 到中国站，中国站不认国际站 token ⇒ 401。
+     *
+     * ⇒ **用户配好代理后，对话能用了，积分行却仍报「余额查询失败」、一键签到仍
+     * 失败** —— 症状与 issue IKMEVG 逐字相同，只是从「全部链路」缩到「积分」这一面。
+     *
+     * ⚠️ 与 {@link geminiFetchFor} **刻意分成两个字段**：两家语义与主机都不同
+     *（Gemini 是「墙外连不上」，国际站是「连得上却被分流」），共用会让
+     *「清掉一家的代理」连带清掉另一家的出口配置。
+     *
+     * ⚠️ 同样必须**惰性**调用（按 `accountId` 现取）：账号可能随时在面板里改代理。
+     */
+    readonly minimaxIntlFetchFor?: (accountId: string) => typeof fetch;
 }
 /**
  * 把 ZCode 的额度桶映射成 `CreditBalance`。

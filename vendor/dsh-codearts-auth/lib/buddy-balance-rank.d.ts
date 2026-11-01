@@ -45,7 +45,7 @@
  *
  * ⚠️ 本模块是**纯函数**，不碰网络与凭据 —— 余额由调用方查好后传入。
  */
-import type { CreditBalance } from './credits.js';
+import { type CreditBalance } from './credits.js';
 /**
  * 「临时积分」的时间窗口：距扣费截止不足 **15 天**的积分算临时（会很快作废），
  * 其余算永久。用户 2026-09-29 定的判据。

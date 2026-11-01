@@ -243,8 +243,8 @@ describe('A. 「+ 新建账号」必须按 provider 分支（IKJLK3 A1/A2/A3）'
   it('★ 接线：按钮的 onClick 走判据，弹窗渲染处也有防御判据', () => {
     // 光有纯函数不够 —— 有人把按钮改回 `() => setPendingLogin(false)`，
     // 判据还在但没人调用，缺陷原样复现。这条就是守「接上了」。
-    const click = jetHubCode.match(/onClick: \(\) => \{\s*if \(newAccountAsksChannel\(provider\)\)[^}]*\}/)
-    expect(click, '新建账号按钮必须先问 newAccountAsksChannel').not.toBeNull()
+    const click = jetHubCode.match(/onClick: \(\) => \{\s*if \(phoneLogin && provider === 'autoclaw'\) setAutoclawLogin\(true\)\s*else if \(newAccountAsksChannel\(provider\)\)[^}]*\}/)
+    expect(click, '手机AutoClaw先开短信页，其余保留newAccountAsksChannel').not.toBeNull()
     // 弹窗渲染处的防御判据（正常路径走不到，但状态是活的）。
     expect(jetHubCode).toMatch(/!newAccountAsksChannel\(provider\)\s*\?\s*null\s*:\s*React\.createElement/)
   })

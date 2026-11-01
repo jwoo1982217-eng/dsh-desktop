@@ -31,7 +31,7 @@ import {
   type MinimaxProduct,
 } from './minimax-product.js'
 import { describeMinimaxGeoRoute, minimaxFetch, minimaxHeadersFor, type MinimaxCredential } from './minimax.js'
-import { roundCredits, type CheckinStatus, type ClaimOutcome, type CreditBalance } from './credits.js'
+import { roundCredits, type CheckinStatus, type ClaimOutcome, type CreditBalance, type CreditPackage } from './credits.js'
 
 /** 单日状态（asar `SigninDayStatus`）。 */
 export const MINIMAX_SIGNIN_STATUS = Object.freeze({
@@ -610,9 +610,31 @@ export async function claimMinimaxDailyCheckin(
  *   **不是**「查询失败」。两者必须区分（`null` 才是失败）。
  * - ⚠️ `base_resp.status_code` 非 0 ⇒ `null`（真失败）。
  *
- * ⚠️ **`expiredTotal` 仍为 0**：`details[]` 里没有区分「本周期有效」的标志
- *（`credit_type` 的语义未实测），故**不凭猜测分类**。`packages` 同理留空 ——
- * 需要时再按实测补充，**不得**用 locale 文案反推字段名。
+ * ## `packages` 的产出（2026-10-20 用户报障后补）
+ *
+ * 用户报障原文：「MiniMax Code 积分也有到期时间，也应当有相同功能」（附 AStudio
+ * 面板截图作参照）。此前本函数把 `packages` **硬编码成 `[]`**，理由是
+ * 「`credit_type` 的语义未实测，不凭猜测分类」—— 但那个理由说的是**分类**
+ * （哪些算过期），与**到期时刻**是两件事：每个 `details[]` 条目都带
+ * `expire_at_ms`（毫秒时间戳，实测 2026-10-20 真实账号 20 条全部有值），
+ * 直接可用，无需猜 `credit_type` 语义。
+ *
+ * 实测形状（两站各取真实账号，`GET /minimax-cloud/api/v1/credit/details`）：
+ *
+ * | 发放 `granted_at_ms` | 剩余 `remaining_amount` | 到期 `expire_at_ms` |
+ * |---|---|---|
+ * | 2026-10-20 01:41:32 | 1000.00 | 2026-11-19 00:00:00 |
+ * | 2026-10-19 00:40:51 | 1000.00 | 2026-11-18 00:00:00 |
+ * | 2026-10-18 02:24:45 | 400.00 | 2026-11-17 00:00:00 |
+ *
+ * ⇒ 每条明细就是一个独立的「积分包」，到期时刻 = `granted_at_ms` 的 30 天后零点。
+ * 这正是「临期优先」要的信息：先烧最快作废的那一笔。
+ *
+ * ⚠️ **`expiredTotal` 仍为 0**：它要与 `total` 相加构成「已过期」口径，
+ *   而本响应**不下发已过期条目**（服务端只回有效包）⇒ 无从计算，不编造。
+ *   `packages[].active` 恒为 `true` 是基于「服务端只回有效包」的实测；
+ *   若将来它开始回过期条目，**必须**改用 `expire_at_ms > Date.now()` 判定
+ *   （已在该处留注释）。
  */
 export async function fetchMinimaxCreditBalance(
   credential: MinimaxCredential,
@@ -652,10 +674,55 @@ export async function fetchMinimaxCreditBalanceDetailed(
   }
   // ⚠️ 余额 = 各包 `remaining_amount` 之和；缺失 `details` ⇒ 0（真的为 0）。
   let total = 0
+  const packages: CreditPackage[] = []
   for (const entry of details ?? []) {
     if (typeof entry !== 'object' || entry === null) continue
-    const remaining = looseAmount((entry as Record<string, unknown>).remaining_amount)
-    if (remaining !== undefined) total += remaining
+    const row = entry as Record<string, unknown>
+    const remaining = looseAmount(row.remaining_amount)
+    if (remaining === undefined) continue
+    total += remaining
+    const granted = finiteNumber(row.granted_at_ms)
+    const expires = finiteNumber(row.expire_at_ms)
+    packages.push({
+      /**
+       * ⚠️ 包名**不编造业务含义**：`credit_type` 的语义未实测（实测全部样本都是 2），
+       * 故不按它起名（「签到包」/「活动包」都是猜测）。用发放日期作可区分标识
+       * —— 它来自实测字段，且在 UI 上足以让用户对上「哪一笔」。
+       */
+      name: granted === undefined
+        ? '积分包'
+        : `积分包 ${new Date(granted).toLocaleDateString('zh-CN')}`,
+      unit: 'credit',
+      remaining,
+      total: remaining,
+      // ⚠️ `consumed_amount` 与 `granted_amount` 都在，但口径不确定
+      //（`total` 究竟该取发放额还是「剩余+已用」未实测，两者在多笔混合消耗时不等）
+      // ⇒ 只填有把握的：`total = remaining`，`used = 0`。
+      // 两者在 `splitCreditsByExpiry` / `sharedPackageExpiry` 里**都没有消费者**
+      //（它们只读 `active`/`remaining`/`deductionEndTime`），故不编造不会影响分档。
+      used: 0,
+      /**
+       * ⚠️ 恒 `true`，依据是**实测「服务端只回有效包」**（20 条样本全部
+       * `expire_at_ms` 晚于现在、`remaining_amount` 非 0）。
+       * 若将来它开始回过期条目，**必须**改成
+       * `expires !== undefined && expires > Date.now()`
+       * —— 否则过期包会参与分档排序，把「已作废的额度」当成可用。
+       */
+      active: true,
+      cycleStartTime: '',
+      cycleEndTime: '',
+      expiredTime: expires === undefined
+        ? ''
+        : new Date(expires).toISOString(),
+      /**
+       * ⚠️⚠️ **这才是分档与到期排序唯一读的字段**（`CreditPackage` 的类型注释
+       * 第 130 行起有完整说明）。`expire_at_ms` 实测是**毫秒时间戳**（无需 ×1000），
+       * 直接透传 —— 不要做 `Date.parse` / 时区换算（那是字符串形态才需要的）。
+       * 解析不出就**不写这个键**（`undefined` = 「到期时间未知」，
+       * 分档会落到永久桶），绝不填 0（0 会被判成「服务端未下发」，语义不同）。
+       */
+      ...expires === undefined ? {} : { deductionEndTime: expires },
+    })
   }
-  return { balance: { total: roundCredits(total), packages: [], expiredTotal: 0 } }
+  return { balance: { total: roundCredits(total), packages, expiredTotal: 0 } }
 }

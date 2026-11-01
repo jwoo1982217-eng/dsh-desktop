@@ -68,9 +68,14 @@ import { AutoclawAdapter } from '../../src/autoclaw-adapter.js'
 // ⚠️ AutoClaw 国际版（2026-10-20）：与国内同一适配器类，只差 product。
 import { AUTOCLAW_INTL } from '../../src/autoclaw-product.js'
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
+import { MagicrewAdapter } from '../../src/magicrew-adapter.js'
+import { MAGICREW_FALLBACK_CONTEXT_WINDOW } from '../../src/magicrew-product.js'
 import { ModelscopeAdapter } from '../../src/modelscope-adapter.js'
+// ⚠️ **本 fork 独有**（qiniu/七牛云，2026-10-29）。
+import { QiniuAdapter } from '../../src/qiniu-adapter.js'
+import { CodelyAdapter } from '../../src/codely-adapter.js'
 import { ClineAdapter } from '../../src/cline-adapter.js'
-import { CodeArtsAdapter } from '../../src/llm-adapter.js'
+import { CodeArtsAdapter, CODEARTS_FALLBACK_CONTEXT_WINDOW } from '../../src/llm-adapter.js'
 import { GeminiAdapter } from '../../src/gemini-adapter.js'
 import { OfficeAceAdapter } from '../../src/officeace-adapter.js'
 import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
@@ -650,13 +655,55 @@ id: 'autoclaw',
       } as never),
     },
     {
+      // ⚠️ **本 fork 独有**（qiniu/七牛云，2026-10-29）。
+      // ⚠️ 同样**不注入 `fetchRemoteCatalog`**（注入了就真发网络）：不注入时
+      //    `loadQiniuCatalog` 回退 `QINIU_FALLBACK_MODELS`（那张表是 2026-10-29
+      //    直连 `/v1/models` 的实测快照，77 条带真实 `context_length`），本段因此零网络。
+      // ⚠️ `slots` 必须返回至少一个条目：`listModels` 的门控是「无槽位 ⇒ `[]`」。
+      id: 'qiniu',
+      make: () => new QiniuAdapter({
+        ...NO_CRED,
+        // ⚠️ 这里**不得**用 `sk-` 开头的字面量：`tests/unit/repo-pii-guard.spec.ts`
+        //    会把入库文件里的 sk- 风格串判成泄漏密钥（实测命中本行即红）。
+        //    qiniu 的 KEY_PATTERN 是 `[A-Za-z0-9_.-]{16,}`（刻意不绑死前缀），故此串合法。
+        slots: async () => [{ id: 'qiniu', apiKey: 'qiniu-wire-test-key-0123456' }],
+      } as never),
+    },
+    // ⚠️ 超级麦吉（Magicrew，2026-10-29）：`channel: true` ⇒ 必须进本表，
+    //    否则它不过本段任何对拍（目录 / 模态 / 窗口 / 档位全部零覆盖）。
+    //    ⚠️ `fetchRemoteModels` 不给 ⇒ 走静态兜底表（27 条），那是**可预期**的目录；
+    //    本段只对拍跨家契约，不打远端。
+    {
+      id: 'magicrew',
+      make: () => new MagicrewAdapter({
+        ...NO_CRED,
+        resolveCredential: async () => ({ jwt: 'J', organizationCode: 'org1' } as never),
+      } as never),
+    },
+    // ⚠️ Codely（Unity，2026-10-22 A6）：`channel` 已翻 true ⇒ 必须进本表，
+    //    否则它不过本段任何对拍（目录 / 模态 / 窗口 / 档位全部零覆盖）。
+    {
+      id: 'codely',
+      make: () => new CodelyAdapter({
+        ...NO_CRED,
+        credentialProvider: async () => ({ access_token: 'COD', refresh_token: 'R' } as never),
+      } as never),
+    },
+    {
       id: 'opencode',
       make: () => new OpencodeAdapter({
         ...NO_CRED,
-        // ⚠️ opencode 的目录不来自 `createModelCatalog`（5 处协议级差异），
-        //    它需要整个 `identitySlots` 序列与池的代理映射。
+        // ⚠️⚠️ 2026-10-23 迁移后 opencode **也走 `createModelCatalog`** 了
+        //    （用户要求「实体 provider 一律走共享骨架」）⇒ 它的 `accountPool`
+        //    必须实现骨架消费的 `disabledModelsFor` / `providerClosedFor`，
+        //    只给 `opencodeProxyFor` 会抛
+        //    `deps.accountPool?.disabledModelsFor is not a function`（实测）。
         identitySlots: async () => [{ refName: 'OPENCODE_A', slotId: 's1' }],
-        accountPool: { opencodeProxyFor: () => undefined } as never,
+        accountPool: {
+          opencodeProxyFor: () => undefined,
+          disabledModelsFor: () => new Set<string>(),
+          providerClosedFor: () => false,
+        } as never,
       } as never),
     },
     {
@@ -709,7 +756,17 @@ id: 'autoclaw',
    * 「cline/codearts 恒声明」与此一致，但那里的判据是**自造 config**、
    * 不逐家核对 —— 逐家核对由本段的 (i) 承担。
    */
-  const DECLARE_UNKNOWN_REASONING: ReadonlySet<string> = new Set(['cline', 'codearts'])
+  /**
+   * 未知 id 也声明 `reasoning` 的家。
+   *
+   * ⚠️ 超级麦吉（Magicrew，2026-10-29）在此，理由与 codearts / cline 不同：
+   * 本家**默认开启思考**，而关闭它只有 `reasoning_effort: 'none'` 一个真开关
+   *（实测：不发该字段 ⇒ `reasoning_tokens` 恒 54；发 `none` ⇒ 恒 0）。
+   * 不声明 ⇒ 用户手填模型 id 时**没有档位选择器** ⇒ 永远关不掉思考
+   *（比「臆造档位」更实际的损失），而本家只两档、且上行前按
+   * `MAGICREW_REASONING_EFFORTS` 过滤（非法值本就不会发出）。
+   */
+  const DECLARE_UNKNOWN_REASONING: ReadonlySet<string> = new Set(['cline', 'codearts', 'magicrew'])
 
   it('⚠️ 表的家数 == 全部对外注册的 LLM provider（漏一家 ⇒ 它不过本段任何断言）', async () => {
     // ⚠️ 判据来自 **PROVIDER_REGISTRY**（唯一的 provider 真源），不手抄。
@@ -725,7 +782,10 @@ id: 'autoclaw',
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    expect(CASES).toHaveLength(22)
+    // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true` ⇒ 进本表：21 → 22。
+    // ⚠️ 2026-10-29 **本 fork** 并入 qiniu（七牛云）+ master 并入 magicrew：22 → 23 → 24。
+    expect(CASES).toHaveLength(25)
+    expect(CASES.map(c => c.id)).toContain('orcaterm')
   })
 
   it('★★ `catalog` 具备 `refresh` 的家，适配器上必须**存在** `refresh` 成员（转发接线）', () => {
@@ -780,9 +840,9 @@ id: 'autoclaw',
     //       **共用适配器类**，因此同样继承了 config 回调与转发（实测由本断言自己找出）。
     expect(
       forwarding.sort(),
-      '这 14 家必须都接入后台刷新（改这条名单前请先读 be42b25 与本轮修正的注释）',
+      '这 15 家必须都接入后台刷新（改这条名单前请先读 be42b25 与本轮修正的注释）',
     ).toEqual([
-      'accio', 'astudio', 'buddy', 'codearts', 'lobsterai', 'loomy',
+      'accio', 'astudio', 'buddy', 'codearts', 'lobsterai', 'loomy', 'magicrew',
       'minimax', 'minimaxintl', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
     ])
   })
@@ -871,8 +931,42 @@ id: 'autoclaw',
     // (g) 未知 id 不抛错（用户手填模型 id 是正常操作）
     const unknown = await adapter.resolveModel(id, 'no-such-model-xyz-2026')
     expect(unknown.name.length, `${id} 对未知 id 给了空名`).toBeGreaterThan(0)
-    // ⚠️ 且未知模型**不得**声明 context（不编造窗口）。
-    expect(unknown.context, `${id} 给未知 id 编造了 contextWindow`).toBeUndefined()
+    // ⚠️ 未知模型**默认不得**声明 context（不编造窗口）。
+    //
+    // ⚠️⚠️ **`codearts` 是刻意的具名例外**（2026-10-21 真实报障，见下）——
+    //    这是本不变式**唯一**的放行名单，`it.each` 逐家隔离保证其余各家仍然有牙
+    //    （历史上本条对 15 家全部有牙，见文件头注的反向验证表）。
+    //
+    //    为什么 codearts 例外：它的窗口**全部来自本地静态表**（上游两个目录端点
+    //    实测都不下发窗口），且「缺窗口」在本家的后果是**用户可见功能消失** ——
+    //    DSH 的 `contextOccupancy()` 只要 `contextWindow === undefined` 就返回
+    //    `null`，`ContextMeter` 随之 `return null` ⇒ 上下文占用条**整条不渲染**
+    //    （不是显示 0%）。用户手填模型 id 时同样会中招。
+    //    ⇒ 本家改用具名兜底 `CODEARTS_FALLBACK_CONTEXT_WINDOW`，理由与取证见
+    //    `src/llm-adapter.ts` 该常量的长注释。
+    //
+    //    ⚠️ **不得**把这条例外推广到别家：多数家的窗口来自**远端该模型的**配置，
+    //    对未知 id 编一个就是**假窗口**（分母错 ⇒ 占用比与自动压缩阈值一起错，
+    //    比「不显示」更难发现）。
+    //    ⚠️ 例外不是「跳过断言」，而是**改判据**：必须等于那个具名常量，
+    //    写成 `if (id !== 'codearts') expect(...)` 会让 codearts 这条完全无牙。
+    if (id === 'codearts') {
+      expect(
+        unknown.context,
+        `${id} 对未知 id 必须给具名兜底窗口（否则手填模型永远没有上下文占用条）`,
+      ).toEqual({ contextWindow: CODEARTS_FALLBACK_CONTEXT_WINDOW })
+    } else if (id === 'magicrew') {
+      // ⚠️ 超级麦吉（Magicrew，2026-10-29）与 codearts **同因**：两个目录端点都
+      //    **不下发** ctx ⇒ 手填/新上的模型若不给兜底窗口，上下文占用条会**整条不渲染**
+      //   （`ContextMeter` 在 `contextWindow === undefined` 时 `return null`）。
+      //    ⇒ 这里是**改判据**（必须等于那个具名常量），不是跳过断言。
+      expect(
+        unknown.context,
+        `${id} 对未知 id 必须给具名兜底窗口（否则手填模型永远没有上下文占用条）`,
+      ).toEqual({ contextWindow: MAGICREW_FALLBACK_CONTEXT_WINDOW })
+    } else {
+      expect(unknown.context, `${id} 给未知 id 编造了 contextWindow`).toBeUndefined()
+    }
 
     // (h) **未知 id 的模态形态**必须与 `OMIT_UNKNOWN_MODALITIES` 一致。
     //     ⚠️ 这一条补的是一个**已登记的覆盖缺口**：`model-catalog.spec.ts` ⑬

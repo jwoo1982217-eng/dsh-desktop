@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { spawn, execFileSync } from 'node:child_process';
+import { isAndroidRuntime } from './login-platform.js';
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { getRandomValues, randomUUID, randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -121,6 +122,8 @@ export async function pollForCredential(ticketId, secret, options = {}) {
  * 不因它挂起，后者补上缺失的监听器，二者缺一不可。
  */
 export function openBrowser(url) {
+    if (isAndroidRuntime())
+        return;
     const warn = (error) => {
         console.error('[codearts-auth] failed to open browser; open manually:', url, error);
     };
@@ -337,6 +340,8 @@ export function incognitoWindowArgs(exe, url, profileDir) {
  * @returns 是否成功以无痕方式拉起（`false` 时调用方应回退到普通打开）。
  */
 export function openIncognitoWindow(url) {
+    if (isAndroidRuntime())
+        return false;
     // ⚠️⚠️ **测试环境断路器**（2026-10-13，我自己踩出来的真实污染）。
     //
     // 本函数**会真的 spawn 浏览器**。而 `officeace-rpc-multi-account.spec.ts`

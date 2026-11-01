@@ -8,7 +8,7 @@
  * | | opencode | modelscope |
  * |---|---|---|
  * | RPC 方法 | `opencode.addAccount` | `modelscope.addAccount` |
- * | Key 形状 | `sk-…` | `ms-…` |
+ * | Key 形状 | `sk-…` / `oc_sk_…`（不绑前缀） | `ms-…` |
  * | 第二个入口 | 匿名通道（`public`） | **没有**（魔搭必须持 Key） |
  * | 提示语义 | 免费通道按出口 IP 限额 | 魔搭按日发放魔粒 |
  *
@@ -76,7 +76,7 @@ export function ModelscopeKeyModal({ error, busy, inputRef, onSubmit, onClose })
     onSubmit(value)
   }
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget && !busy && onClose) onClose() },
   },
     React.createElement('div', {
@@ -175,7 +175,7 @@ export function ModelscopeKeyEditModal({ error, busy, currentMasked, inputRef, o
     onSubmit(value)
   }
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget && !busy && onClose) onClose() },
   },
     React.createElement('div', {

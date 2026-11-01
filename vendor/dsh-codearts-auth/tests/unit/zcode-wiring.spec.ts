@@ -412,10 +412,12 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     // 2026-10-16 加 astudio：18 → 19；
     // 2026-10-17 加 autoclaw：19 → 20；
     // 2026-10-16 **本 fork** 加 modelscope（魔搭）：20 → 21；
+    // 2026-10-19 **本 fork** 加 codely（Unity 团结引擎，UI 先行）：20 → 21；
     // 2026-10-20 加 autoclawintl（AutoClaw 国际版）：21 → 22）。
     // ⚠️ 这个断言的价值是「**别把既有 provider 挤掉**」，所以它同时断言
     // 上面的具体 id；若将来再加 provider，记得同步这里。
-    expect(ids).toHaveLength(23)
+    // 2026-10-29 fork: qiniu + magicrew added -> 24 -> 25.
+    expect(ids).toHaveLength(26)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {
@@ -457,7 +459,7 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     //    `window.open(...)` 移到分支内（两种打开方式都要持有它，供轮询结束时关窗）。
     //    本用例要守的是「**通用弹窗路径仍在**」，与声明位置无关 —— 写死形态会让
     //    一次纯结构重构假失败（仓库既有教训：接线类断言须容忍重构）。
-    expect(source, '通用 window.open 弹窗路径不见了').toMatch(/openAccountLoginWindow\(\{ provider, loginUrl/)
+    expect(source, '通用 window.open 弹窗路径不见了').toMatch(/openAccountLoginWindow\(\{ provider, accountId, loginUrl, rpcCall/)
     // 空 loginUrl 的通用错误分支也要保留（它是所有 provider 的兜底）。
     expect(source).toMatch(/后端未返回登录地址/)
   })
@@ -656,11 +658,16 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：19 → 20；
     //    同日 **本 fork** 加 modelscope（魔搭）：20 → 21；
     //    2026-10-20 加 autoclawintl（AutoClaw 国际版）：21 → 22。
+    // ⚠️ 2026-10-19 **本 fork** 加 codely（Unity，UI 先行）：20 → 21。
     //    ⚠️ clientProviderIds() 是**客户端图标表**的 id 数，与 registry 口径不同 ——
     //    权威值以断言实测为准，注释里的加减号只是**历史沿革**，不要拿来推当前数字。
-    expect(clientIds.length).toBe(23)
-    // ⚠️ 20 个 auth 键（22 个客户端 id − opencode − aggregate）。
-    expect(keys).toHaveLength(20)
+    // 2026-10-29 fork: qiniu + magicrew added -> 24 -> 25.
+    expect(clientIds.length).toBe(26)
+    // ⚠️ **21 个 auth 键**（23 个客户端 id − opencode − aggregate）。
+    //    ⚠️ 2026-10-22（A6）：codely **已接续期**（`CodelyAuth` 签名修正为单参
+    //    `refreshAll(pool)`，并接入 `index.ts` 的 `auths`）⇒ 它不再是豁免项。
+    // 2026-10-29 fork: qiniu + magicrew 接续期后 auth 键 21 -> 22 -> 23.
+    expect(keys).toHaveLength(23)
     const withoutKey = clientIds.filter((id) => !keys.includes(id))
     expect([...withoutKey].sort()).toEqual(['aggregate', 'opencode', 'orcaterm'])
   })
@@ -678,8 +685,12 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     //    那层别名本身就是「键与 id 不同名」这个缺陷的化石。
     const withoutKey = clientIds.filter((id) => !keys.includes(id))
     // ⚠️ 两者豁免理由**不同**（见上一条用例的注释）：opencode 是「RPC 走
-    //    handleOpencodeRpc」、aggregate 是「没有 auth 服务」。断言写成数组
-    //    （而非 `toHaveLength(2)`）是为了在**将来多出第三个豁免**时立刻可见是哪两个。
+    //    handleOpencodeRpc」、aggregate 是「没有 auth 服务」。
+    //    ⚠️ **codely 已从本清单移出**（2026-10-22 A6）：它的 `CodelyAuth`
+    //    之前不能接是因为**契约都没对上**（`refreshAll` 是 2 参 ⇒ TS2322），
+    //    而不是「不需要续期」。
+    //    断言写成数组（而非 `toHaveLength(2)`）是为了在**将来多出豁免**时
+    //    立刻可见是哪几个。
     expect([...withoutKey].sort()).toEqual(['aggregate', 'opencode', 'orcaterm'])
   })
 })

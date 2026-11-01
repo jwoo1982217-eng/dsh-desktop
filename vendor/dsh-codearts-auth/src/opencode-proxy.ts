@@ -151,6 +151,11 @@ export function buildProxyDispatcher(proxy: NormalizedProxy): Dispatcher {
   return created
 }
 
+/** Android签名传输独占出口，释放时不销毁OpenCode共享缓存。 */
+export function createProxyDispatcher(proxy: NormalizedProxy): Dispatcher {
+  return proxy.kind === 'http' ? buildHttpDispatcher(proxy.url) : buildSocksDispatcher(proxy)
+}
+
 /** 当前缓存的代理实例数（诊断用）。 */
 export function proxyCacheSize(): number {
   return cache.size

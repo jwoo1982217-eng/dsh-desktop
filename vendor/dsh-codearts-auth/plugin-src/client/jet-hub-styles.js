@@ -4,6 +4,19 @@
 
 const STYLES = `
 .dim-jh-page { display: flex; flex-direction: column; height: 100%; }
+/* 「侧栏」面板的宿主（main 槽）：中央面板自己不留白，只给顶部一条 28px 的
+   标题带（插件市场页同款）。设置页里的 .dim-jh-page 则由 SettingsRoot 缩进，
+   两条入口共用同一个组件、靠这一层补丁拉开差别。
+   ⚠️ 顶部清障**只在 darwin 上叠加**（2026-10-26 修双重预留）：
+   Windows 的框架已经把整块内容区按 padding-top: var(--dsh-windows-titlebar-height)
+   （40px）下推过标题栏了，而 --dsh-frame-top-clearance 在 Windows 上正是同一个
+   40px ⇒ 这里若无条件再叠一次，顶部就空出 40 + 28 + 40 = 108px，用户看到的是
+   「卡片上方一大片白」。macOS 的框架不给这层 padding（红绿灯浮在内容上），
+   所以只有 darwin 需要补。判据与插件市场页的 .V7pFBG_pageHead 逐字同源。
+   ⚠️ 本文件是 JS 模板字符串，注释里**不能出现反引号**（会提前闭合）。 */
+.dim-jh-panelHost { box-sizing: border-box; height: 100%; min-height: 0; display: flex; flex-direction: column; padding: 28px 24px 24px; }
+[data-platform='darwin'] .dim-jh-panelHost { padding-top: calc(28px + var(--dsh-frame-top-clearance, 0px)); }
+.dim-jh-panelHost > .dim-jh-page { flex: 1 1 auto; min-height: 0; }
 /* ⚠️ 左右 padding 为 0（2026-10-14）：宿主 SettingsRoot 已经把整个 section
    内容区按 padding 0 24px 24px 缩进了一层（类名 .wCInkW_options，见
    @deepseek-ai/dsh-client-ui-settings-general/SettingsRoot.module.css）。
@@ -88,10 +101,18 @@ const STYLES = `
 .dim-jh-providerIcon.officeace { background: transparent; }
 /* AStudio：内联 SVG 自带不透明品牌蓝底 + 白字 A，容器白底与其它内联 SVG 家一致。 */
 .dim-jh-providerIcon.astudio { background: white; }
+/* 超级麦吉（Magicrew）：官方 favicon 自带紫蓝渐变圆底，本身即完整图形，
+   故容器保持透明（与 zcode / officeace / codely 同因：图标自己不透明，再叠白底多余）。
+   ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里不能出现反引号（会提前终止）。 */
+.dim-jh-providerIcon.magicrew { background: transparent; }
 /* 聚合 provider：内联 SVG（三渠道汇聚），白底容器中显示清晰。
    ⚠️ 加这一条是必要的 —— 上面每家的 logoClass 都各自声明了背景，
       没有兜底规则，缺了会让聚合的图标容器**没有背景**（与其它行不一致）。 */
 .dim-jh-providerIcon.aggregate { background: white; }
+/* Codely（Unity 团结引擎）：内联 SVG 自带深灰圆角底 + 白色 U，本身即完整图形，
+   故容器保持透明（与 zcode / officeace 同因：图标自己不透明，再叠白底是多余的）。
+   ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里不能出现反引号（会提前终止）。 */
+.dim-jh-providerIcon.codely { background: transparent; }
 
 /* provider 文案：align dsh-im .dim-channelCopy */
 .dim-jh-providerLabel { min-width: 0; display: grid; }
@@ -112,8 +133,14 @@ const STYLES = `
 .dim-jh-providerRow { display: grid; grid-template-columns: minmax(0, 1fr); }
 .dim-jh-providerRow .dim-jh-provider { min-width: 0; }
 
-/* 右侧面板 */
-.dim-jh-panel { flex: 1; padding: 24px; overflow-y: auto; }
+/* 右侧面板。
+   ⚠️ 2026-10-26 用户要求「页头滚动时应该只滚动账号列表」：本容器改为
+   **纵向 flex**，把「谁滚动」这件事交给子组件自己决定 ——
+   .dim-jh-accountSection 内部只让 .dim-jh-accountList 滚，
+   .dim-jh-aggPanel 自己滚。若本容器仍是普通块级 + overflow-y: auto，
+   滚动会发生在**它**身上 ⇒ 账号管理页的标题/提示/按钮组跟着一起滚走。
+   ⚠️ overflow-y: auto 保留为兜底（子项没撑开时仍能滚），正常路径下不会出现滚动条。 */
+.dim-jh-panel { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 24px; overflow-y: auto; }
 .dim-jh-providerIcon.chatgpt { background: var(--dsw-alias-label-primary, #20242b); color: var(--dsw-alias-bg-layer-3, #fff); font-size: 10px; font-weight: 750; }
 .dim-jh-chatgpt { max-width: 760px; }
 .dim-jh-chatgpt h2 { margin: 0 0 10px; font-size: 20px; }
@@ -151,7 +178,19 @@ const STYLES = `
 .dim-jh-accountCard[data-dropAfter="true"]::after { content: ''; position: absolute; left: 0; right: 0; bottom: -6px; height: 3px; border-radius: 2px; background: #1677ff; }
 /* 序号徽标：让当前优先级一目了然（顺序即自动选号优先级） */
 .dim-jh-accountOrder { flex: none; min-width: 18px; padding: 0 5px; border-radius: 6px; font-size: 11px; line-height: 17px; font-weight: 600; text-align: center; color: var(--dsw-alias-label-secondary, #5f6672); background: rgb(31 35 41 / 6%); }
-.dim-jh-orderHint { margin: 0 0 10px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
+/* 排序提示：与按钮组同处 .dim-jh-panelHead 第二行（用户 2026-10-26
+   「将按钮行合并到文案行最右侧」，随后「文案改为一行显示」）。
+   ⚠️ white-space: nowrap 是这次需求的核心：提示必须单行，不随窗口变窄折行。
+   折行会让第二行变成两行高、把按钮组挤到垂直居中的怪位置，观感也乱。
+   ⚠️ flex: 0 1 auto 而**不是** 1 1 0：1 1 0 的基准宽是 0，nowrap 下浏览器
+   仍按 min-content 撑开，结果是「要么整行、要么溢出」；0 1 auto 按内容宽
+   起算，配合 min-width: 0 才能在空间不足时真正收缩。
+   ⚠️ overflow: hidden + text-overflow: ellipsis 是 nowrap 的必要配套：
+   没有它们，窄窗口下文本会溢出到按钮组底下互相压字。省略号是最后手段，
+   完整文案挂在元素的 title 上，悬停仍可读全。
+   ⚠️ 上下 margin 归零：这一行的高度由两者中较高者决定，旧值 margin: 0 0 10px
+   是「独占一行」时代的遗留，留着会在按钮组下方多出一截空隙。 */
+.dim-jh-orderHint { flex: 0 1 auto; min-width: 0; margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
 /* 顶部一行：状态点 + 名称 + 状态标签 */
 .dim-jh-accountTop { display: flex; align-items: center; gap: 8px; }
@@ -163,9 +202,36 @@ const STYLES = `
 .dim-jh-accountTag[data-tone="off"] { color: var(--dsw-alias-label-tertiary, #8f959e); background: rgb(143 149 158 / 12%); }
 /* 「限额中」标记：与 metaRow 的 warn 同色系，让「沉到底部的原因」一眼可辨。 */
 .dim-jh-accountTag[data-tone="warn"] { color: #b45309; background: rgb(227 116 0 / 12%); }
+/* 状态徽章兼作启停开关（用户 2026-10-26：把底部「停用」按钮的功能合并进来）。
+   ⚠️ 只加「可点」的观感，不动 data-tone 的配色 —— 绿 / 灰两态与合并前逐字一致。 */
+/* 用户反馈「不明显」（2026-10-26）：只给 cursor 不够 —— 胶囊本身太像一个
+   纯展示标签。加 1px 边框，把它做成按钮的样子。
+   ⚠️ 边框会让盒子长 2px（上下各 1px），故 padding 各减 1px 抵掉，
+   与旁边的静态标签（如「限额中」）**保持等高** —— 同一行里两枚标签差
+   2px 高度非常显眼。
+   ⚠️ 先给 transparent 兜底再按 tone 上色：这样即使以后新增 tone，
+   也不会有哪一态突然变高。 */
+.dim-jh-accountTag[data-clickable="true"] { cursor: pointer; user-select: none; padding: 0 7px; border: 1px solid transparent; }
+.dim-jh-accountTag[data-clickable="true"][data-tone="on"] { border-color: rgb(34 197 94 / 45%); }
+.dim-jh-accountTag[data-clickable="true"][data-tone="off"] { border-color: rgb(143 149 158 / 40%); }
+.dim-jh-accountTag[data-clickable="true"]:hover { filter: brightness(0.94); }
+/* hover 时把边框也压深：只靠背景亮度变化，在浅色主题下几乎看不出。 */
+.dim-jh-accountTag[data-clickable="true"][data-tone="on"]:hover { border-color: #15803d; }
+.dim-jh-accountTag[data-clickable="true"][data-tone="off"]:hover { border-color: var(--dsw-alias-label-tertiary, #8f959e); }
+.dim-jh-accountTag[data-clickable="true"]:active { transform: translateY(1px); }
+/* 焦点圈：去掉它等于把「键盘可达」退化回只能用鼠标。 */
+.dim-jh-accountTag[data-clickable="true"]:focus-visible { outline: 2px solid #1677ff; outline-offset: 1px; }
 
 /* 元信息：键值对齐的网格 */
-.dim-jh-accountMeta { display: grid; gap: 3px; margin: 8px 0 0; }
+/* ⚠️ 2026-10-27 用户报障「面板在仅设置页时按钮与信息重叠，其次将积分和详细积分
+   进行分行处理，避免越界」：本容器同时是**容器查询的锚点**
+   （见下方 @container 块）。设置页里的卡片比侧栏窄一截，同一套 nowrap 布局
+   在那边会溢出到右侧按钮列上。
+   ⚠️ container-type: inline-size 只影响本容器的**宽度计算**（让内部按容器宽
+   而不是视口宽做响应式），不改变它自身的盒模型 —— 把它挂在这里而不是整个
+   .dim-jh-accountCard 上，是为了把影响面收到元信息区，不碰卡片的拖拽指示线
+   （那两条 ::before / ::after 是相对卡片定位的）。 */
+.dim-jh-accountMeta { display: grid; gap: 3px; margin: 8px 0 0; container-type: inline-size; }
 .dim-jh-metaRow { display: grid; grid-template-columns: 52px minmax(0, 1fr); align-items: baseline; gap: 8px; }
 .dim-jh-metaRow dt { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 .dim-jh-metaRow dd { min-width: 0; margin: 0; overflow: hidden; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); text-overflow: ellipsis; white-space: nowrap; }
@@ -176,8 +242,32 @@ const STYLES = `
 
 /* 账号卡片上的积分余额。
    覆盖 metaRow 的 overflow:hidden / nowrap —— 这里要的是横向排列的
-   数值 + 次要说明，而 dd 默认样式是为单行截断文本准备的。 */
-.dim-jh-metaRow dd.dim-jh-creditValue { display: flex; flex-direction: row; align-items: baseline; gap: 6px; overflow: visible; }
+   数值 + 次要说明，而 dd 默认样式是为单行截断文本准备的。
+
+   ⚠️⚠️ 2026-10-27 用户报障「面板在仅设置页时按钮与信息重叠」的**根因就在
+   这一行**：原先这里是 display: flex + overflow: visible，而父规则
+   .dim-jh-metaRow dd 带 white-space: nowrap ⇒ 那一整串
+   「永久 1670.57 · 长期 500 · 临期 200」被当成**一个不可断行的整体**按内容宽
+   撑开；dd 的宽度又被 minmax(0, 1fr) 钉住 ⇒ 内容直接画到右侧按钮列上
+   （设置页卡片窄，症状最明显；侧栏宽，看不出来）。
+
+   ★ 用户 2026-10-27 定稿方案：「详细积分也别换行了，就继续在后面，越界部分
+   使用 ... 替代，悬浮可看详情」。故这里**不换行**（nowrap），越界走省略号，
+   完整内容挂在 title 上（见 CreditBalanceRow 的 title 计算）。
+
+   ⚠️⚠️ **不能保留 display: flex**：text-overflow: ellipsis 在 flex 容器上
+   **不生效**（它只作用于块级容器的行内内容），实测表现为「flex 子项各自
+   nowrap 撑开、整行照样溢出」。故改成 block，子元素回到 inline 流。
+   ⚠️ 子元素之间的间距不再由 flex gap 提供，改由下面那条
+   > * + * 的 margin-left 给 —— 否则改成 inline 后各段会黏成一团。
+   ⚠️ 父规则已有的 text-overflow / overflow 不再被覆盖（这里刻意**不写**
+   overflow: visible），省略号才能生效。 */
+.dim-jh-metaRow dd.dim-jh-creditValue { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* inline 化：让主数值、分桶、独立池、资源包计数排在同一条不可断行的行内流里，
+   省略号才有「一个整体被截断」的语义。 */
+.dim-jh-metaRow dd.dim-jh-creditValue > * { display: inline; }
+/* 段间间距（替代原 flex gap: 6px）。用相邻兄弟选择器，首段不带左边距。 */
+.dim-jh-metaRow dd.dim-jh-creditValue > * + * { margin-left: 6px; }
 .dim-jh-creditTotal { font-size: 13px; font-weight: 600; color: #1677ff; font-variant-numeric: tabular-nums; }
 .dim-jh-creditPackages { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 /* 分桶说明（三档带色）：永久绿 / 长期黄 / 临期红 + 倒计时（用户 2026-10-12）。
@@ -194,13 +284,89 @@ const STYLES = `
 .dim-jh-creditPoolSep { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 /* 已失效额度：弱化的橙色提示，与主数值的蓝色明确区分 */
 .dim-jh-creditExpired { font-size: 11px; color: #b45309; }
+/* 独立池（AStudio 星火积分等）：与上方三档分桶并列的事实标注。
+   用中性灰而**不是** warn 橙 —— 它不是「快过期」的告警，而是「这笔钱不能混用」
+   的说明；用橙色会与临期档抢注意力。 */
+.dim-jh-creditExclusive { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
 /* 限额重置徽章行 */
 .dim-jh-rateLimits { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
 .dim-jh-rateLimitsLabel { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
-/* 操作按钮：横向一行，右对齐 */
+/* 操作按钮：横向一行，右对齐。
+   ⚠️ flex-wrap: nowrap 是**有意**的（2026-10-26 之前就是），理由是账号卡片
+   在侧栏里足够宽、行内按钮排成一条更好看。但它在**窄容器**（仅设置页那种
+   宽度）里会让按钮组溢出卡片右边缘 —— 与积分文字重叠的那个报障同源。
+   ⇒ 窄容器改由下方 @container 块覆盖成 wrap，宽容器逐字不变。
+   ⚠️ 别直接把这里改成 wrap：宽容器下 nowrap + flex-end 是「按钮贴右、
+   不换行」的既定观感，改了会波及侧栏（用户明确说那边不用处理）。 */
 .dim-jh-accountActions { display: flex; flex-direction: row; flex-wrap: nowrap; justify-content: flex-end; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--dsw-alias-border-l2, #f0f1f3); }
+
+/* 带操作按钮的积分行：第三列 auto 让按钮贴最右（用户报障「底部那排按钮
+   别单独占一行」）。⚠️ 只有传了 actions 的调用方才带这个类名 —— 其余
+   provider 的 .dim-jh-metaRow 仍是两列，逐字不变。 */
+.dim-jh-metaRow--actions { grid-template-columns: 52px minmax(0, 1fr) auto; }
+/* 挂进积分行后就不再需要「独立成行」的那些装饰（上边距 / 分隔线），
+   否则会在按钮上方多出一条线并撑高行距。
+   align-self: center 覆盖 metaRow 的 baseline —— 按钮是 flex 容器，
+   按基线对齐会贴到文字基线下方。 */
+.dim-jh-metaRow--actions .dim-jh-accountActions { margin-top: 0; padding-top: 0; border-top: 0; align-self: center; }
+
+/* ── 窄容器（仅设置页那种宽度）：积分行改成两行，按钮组独占第二行 ──
+   ⚠️⚠️ 2026-10-27 用户报障「面板在仅设置页时按钮与信息重叠」的**第二处根因**：
+   三列 grid（52px | minmax(0,1fr) | auto）里按钮列是 auto ⇒ 它按内容宽
+   吃走固定宽度，剩下给积分列的空间在设置页里只有 ~200px；而积分列里塞着
+   主数值 + 三档分桶 + 独立池 + 资源包计数四五段文字。**光靠换行还不够**：
+   换行只是把溢出从横向变成纵向，行高会涨到三四行，按钮仍与文字挨在同一行。
+
+   正解是**结构换行**：容器窄时把第三列（按钮组）下移一行独占整宽 ——
+   标签与积分占第一行，按钮组占第二行右对齐。侧栏宽度足够，不触发本块，
+   观感与改动前逐字一致（用户明说「仅在侧栏显示的话，宽度足够，可以考虑
+   不用处理」）。
+
+   ⚠️ 阈值 420px 的由来：设置页里的卡片内容宽实测约 300–380px（弹层左右
+   各留白 + rail 不出现），侧栏里约 520–700px。取 420 落在两档之间，两侧
+   都有余量 —— 不要为了「更保险」往上调，那会把侧栏也拖进两行布局。
+   ⚠️ 必须用 @container 而不是 @media：媒体查询看的是**视口**宽，而同一
+   个组件在两处入口的宽度差来自**容器**（设置弹层 vs 中央面板），视口完全
+   可能一样宽 —— 用 media 会得到「两处同时变/同时不变」的错误行为。
+   ⚠️ 容器查询锚点是上面 .dim-jh-accountMeta 的 container-type: inline-size；
+   删掉那一行，本块**整段静默失效**（浏览器不会报错，只是不匹配）。 */
+@container (max-width: 420px) {
+  /* 标签与积分占第一行，按钮组换到第二行并贴右。
+     ⚠️ grid-template-areas 比数格子稳：三列变两行时不用重算列宽。
+     ⚠️ align-items: start 覆盖基础规则的 baseline —— 窄容器下 dt / dd /
+     按钮组各自独占一格，baseline 会让空标签把行高撑歪。 */
+  .dim-jh-metaRow--actions {
+    grid-template-columns: 52px minmax(0, 1fr);
+    grid-template-areas:
+      "label value"
+      "actions actions";
+    row-gap: 6px;
+    align-items: start;
+  }
+  .dim-jh-metaRow--actions > dt { grid-area: label; }
+  .dim-jh-metaRow--actions > dd.dim-jh-creditValue { grid-area: value; }
+  /* ⚠️ 这里**不再**让主数值独占一行（用户 2026-10-27 定稿：「详细积分也别
+     换行了，就继续在后面，越界部分使用 ... 替代」）。积分行本身已是
+     nowrap + ellipsis 的**单行**，窄容器下由省略号收尾、悬浮看全 ——
+     再让它占整行只会把行数从 1 变成 2，与用户要求相反。 */
+  /* ⚠️ 按钮组在第一列起、跨两列：它现在是整行，justify-content: flex-end
+     让按钮贴右，与宽容器下的视觉位置一致（用户不会觉得按钮「跑到左边」）。 */
+  .dim-jh-metaRow--actions > .dim-jh-accountActions {
+    grid-area: actions;
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+    align-self: start;
+    /* ⚠️ 窄容器下**允许换行**：这一行有 5～6 个按钮（新手任务 / 重测 / 重置 /
+       测试 / 代理 / 令牌 / 删除），整行宽度在 300px 级容器里放不下 ——
+       nowrap 会把最后一个（删除）推出卡片外，用户看不到也点不到。
+       宽容器仍是 nowrap（见基础规则），观感不变。 */
+    flex-wrap: wrap;
+    /* 与上方积分行拉开一点距离，否则按钮紧贴积分文字。 */
+    margin-top: 2px;
+  }
+}
 
 /* 按钮：align dsh-im .dim-deliveryButton */
 .dim-jh-btn { font-size: 12px; line-height: 18px; padding: 4px 12px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); border-radius: 8px; background: var(--dsw-alias-bg-layer-3, #fff); cursor: pointer; color: var(--dsw-alias-label-primary, #1f2329); white-space: nowrap; transition: border-color .15s ease, background .15s ease, color .15s ease; }
@@ -221,31 +387,147 @@ const STYLES = `
    终止字符串（本次构建失败的成因）。 */
 .dim-jh-iconBtn { display: inline-flex; align-items: center; justify-content: center; padding: 4px 8px; min-width: 26px; }
 .dim-jh-iconBtn svg { display: block; }
+/* 图标 + 短文字（如「模型列表」的列表图标 + 「模型」二字）。
+   ⚠️ 与 .dim-jh-iconBtn 的区别：那个是纯图标（正方形，文案全在 title 里），
+   这个是「图标打头、文字收尾」，横向排列且保留 6px 间距 —— 没有这条间距，
+   svg 会紧贴文字，看着像一个怪字符。
+   ⚠️ 本文件整体是 JS 模板字符串，注释里绝不能出现反引号（本行因此红过多次）。 */
+.dim-jh-iconTextBtn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.dim-jh-iconTextBtn svg { display: block; flex: none; }
+/* 加载态：图标自转（「刷新积分」换图标后没有文字可换，只能靠动效表达进行中）。
+   ⚠️ 必须尊重 prefers-reduced-motion —— 前庭功能敏感的用户会被旋转动画伤到，
+   这是无障碍硬要求，不是可选项。降级后仍有 .dim-jh-btn:disabled 的 .5 透明度可辨识。
+   ⚠️ 两条选择器缺一不可：纯图标按钮（刷新积分 / 新建账号 / 删除）用
+   .dim-jh-iconBtn，而「图标 + 短文字」按钮（模型、永久积分）用
+   .dim-jh-iconTextBtn —— 只写前者时，后者的图标在加载态**不会转**，
+   用户眼神落在图标上就以为没点上。
+   ⚠️ 本文件整体是 JS 模板字符串，注释里绝不能出现反引号（本行就因此红过一次）。 */
+@keyframes dim-jh-spin { to { transform: rotate(360deg); } }
+.dim-jh-iconBtn[data-loading="true"] svg,
+.dim-jh-iconTextBtn[data-loading="true"] svg { animation: dim-jh-spin .9s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .dim-jh-iconBtn[data-loading="true"] svg,
+  .dim-jh-iconTextBtn[data-loading="true"] svg { animation: none; }
+}
 
 /* 限流 TTL 徽章 */
 .dim-jh-ttlBadge { display: inline-block; padding: 1px 8px; border-radius: 999px; background: rgb(227 116 0 / 10%); color: #b45309; font-size: 11px; line-height: 17px; font-weight: 500; }
 
 /* 面板标题区：标题独占一行，操作按钮另起一行。
-   此前用单行 space-between 把标题与 5 个按钮挤在一起，面板一窄就溢出被裁掉。 */
-.dim-jh-panelHead { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin-bottom: 16px; }
+   此前用单行 space-between 把标题与 5 个按钮挤在一起，面板一窄就溢出被裁掉。
+
+   ⚠️⚠️ **刻意不写 align-items（= 默认 stretch）**（2026-10-21 合并审计的**根因修法**）。
+
+   原先这里是 align-items: flex-start ⇒ panelHead 是 column flex、交叉轴是**水平**
+   ⇒ 每个子项按 fit-content 收缩到 **max-content**。后果是**一整类**「窄条/贴左」缺陷，
+   而不只是账号卡片那一格：
+
+   - .dim-jh-accountList：单账号时卡片缩成 ~257px 窄条（多账号时被那句约 1200px 长的
+     排序提示撑宽，所以只有单账号暴露）—— 这是用户真机看到的那一格；
+   - .dim-jh-probeNotice / .dim-jh-empty / 补偿卡片：**短文案**时渲染成带边框背景的
+     **窄药丸**；其中 .dim-jh-empty 的加载文案 正在读取账号列表… 还带
+     text-align: center ⇒ 每次开面板都看到一句**贴左**的加载提示（最常被看到的一格）。
+
+   ⇒ 去掉 align-items 让全部子项 stretch 到面板宽，**一次修好账号列表 + 7 个兄弟**。
+
+   ⚠️ **本次唯一的可见行为变化**：.dim-jh-headerActions 有 justify-content: center，
+   而它此前是 max-content 宽（没有空余可分配 ⇒ 居中不生效、观感贴左）；现在它整宽 ⇒
+   按钮总宽小于面板宽时**真的居中**（这正是它声明 center 的本意）。
+   ⚠️ 2026-10-26 起改为贴右（见下方 .dim-jh-headerActions 段落），本段只保留
+   「不要改回 flex-start」这条仍然成立的结论。
+
+   ⚠️ **不要**把它改回 flex-start：那会同时复发上面那一整类缺陷
+   （而下面 .dim-jh-accountList 那两条规则只能兜住账号列表这一格）。
+
+   ⚠️ 2026-10-26 由 column 改为 **row + wrap**（用户要求「将按钮行合并到
+   文案行最右侧」）。布局契约（同日第三次改后，账号列表已移出本容器）：
+     第一行 = .dim-jh-panelTitle（flex: 1 0 100% 强制独占）
+     第二行起 = 各条 .dim-jh-probeNotice（flex: 1 0 100% 各占一整行，见下方规则）
+     最后一行 = .dim-jh-orderHint（flex: 0 1 auto）+ .dim-jh-headerActions
+              （margin-left: auto 贴右）
+   ⚠️ 账号列表**不再**是本容器的子项（它挪到 .dim-jh-accountSection 下，
+   由那里负责滚动）—— 所以本容器里没有「第三行起 = accountList」那条了。
+   ⚠️ 三个子项的 flex-basis 是**互相依赖**的：任何一项改成 auto，那一行就会
+   与相邻项挤在一起。改布局时三处一起看，别只改一处。
+   ⚠️ align-items: center 让「提示 + 按钮组」那一行里两种高度的元素垂直居中对齐。 */
+.dim-jh-panelHead { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 16px; }
+/* 标题独占一行（用户 2026-10-26「将按钮行合并到文案行最右侧」的配套）。
+   ⚠️ flex-basis: 100% 是唯一能让标题单独占一行的写法：wrap + basis 100%
+   会把后续兄弟挤到下一行，而**不必**给 panelHead 换 flex-direction。 */
+.dim-jh-panelHead > .dim-jh-panelTitle { flex: 1 0 100%; }
+/* 面板级状态提示（探测结果 / 锁定状态 / 领取结果 / 新手任务 / 登录链接 / 补偿卡）。
+   ⚠️ 2026-10-26 用户要求「信息应该在按钮行上方行，而不是下方行」：这些提示
+   已从 section 直接子节点搬进 panelHead、排在按钮组之前，**必须各占一整行**。
+   缺了 flex: 1 0 100% 这条，它们是 flex: 0 1 auto 的，会与按钮组挤在同一行 ——
+   正是「补偿积分已领取」被挤到按钮组右侧那个报障的形态。
+   ⚠️ margin-bottom 归零：行间距由 panelHead 的 gap: 10px 统一给，
+   两套间距并存会让提示与按钮行之间多出一截。
+   ⚠️ 必须是**直接子级**选择器：若哪天有人给这些提示包一层容器，本规则
+   与下面那两条 tone 规则会一起失效（它们全部挂在直接子级上）。 */
+.dim-jh-panelHead > .dim-jh-probeNotice { flex: 1 0 100%; margin-bottom: 0; }
+/* 账号管理页：整页是一个纵向 flex，**只有账号列表滚动**（用户 2026-10-26
+   「页头滚动时应该只滚动账号列表」）。
+   布局契约：
+     第一行 .dim-jh-panelHead   —— flex: none，页头恒在顶部，不参与滚动
+     第二行 .dim-jh-accountList —— flex: 1 1 auto + min-height: 0 + overflow-y: auto
+                                    （以及「正在读取 / 空态」那几个 .dim-jh-empty）
+   ⚠️ min-height: 0 是必需的：flex 子项默认 min-height: auto，内容多时它会被
+   撑到内容高而不是收缩，于是滚动条又跑回 .dim-jh-panel 上，页头照旧跟着滚。
+   ⚠️ 非列表态（loading / error / 空账号）用的是 .dim-jh-empty，同样给 flex: 1 1 auto
+   让它在剩余空间里居中，而不是把 section 撑出滚动。 */
+.dim-jh-accountSection { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+.dim-jh-accountSection > .dim-jh-panelHead { flex: none; }
+.dim-jh-accountSection > .dim-jh-empty { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+
+/* 账号列表容器：宽度与账号数量无关，并且**它就是滚动容器**
+   （用户 2026-10-26「页头滚动时应该只滚动账号列表」）。
+   ⚠️ 2026-10-26 第二次改：本容器此前是 .dim-jh-panelHead 的子项
+   （那时用 flex: 1 0 100% 靠 wrap 强制独占一行）。现在它在
+   .dim-jh-accountSection（**纵向** flex）里，那套 basis: 100% 的写法
+   在纵向主轴下等于「高度取满容器且不许收缩」⇒ 内容多时直接溢出、
+   滚动条跑回 .dim-jh-panel 上，页头又开始跟着滚。
+   正确写法是 flex: 1 1 auto + min-height: 0 + overflow-y: auto。
+   ⚠️ 根因已在上面 .dim-jh-panelHead 修掉（去掉 align-items: flex-start），
+      故 align-self 现在是**冗余兜底** —— 保留是刻意的：万一有人把
+      align-items: flex-start 改回来，账号列表（用户唯一明确报障过的那一格）仍正确。
+   ⚠️ min-width: 0 在纵向 flex 的**交叉轴**方向是惰性声明，保留只为将来
+      本容器改成横向排布时承重；**不要**把它当成「账号列表靠它才整宽」。 */
+.dim-jh-accountList { flex: 1 1 auto; align-self: stretch; min-width: 0; min-height: 0; overflow-y: auto; }
+.dim-jh-accountList > .dim-jh-accountCard { width: 100%; box-sizing: border-box; }
 .dim-jh-panelTitle { margin: 0; font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
 
-/* 面板标题下方的操作按钮组（显示列表 / 刷新积分 / 一键领取积分 / 重测所有 / 重置所有 / 新建账号）。
-   允许换行：按钮数量随 provider 变化（CodeBuddy 有「一键领取积分」，其他没有），
-   固定单行在窄面板下必然放不下。 */
-/* ⚠️ 本文件 CSS 装在**模板字符串**里 —— 注释内绝不能出现反引号，否则提前
+/* 操作按钮组。**两类页头共用同一个类名**，对齐方式不同：
+   ① 全局页头（.dim-jh-header 内）：供应商 / 一键签到 / 备份 / 恢复 / 网关 /
+      Token 用量 / 渠道原生搜索 —— **居中**；
+   ② 账号管理页头（.dim-jh-panelHead 内）：模型列表 / 刷新 / 一键领取积分 /
+      重测所有 / 重置所有 / 新建账号 —— **贴右**（与排序提示同一行）。
+   ⚠️ 故基础规则写**居中**，贴右只在 .dim-jh-panelHead 的直接子级选择器下覆盖。
+   2026-10-26 我先直接把基础规则改成 flex-end，结果把全局页头那排按钮也
+   一起拖到了最右（用户截图报障「供应商…渠道原生搜索按钮行应该保持居中」）——
+   共用类名改默认值会波及另一处，这是本文件最常犯的一类错。
+   ⚠️ 允许换行：按钮数量随 provider / 状态变化，固定单行在窄窗口下必然溢出。
+   ⚠️ 本文件 CSS 装在**模板字符串**里 —— 注释内绝不能出现反引号，否则提前
    闭合、esbuild 报 "Expected ; but found ..." 并把指针指到注释行（2026-10-07
    在同一天内踩了两次，故把这条写进最常改的页头段落）。
    ⚠️ 页头左侧标题块（.dim-jh-brand / .dim-jh-brandName）已删除（2026-10-07）。
-   ⚠️ 对齐方式历经三次调整，**当前是居中**：
+   ⚠️ 全局页头的对齐历经三次调整，**当前是居中**：
    ① 有标题时：space-between 靠标题把按钮推到右边；
    ② 标题删除后：改 flex: 1 + 默认左对齐（贴左，注释原话「保持原观感」）；
-   ③ 2026-10-14：用户要求改**居中**（justify-content: center）—— 按钮组
-      是页头唯一内容，居中让整排在视觉上更平衡，也不与下方内容左边界打架。
-   ⚠️ 仍**保留** flex-wrap: wrap：窗口极窄时让按钮换行远好过溢出到窗口外点不到。
+   ③ 2026-10-14：用户要求改**居中**（justify-content: center）——
+      按钮组是页头唯一内容，居中让整排在视觉上更平衡，也不与下方内容左边界打架。
    ⚠️ 居中与 flex: 1 1 auto 并存是**必需的**：去掉 flex 后容器宽度收缩到内容宽，
    justify-content 就没有可分配的空间、视觉上退回贴左。 */
 .dim-jh-headerActions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px; flex: 1 1 auto; min-width: 0; }
+
+/* 账号管理页头里的那一组**贴右**（用户 2026-10-26「将按钮行合并到文案行最右侧」）：
+   margin-left: auto 是主手段（排序提示存在时把它顶到最右），
+   justify-content: flex-end 是兜底（提示为 null、本组独占一行时同样贴右）。
+   ⚠️ 两条缺一不可：只留 flex-end 时提示会与按钮组之间留一大段空白；
+   只留 auto 时「账号 ≤ 1、提示不渲染」那种状态下按钮组会贴左。
+   ⚠️ flex: 1 1 auto 在这里的作用是让本组吃掉第二行的剩余宽度，
+   auto 外边距才有效（若本组收缩到内容宽，auto 外边距没有可分配空间，
+   视觉上会贴着提示末尾而不是贴右）。 */
+.dim-jh-panelHead > .dim-jh-headerActions { justify-content: flex-end; margin-left: auto; }
 
 /* 上一次「重测 / 重置」的结果提示 */
 .dim-jh-probeNotice { margin-bottom: 12px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); background: var(--dsw-alias-bg-layer-2, #f7f8fa); font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); }
@@ -271,19 +553,30 @@ const STYLES = `
 /* 复用登录弹窗的遮罩模式：fixed 覆盖全屏，z-index 高于设置页内容。
    3000 高于 .dim-jh-loginOverlay 的 1000，保证两个弹窗同时存在时模型列表在上。 */
 .dim-jh-modalOverlay { position: fixed; inset: 0; z-index: 3000; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(0,0,0,0.32); }
-/* 模型列表弹窗：**顶部锚定**而非垂直居中。
-   ⚠️ 这是修真实缺陷（用户报障「输入文字后整个弹框的位置会发生改变，有点突兀」）：
-   弹窗高度随列表长度变化，而 align-items: center 会把高度变化直接变成**整体
-   位置跳动** —— 实测输入搜索词后 top 从 4px 跳到 187px（结果变少 → 弹窗变矮 →
-   居中的位置跟着上移）。顶部锚定后上边缘固定，只在下方伸缩，视觉上稳定。
-   只作用于模型列表，不影响账号备份弹窗。
+/* ⚠️ .dim-jh-modalOverlay--top（顶部锚定修饰类）已于 2026-10-26 **整体删除**，
+   全仓已无任何 className 用到它。它当初存在的理由（2026-10-07 真实报障
+   「输入文字后整个弹框的位置会发生改变，有点突兀」）并没有消失：
+   align-items: center 会把「弹窗高度变化」直接翻译成「整体位置跳动」——
+   模型列表弹窗搜索后从 32 项变 3 项，实测 top 从 4px 跳到 187px。
+   当时的解法是把上边缘钉死在顶部（flex-start + 8vh）。
+   现在用户要求**所有弹窗一律居中**（视觉一致性优先），故改为
+   「居中 + 给弹窗兜一个 min-height」，把高度变化区间压到 (min-height, max-height]。
+   见下方 .dim-jh-modal 的 min-height 注释。
+   ⚠️ 若日后仍有「弹窗上下跳」的报障，正解是给**列表型**弹窗固定 height，
+   而不是把本修饰类加回来（加回来就等于又一次违反「全部居中」）。
    ⚠️ 本文件整体是 JS 模板字符串，注释里**不能出现反引号**（会提前终止字符串）。 */
-.dim-jh-modalOverlay--top { align-items: flex-start; padding-top: max(24px, 8vh); }
-/* 顶锚后可用高度由 padding 决定，故 max-height 按 padding box 计算（100%），
-   不再用 100vh - 48px 这类视口算式 —— 否则 8vh 大于 24px 时会溢出视口。 */
-.dim-jh-modalOverlay--top .dim-jh-modal { max-height: 100%; }
-.dim-jh-modal { display: flex; flex-direction: column; width: min(560px, 100%); max-height: min(640px, calc(100vh - 48px)); padding: 20px 22px; border-radius: 14px; background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 16px 48px rgba(0,0,0,0.22); }
-.dim-jh-modal--ledger { width: min(960px, 100%); max-height: min(820px, calc(100vh - 40px)); }
+/* 弹窗本体：max-height 按视口封顶，min-height 兜住居中时的跳动幅度。
+   min-height 取 300px 的由来：模型列表 3 项时内容高约 260px，兜到 300 后
+   与「32 项撑满 640px」的位移差从约 380px 降到约 340px —— 仍有位移，但
+   视觉上不再像「跳了一下」；再往上兜（如 480px）会让表单型小弹窗空出一大片。 */
+.dim-jh-modal { display: flex; flex-direction: column; width: min(560px, 100%); min-height: min(300px, calc(100vh - 48px)); max-height: min(640px, calc(100vh - 48px)); padding: 20px 22px; border-radius: 14px; background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 16px 48px rgba(0,0,0,0.22); }
+/* Token 用量弹窗：比通用弹窗宽一档（960px），高度上限 700px（2026-10-26 用户指定）。
+   ⚠️ 这里同时把 min-height 压回 0：通用 .dim-jh-modal 的 min-height 是 300px
+   （为居中时兜住「列表变短导致整体跳动」），但本弹窗的内容永远够高，
+   那条兜底只会让它下边框多空出一截 —— 本弹窗要的是「上下收紧」。
+   max-height 取 700px：比通用 640px 高、比原 820px 矮；1080p 下遮罩内边距
+   24px×2 之后仍有余量，汇总区 3 张卡片 + 明细表十余行的常见形态不出滚动条。 */
+.dim-jh-modal--ledger { width: min(960px, 100%); min-height: 0; max-height: min(700px, calc(100vh - 48px)); }
 .dim-jh-modalHead { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .dim-jh-modalTitle { min-width: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; font-size: 15px; line-height: 22px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
 .dim-jh-modalSubtitle { overflow: hidden; font-size: 12px; line-height: 18px; font-weight: 400; color: var(--dsw-alias-label-tertiary, #8f959e); text-overflow: ellipsis; white-space: nowrap; }
@@ -295,8 +588,9 @@ const STYLES = `
 .dim-jh-emph-danger { color: #b3261e; font-weight: 600; }
 .dim-jh-emph-warn { color: #b45309; font-weight: 600; }
 .dim-jh-modal .dim-jh-probeNotice { flex: none; margin: 10px 0 0; }
-/* 批量工具条（打开全部 / 关闭全部）：固定不滚动，紧跟在说明文字下方 */
-.dim-jh-modelBulkBar { flex: none; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+/* .dim-jh-modelBulkBar（模型列表顶部「打开全部 / 关闭全部」工具条）已于
+   2026-10-26 随按钮一起删除。分组按钮走 .dim-jh-modelGroupBtn，不受影响。
+   ⚠️ 本条注释里**不能**出现反引号：STYLES 整段是模板字符串，写一个就提前闭合。 */
 /* 搜索 + 状态筛选条（Cline 目录近 500 条，没有它就只能一页页翻）。
    允许换行：窄面板下搜索框与三个状态按钮放不进一行。 */
 .dim-jh-modelFilterBar { flex: none; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
@@ -327,6 +621,18 @@ const STYLES = `
 .dim-jh-modelRow:hover { background: var(--dsw-alias-bg-layer-2, #f7f8fa); }
 /* 已关闭的模型整体降透明度：一眼能看出哪些被隐藏了 */
 .dim-jh-modelRow[data-disabled="true"] .dim-jh-modelInfo { opacity: 0.5; }
+
+/* 行首的供应商图标（2026-10-26，用户要求「所有页面供应商和模型左侧 + 图标」）。
+   ⚠️ .dim-jh-providerIcon 的基类尺寸是 30px —— 那是给左栏 rail 的 48px 高按钮
+   用的；模型行 padding 只有 7px，直接套会顶高整行、把行距撑开。
+   故这里用**后代选择器**就地收窄，不动基类（rail 与两处弹窗共用同一枚 class）。
+   flex: none 是必需的：同行的 .dim-jh-modelInfo 是 flex: 1 1 auto，
+   图标若参与收缩会被长模型名挤成一条线。
+   阴影也去掉 —— 22px 的方块配 30px 的那层投影会显脏。 */
+.dim-jh-modelRow > .dim-jh-providerIcon { flex: none; width: 22px; height: 22px; border-radius: 6px; box-shadow: none; }
+.dim-jh-modelRow > .dim-jh-providerIcon img { width: 15px; height: 15px; }
+/* 已关闭的模型连图标一起降透明度：只淡文字会让图标显得「亮着但不可用」。 */
+.dim-jh-modelRow[data-disabled="true"] > .dim-jh-providerIcon { opacity: 0.5; }
 
 /* 「供应商开关」弹窗的行拖拽（2026-10-06）。
    视觉语言与账号卡片（.dim-jh-accountCard[data-dragging] 系）完全一致：
@@ -520,6 +826,13 @@ const STYLES = `
 /* 计数与按钮：可以掉到第二行，但**不换行、不截断**（flex: none 保证不被挤没）。 */
 .dim-jh-gatewayCardCount { flex: 0 0 auto; margin-left: auto; font-size: 11px; line-height: 17px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--dsw-alias-label-tertiary, #8f959e); }
 .dim-jh-gatewayCardHead .dim-jh-gatewayCardBtn { flex: none; padding: 2px 8px; font-size: 11px; }
+/* 卡片标题里的供应商图标（2026-10-26）。
+   ⚠️ 基类是 display: grid（block-level）—— 直接塞进这个按钮会在图标前后**各断
+   一行**，标题当场变成三行。而按钮本身不是 flex 容器（它是 flex: 1 1 auto 的
+   **项**），故这里只能用 inline-grid + vertical-align 把它压回文字流。
+   负的 vertical-align 是让 18px 方块的中线对准 12.5px 文字的视觉中线。 */
+.dim-jh-gatewayCardToggle > .dim-jh-providerIcon { display: inline-grid; vertical-align: -5px; width: 18px; height: 18px; margin-right: 4px; border-radius: 5px; box-shadow: none; }
+.dim-jh-gatewayCardToggle > .dim-jh-providerIcon img { width: 13px; height: 13px; }
 .dim-jh-gatewayCardBody { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; padding: 3px 4px 5px; }
 /* 一行模型（**只读**，无开关）：短名字 + 展示名 + 能力标记。
    ⚠️ 行内显示的是去掉供应商前缀的名字（见 gatewayModelKeyOf）—— 卡片头已经
@@ -724,6 +1037,15 @@ const STYLES = `
 .dim-jh-modePick input[type="radio"] { margin: 0; accent-color: #1677ff; }
 /* 弹窗底部动作区：右对齐（生成/确认按钮） */
 .dim-jh-modalActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+/* ── 备份 / 恢复弹窗的方向切换条（2026-10-27 合并两个入口后新增）──
+   ⚠️ 这是「换一页」不是「选项」：两个按钮互斥、点即生效，故用按钮 + data-active
+   而不是 radio（radio 的语义是随表单一起提交，这里没有提交动作）。
+   ⚠️ 选中态沿用既有的 data-kind="primary" 观感（蓝底白字）**不**另起一套配色：
+   本仓库反复记录过「两套样式看起来不像同一个 UI」。 */
+.dim-jh-backupTabs { display: flex; gap: 8px; margin: 2px 0 10px; }
+/* 选中态：与 .dim-jh-btn[data-kind="primary"] 逐字同形（背景/边框/文字三处）。 */
+.dim-jh-backupTabs .dim-jh-btn[data-active="true"] { background: #1677ff; color: #fff; border-color: #1677ff; font-weight: 600; }
+.dim-jh-backupTabs .dim-jh-btn[data-active="true"]:hover:not(:disabled) { background: #0f5fce; border-color: #0f5fce; color: #fff; }
 
 
 /* ── Cline「订阅额度」弹窗（官方额度窗口 + 请求记录）── */
@@ -1105,7 +1427,31 @@ const STYLES = `
    ⚠️ 本文件是模板字符串 ⇒ 注释里**禁止反引号**（会提前闭合）。
    ⚠️ 带属性选择器的规则必须放在**基础规则之后**（model-filter.spec.ts 的 ruleOf()
       按源码顺序取第一条匹配规则，写在前面会让它误取到新块、跳过基础规则）。 */
-.dim-jh-aggPanel { padding: 16px 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+.dim-jh-aggPanel { flex: 1 1 auto; min-height: 0; padding: 16px 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+/* ⚠️⚠️ 面板的**直接内容子项必须 flex: none**（真实缺陷，用户 2026-10-27 报障
+   「聚合页模型列表显示异常」：22 个聚合模型的每行都被压成几像素高的细线，
+   右侧只剩一片横线，一个字都看不见）。
+   根因链：2026-10-26 的账号页重排给本容器加了 flex: 1 1 auto + min-height: 0
+   （目的：让面板自己滚，而不是把滚动条推给外层 .dim-jh-panel）——但本容器
+   同时还是 display: flex / flex-direction: column，于是它成了「高度受限的
+   纵向 flex 容器」，而**子项默认 flex-shrink: 1 会在内容超高时被压缩**，
+   不是溢出。.dim-jh-aggModel 又带 overflow: hidden ⇒ 它的 min-height: auto
+   自动下限**失效**，能被一路压到 0 高。
+   ⇒ 约束高度 + 子项不收缩 + overflow-y: auto，三者齐备才是「内容保持原高、
+     超出就滚动」。
+   ⚠️ **不得用通配符 .dim-jh-aggPanel > * **。
+   ⚠️ 2026-10-28 审计更正：原先这里写的理由是「会把 .dim-jh-aggCount 一起钉死」——
+   那是**错的**：aggCount 是 .dim-jh-aggToolbar 的**孙节点**，子代组合器 > *
+   根本选不到它（flex-basis: 100% 的换行不受影响）。
+   真实理由两条：① 逐类名让「本面板有哪些直接子项」在 CSS 里**可读、可与渲染树对照**；
+   ② 通配符会把**将来**新增的直接子项也一并钉成 flex: none —— 若新子项需要收缩
+   （例如一条可压缩的提示条），它会静默失去弹性。 */
+.dim-jh-aggPanel > .dim-jh-aggIntro,
+.dim-jh-aggPanel > .dim-jh-aggToolbar,
+.dim-jh-aggPanel > .dim-jh-aggNotice,
+.dim-jh-aggPanel > .dim-jh-aggEmpty,
+.dim-jh-aggPanel > .dim-jh-aggModel,
+.dim-jh-aggPanel > .dim-jh-aggFooter { flex: none; }
 .dim-jh-aggIntro { display: flex; flex-direction: column; gap: 4px; }
 .dim-jh-aggTitle { margin: 0; font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary, #1a1a1a); }
 .dim-jh-aggIntroLine { margin: 0; font-size: 12px; line-height: 1.7; color: var(--dsw-alias-label-secondary); }
@@ -1139,13 +1485,41 @@ const STYLES = `
    分组标题冗余（且其中的「(2)/(5)」是**模型个数**，容易被误读成渠道个数）。
    ⚠️ 本文件的样式整体是一个模板字符串 —— 注释里**不能出现反引号**（会提前终止，
    有专门用例守着：usage-badge-client.spec.ts / zcode-channel-dialog.spec.ts）。 */
-.dim-jh-aggModel { border: 1px solid var(--dsw-alias-border-secondary); border-radius: 8px; overflow: hidden; }
+/* ⚠️ 模型块是这一页**唯一的重复单元**（22 个平铺），它的观感就是整页的观感。
+   ⇒ 底色 / 边框 / 悬停 / 展开态四件套都在这几处定，别散落到别处去覆盖。
+   「transition」 同时过渡边框与阴影：展开瞬间的抬升要有过程，不能是跳变。 */
+.dim-jh-aggModel { border: 1px solid var(--dsw-alias-border-secondary); border-radius: 8px; overflow: hidden; background: var(--dsw-alias-bg-layer-1, #fff); transition: border-color .15s ease, box-shadow .15s ease; }
+/* 悬停：边框提亮 + 一层极淡投影（暗示「这一块整体是一个可点单元」）。
+   ⚠️ 阴影必须**极淡**（7% 以内）：22 个块若同时带明显投影，整页会发灰。 */
+.dim-jh-aggModel:hover { border-color: var(--dsw-alias-border-l2, #d0d3d8); box-shadow: 0 1px 4px rgb(31 35 41 / 7%); }
+/* 展开态：边框转品牌色 + 阴影加深 + **模型头底色加一层淡蓝**。
+   ① 边框用 brand 而不是更深的灰 —— 22 个块里只有一个展开，
+      要让它在滚动的长列表里**一眼能定位**（用户滚到中间时不至于找不到自己在看哪块）。
+   ② 头部底色与边框同源（brand 6%）：单独染边、不染头会显得「框是框、内容是内容」。
+   ③ 展开态优先于悬停，但两条腿的**取胜机制不同**（2026-10-28 审计更正）：
+      · 边框 / 阴影：与 :hover **同特异性**（都是 (0,2,0)），靠**顺序在后**取胜；
+      · 模型头底色：展开态那条写在 :hover **之前**，靠**特异性**取胜
+        （[data-open=true] > .dim-jh-aggModelHead = (0,3,0)
+        > .dim-jh-aggModelHead:hover = (0,2,0)）。
+      ⇒ 别把「顺序在后」当成这两条的共同前提：底色那条挪到 hover 之后结果**不变**；
+        它真正不能动的是**特异性**（少一个类名就会输给 hover）。 */
+.dim-jh-aggModel[data-open='true'] { border-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #1677ff) 45%, var(--dsw-alias-border-secondary)); box-shadow: 0 2px 8px rgb(22 119 255 / 10%); }
+.dim-jh-aggModel[data-open='true'] > .dim-jh-aggModelHead { background: color-mix(in srgb, var(--dsw-alias-brand-primary, #1677ff) 6%, transparent); }
 /* 模型平铺后的行间距：原先由 .dim-jh-aggGroup 的 gap: 4px 提供，分组去掉后
    改由相邻兄弟选择器承担（与 .dim-jh-railGroup + .dim-jh-railGroup 同一模式）。 */
 .dim-jh-aggModel + .dim-jh-aggModel { margin-top: 4px; }
-.dim-jh-aggModelHead { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 10px; border: 0; background: none; font: inherit; font-size: 13px; text-align: left; color: var(--dsw-alias-label-primary); cursor: pointer; }
+/* 模型头：整块唯一的常驻行，高度与字号是这一页的「节奏基准」。
+   ⚠️ padding 从 7px 提到 9px：22 行的列表里，行高过密会让点击目标过小
+   （用户要连点十几下才能展开自己关心的模型）。9px + 13px 字号 ≈ 33px 行高，
+   仍显著小于左栏 rail 的 48px，不会把列表撑得过分松散。 */
+.dim-jh-aggModelHead { display: flex; align-items: center; gap: 8px; width: 100%; padding: 9px 10px; border: 0; background: none; font: inherit; font-size: 13px; text-align: left; color: var(--dsw-alias-label-primary); cursor: pointer; transition: background .15s ease; }
+/* ⚠️ 悬停底色**必须弱于**展开态的 brand 6%：否则鼠标一划过，
+   展开块与未展开块看起来一模一样，「data-open」 那层染色就白做了。 */
 .dim-jh-aggModelHead:hover { background: var(--dsw-alias-bg-secondary, rgba(0, 0, 0, 0.03)); }
-.dim-jh-aggModelName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 模型名：这一行唯一吃剩余宽度的一格。
+   ⚠️ 字重 500 而不是 600 —— 22 个块个个加粗会让整页看起来「到处都在喊」，
+   而这里确实只有模型名值得这一档。 */
+.dim-jh-aggModelName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
 /* 「候选全部未参与轮换」提示（规格 §5.2 要求显式提示，避免用户以为模型坏了）。
    ⚠️ 用 warning 色与说明文字区分开（它是**需要注意**的状态）。
    ⚠️⚠️ 2026-10-16（用户验收：「占太宽了把模型名字都挤没了」）三道防线：
@@ -1154,12 +1528,76 @@ const STYLES = `
    - max-width: 40% + 省略号，帽子不得无限撑开。
    模型名那一格是 flex: 1 / min-width: 0，故剩余宽度全归它（超长才省略号）。 */
 .dim-jh-aggAllRejected { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 6px; border-radius: 4px; font-size: 11px; color: var(--dsw-alias-state-warn-primary, #b45309); background: var(--dsw-alias-bg-warn, rgba(180, 83, 9, 0.10)); }
-.dim-jh-aggChevron { font-size: 11px; color: var(--dsw-alias-label-tertiary); }
+/* 展开箭头：字符「▸」换成了 svg（用户 2026-10-27「美化聚合页模型列表」）。
+   ⚠️ 之所以换 svg 而不是继续用字符：字符版**没有中间态**，展开时是从
+   「▸」直接跳到「▾」，在高频点击的模型列表里显得很廉价；svg 走 transform
+   旋转就有过渡。这也是全站图标化的既有口径（删除 / 刷新 / 模型 都是 svg）。
+   ⚠️ 尺寸必须**钉死** 14px：svg 自带 12px，若不给容器定宽，「place-items: center」
+   下它会与 13px 的文字基线对不齐，箭头看着偏上。 */
+.dim-jh-aggChevron { flex: none; display: grid; place-items: center; width: 14px; height: 14px; color: var(--dsw-alias-label-tertiary); transition: transform .15s ease, color .15s ease; }
+.dim-jh-aggModel[data-open='true'] > .dim-jh-aggModelHead > .dim-jh-aggChevron { transform: rotate(90deg); color: var(--dsw-alias-brand-primary, #1677ff); }
 .dim-jh-aggCandidates { display: flex; flex-direction: column; border-top: 1px solid var(--dsw-alias-border-secondary); }
-.dim-jh-aggCandidate { display: flex; align-items: center; gap: 8px; padding: 5px 10px 5px 20px; font-size: 12px; }
+/* 候选行的行距（用户 2026-10-27「美化聚合页模型列表」）。
+   ⚠️ 从 5px 提到 6px：分成四格之后横向元素变多，行与行贴太近时
+   「哪一格属于哪一行」会看不出来（尤其是倍率徽章有底色，视觉重量比纯文字大）。
+   ⚠️ 左内距 20px 是留给拖动柄的；拖动柄只在手工模式下出现，
+   但**不能**因此把左内距改成条件式的 —— 那会让模式切换时整列文字左右横跳。 */
+.dim-jh-aggCandidate { display: flex; align-items: center; gap: 6px; padding: 6px 10px 6px 20px; font-size: 12px; }
 .dim-jh-aggCandidate + .dim-jh-aggCandidate { border-top: 1px solid var(--dsw-alias-border-tertiary, rgba(0, 0, 0, 0.04)); }
+/* 悬停的高亮：这一页要「逐条比较渠道」，鼠标必须能确认自己停在哪一行。
+   ⚠️ 用极淡底色而不是改边框 —— 候选行之间已有 1px 分隔线，
+   再加边框会出现双线（视觉上像分组，而不是同行）。
+   ⚠️ 必须在 .dim-jh-aggCandidateRejected 之前定义？不需要：opacity 是另一属性，
+   两者叠加（未参与的候选悬停 = 淡底色 + 0.55 透明度）正是想要的效果。 */
+.dim-jh-aggCandidate:hover { background: var(--dsw-alias-bg-secondary, rgba(0, 0, 0, 0.03)); }
 .dim-jh-aggCandidateRejected { opacity: 0.55; }
-.dim-jh-aggCandidateLabel { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-secondary); }
+/* 候选行里的供应商图标（2026-10-26）。
+   ⚠️ 基类 30px 是给左栏 48px 按钮的；这一行 padding 只有 6px、字号 12px，
+   照搬会把行高从 28px 撑到 40px，14 个模型的候选列表当场变长一倍。
+   ⚠️ 这里**不需要**额外的淡出规则：未参与的候选整行走 .dim-jh-aggCandidateRejected
+   的 opacity，图标作为子节点自然一起淡（与模型列表那处不同 —— 那边只淡了文字格）。 */
+.dim-jh-aggCandidate > .dim-jh-providerIcon { flex: none; width: 18px; height: 18px; border-radius: 5px; box-shadow: none; }
+.dim-jh-aggCandidate > .dim-jh-providerIcon img { width: 13px; height: 13px; }
+/* ── 候选行的文字四格（用户 2026-10-27「美化聚合页模型列表」）──
+   ⚠️⚠️ 改造前这里只有一条 .dim-jh-aggCandidateLabel，里面放整串
+   「渠道名 · 模型 id · 倍率」—— 三者同色、同字号、同权重。
+   而这一页的**唯一用途**就是逐条比较渠道，最该被一眼分辨的恰恰是
+   「哪家渠道」和「哪个模型」，倍率只是附注。同权渲染让整列看起来
+   是一堆等长的灰点，用户报障原话就是「美化聚合页模型列表」。
+   ⇒ 拆成四格 + 四种视觉层级：渠道（次要色/小字/不换行）、模型 id
+   （主要色/等宽数字/吃剩余宽度）、倍率（圆角徽章）、补丁（警示角标）。
+
+   .dim-jh-aggCandidateLabel 仍是**外层容器**（类名不变）：
+   「provider-icon-coverage.spec.ts」 用它在源码里的位置当锚点，
+   换掉名字会让那条「图标必须在标签之前」的用例失去判据。 */
+.dim-jh-aggCandidateLabel { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 6px; overflow: hidden; color: var(--dsw-alias-label-secondary); }
+/* 渠道名：三格中**最次要**的一格。
+   ⚠️ flex: none + max-width 28%：渠道名长度差异极大（「buddy」 5 字符、
+   「workbuddy」 9、「astudio」 7），若允许它参与压缩，同一页里每行的
+   「模型 id 起始位置」就会错落 —— 对比渠道时眼睛要来回找起点了。
+   钉住它、把弹性全给模型 id。
+   ⚠️ 2026-10-28 审计更正：这**不产生跨行对齐** —— 实测各行「模型 id 起始位置」随
+   渠道名长度错落，最多差 **38px**（flex: none 让渠道格 = 内容宽，本来就各不相同）。
+   真要跨行对齐，得给渠道格一个**固定宽度**（不是 max-width）。 */
+.dim-jh-aggCandidateProvider { flex: none; max-width: 28%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--dsw-alias-label-tertiary); }
+/* 模型 id：本行**唯一**吃剩余宽度的一格。
+   ⚠️ font-variant-numeric: tabular-nums 与字号 12px：模型 id 里数字很多
+   （「deepseek-v4.1-flash」、「glm-4.6」），等宽数字能让上下列的版本号对齐。
+   ⚠️ min-width: 0 不可省 —— 少了它，flex 项的最小尺寸是内容宽度，
+   ellipsis 永远不触发，长 id 会把右侧的到期提示与开关挤出可视区。 */
+.dim-jh-aggCandidateId { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
+/* 倍率徽章：观感沿用全站 .dim-jh-badgeBtn 的胶囊口径（999px 圆角 / 11px / .5px 边框），
+   但**不共用类名** —— 那个类名带 cursor:pointer，而这里只是一枚只读读数。
+   ⚠️ flex: none：徽章宽度由内容决定，不能被模型 id 那种弹性挤变形。 */
+.dim-jh-aggCandidatePrice { flex: none; padding: 1px 7px; border: .5px solid var(--dsw-alias-border-l2, #d0d3d8); border-radius: 999px; background: var(--dsw-alias-bg-layer-2, rgba(0, 0, 0, 0.03)); font-size: 11px; line-height: 1.5; color: var(--dsw-alias-label-secondary); white-space: nowrap; font-variant-numeric: tabular-nums; }
+/* 「免费」（倍率 0）：它与「x0.15」不是同一类信息 —— 前者是**该渠道不计费**，
+   后者是折扣。用 success 色区分，否则用户会把「免费」当成倍率恰好为 0 的折扣。 */
+.dim-jh-aggCandidatePrice[data-free='true'] { color: var(--dsw-alias-state-success-primary, #16a34a); border-color: color-mix(in srgb, var(--dsw-alias-state-success-primary, #16a34a) 40%, transparent); }
+/* 补丁角标：规格 §7.1 要求人工核查的来源标记。
+   ⚠️ 只有 viaPatch 的候选才有，所以必须 flex: none —— 它出现与否会改变
+   本行星级的宽度分配，若允许它伸缩，同一模型的不同候选行的模型 id 宽度会不一致。
+   ⚠️ 用 warning 色而非 error 色：补丁不是错误，是需要核查。 */
+.dim-jh-aggCandidatePatch { flex: none; padding: 1px 6px; border-radius: 4px; font-size: 11px; line-height: 1.5; color: var(--dsw-alias-state-warn-primary, #b45309); background: var(--dsw-alias-bg-warn, rgba(180, 83, 9, 0.10)); white-space: nowrap; }
 /* 「按临期排序」后显示在候选行右侧的到期提示（相对时间，如「3 天」）。
    ⚠️ flex: none 让它不参与压缩（候选名那一格已经 flex:1 吃掉剩余宽度）。 */
 .dim-jh-aggCandidateExpiry { flex: none; font-size: 11px; color: var(--dsw-alias-label-tertiary); }
@@ -1314,7 +1752,33 @@ const STYLES = `
   }
 }
 
+/* ── 插件详情页（plugins.bundle.config）的自有设置卡片 ──
+
+   最外层必须自成 column 且 gap 为 0：宿主 detailSection 给直接子元素
+   12px 间隔（PluginManagerPage.module.css 的 .detailSection），官方插件卡
+   （终端 / 网页搜索）都包了一层内层 column，容器只看到一个子元素。
+   间距改由每块自己的 padding 提供。
+
+   下列几何与字号全部照抄官方设置行与官方插件卡实测值，不要凭感觉改。 */
+.dim-jh-cardStack { display: flex; flex-direction: column; gap: 0; }
+.dim-jh-cardRow { display: flex; align-items: center; gap: 8px; padding: 16px 0; }
+.dim-jh-cardRowText { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; padding-right: 48px; }
+.dim-jh-cardTitle { font-size: 13px; font-weight: 500; line-height: 19.5px; color: var(--dsw-alias-label-primary); }
+.dim-jh-cardDesc { font-size: 12px; font-weight: 400; line-height: 18px; color: var(--dsw-alias-label-tertiary); }
+/* 下拉触发按钮：几何与官方设置页选择器一致（高 36 / 圆角 md / 13px 500）。 */
+.dim-jh-cardSelector { display: inline-flex; align-items: center; gap: 12px; height: 36px; padding: 0 14px; border: none; border-radius: var(--dsw-radius-md); background: var(--dsw-alias-bg-module-platform); font: inherit; font-size: 13px; font-weight: 500; line-height: 19.5px; color: var(--dsw-alias-label-primary); cursor: pointer; }
+.dim-jh-cardSelector:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
+/* 提交中压暗整个控件，而不是只改文字色：官方对带背景控件就是这么做的
+   （Switch 用 opacity 0.5，SegmentedControl 用 0.4）。 */
+.dim-jh-cardSelector:disabled { cursor: default; opacity: 0.5; }
+.dim-jh-cardChevron { flex: none; }
+/* 焦点环：跟随本文件既有约定（outline:none + box-shadow），与 .dim-jh-switch /
+   .dim-jh-zcSelect 一致。官方设置页的选择器**没有** outline 规则，故这里也不加，
+   否则同一张插件页上本卡片会比其他控件多一圈描边。 */
+.dim-jh-cardSelector:focus-visible { outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 30%, transparent); }
 `
+
+
 
 /**
  * 本插件的**包 id** —— 必须等于 package.json 的 name（当前 dsh-providers-hub）。

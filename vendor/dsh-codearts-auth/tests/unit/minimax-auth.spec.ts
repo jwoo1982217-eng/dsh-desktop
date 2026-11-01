@@ -190,28 +190,85 @@ describe('fetchModels', () => {
 })
 
 describe('refreshAll', () => {
-  it('⚠️ 只按 refreshable 过滤，不看 enabled', async () => {
+  /**
+   * ★★ **判据是「凭据里还有没有 refresh_token」，不是池里的 `refreshable`**。
+   *
+   * ## 口径变更（2026-10-27 审计修）
+   *
+   * 修前本用例锁的是「`refreshable:false` 的条目**必须被跳过**」——
+   * 那条断言正是**单向门**本体的守卫：`refreshable` 是每轮由凭据对账出来的
+   * **镜像**，而写 `false` 的唯一来源是终态判定。一旦判据偶发误判（上游 5xx
+   * 报文里出现 `expired`、限流文案、证书过期），账号就再也回不来：
+   * 定时那轮跳过它、启动首轮也跳过它（`AGENTS.md`：「自动续期没工作、重启也没用」）。
+   *
+   * `docs/adding-a-new-provider.md:132-135` 把「不看 `refreshable`」列为**红线**，
+   * 且 `healExpiredAccountBeforeBalance`（`jet-hub-rpc.ts`）**刻意不判**它 ——
+   * 本 PR 却在 `refreshAll` 与巡检里各复制了一份。
+   *
+   * ⇒ 现在断言反过来：池说 `refreshable:false` 但**凭据里有 `refresh_token`**
+   * 时，仍然必须被处理（并借 `syncAccountExpiry` 把镜像纠正回 `true`）。
+   */
+  it('⚠️ 不看池里的 refreshable（读凭据本体），也不看 enabled', async () => {
     const updated: { id: string; patch: unknown }[] = []
     const pool = {
       listAccounts: async () => [
         { id: 'a1', credentialRef: 'MINIMAX_ACCOUNT_A1', refreshable: true, enabled: false, expiresAt: 0 },
+        // ⚠️ 误标：池说不可续期，但凭据里 `refresh_token` 完好
         { id: 'a2', credentialRef: 'MINIMAX_ACCOUNT_A2', refreshable: false, enabled: true, expiresAt: 0 },
       ],
       updateAccount: async (id: string, patch: unknown) => { updated.push({ id, patch }) },
       findAccountIdByCredential: async () => 'a1',
     }
-    // ⚠️ brief 此处未注入 fetchImpl → 会走**真实网络**且必然抛错，
-    // 续期失败后 `updateAccount` 不会被调用，断言恒为假（实测确认）。
-    // 故注入一个返回合法令牌的桩 fetch —— 断言逐字未动。
     const auth = new MinimaxAuth(makeContext({
       resolve: async () => ({ value: JSON.stringify(CRED) }),
       set: async () => {},
     }), { fetchImpl: (async () => refreshOk()) as never })
     await auth.refreshAll(pool as never)
-    // a1 虽然 enabled:false 但 refreshable:true，必须被处理
-    expect(updated.some((u) => u.id === 'a1')).toBe(true)
-    // a2 refreshable:false，必须被跳过
-    expect(updated.some((u) => u.id === 'a2')).toBe(false)
+    // a1 虽然 enabled:false 但凭据可续期，必须被处理
+    expect(updated.some((u) => u.id === 'a1'), 'enabled:false 不得阻止凭据续期/对账').toBe(true)
+    // ★ a2 池标 refreshable:false，但凭据里 refresh_token 完好 ⇒ **必须仍被处理**
+    expect(updated.some((u) => u.id === 'a2'), '★ 误标 refreshable:false 不得变成单向门').toBe(true)
+  })
+
+  it('★ 凭据里确实没有 refresh_token ⇒ 才标 refreshable:false（权威判据）', async () => {
+    const updated: { id: string; patch: unknown }[] = []
+    const pool = {
+      listAccounts: async () => [
+        { id: 'a1', credentialRef: 'MINIMAX_ACCOUNT_A1', refreshable: true, enabled: true, expiresAt: 0 },
+      ],
+      updateAccount: async (id: string, patch: unknown) => { updated.push({ id, patch }) },
+      findAccountIdByCredential: async () => 'a1',
+    }
+    const auth = new MinimaxAuth(makeContext({
+      // 凭据形状合法但**没有** refresh_token
+      resolve: async () => ({ value: JSON.stringify({ ...CRED, refresh_token: '' }) }),
+      set: async () => {},
+    }), { fetchImpl: (async () => { throw new Error('不应发请求') }) as never })
+    await auth.refreshAll(pool as never)
+    expect(
+      updated.some((u) => u.id === 'a1' && (u.patch as { refreshable?: boolean }).refreshable === false),
+      '凭据材料才是权威：没有 refresh_token 必须标死',
+    ).toBe(true)
+  })
+
+  it('★ 凭据读不到 / 解析失败时**不得**标 refreshable:false（那是存储问题，不是服务端拒绝）', async () => {
+    const updated: { id: string; patch: unknown }[] = []
+    const pool = {
+      listAccounts: async () => [
+        { id: 'a1', credentialRef: 'MINIMAX_ACCOUNT_A1', refreshable: true, enabled: true, expiresAt: 0 },
+      ],
+      updateAccount: async (id: string, patch: unknown) => { updated.push({ id, patch }) },
+      findAccountIdByCredential: async () => 'a1',
+    }
+    const auth = new MinimaxAuth(makeContext({
+      resolve: async () => undefined,
+      set: async () => {},
+    }), { fetchImpl: (async () => { throw new Error('不应发请求') }) as never })
+    await auth.refreshAll(pool as never)
+    expect(
+      updated.some((u) => (u.patch as { refreshable?: boolean }).refreshable === false),
+      '读不到凭据不得改池标记（否则又是单向门）',
+    ).toBe(false)
   })
 
   it('⚠️ 凭据仍在有效期内时只对账池值、不发续期请求（共享实现的行为）', async () => {
@@ -234,9 +291,34 @@ describe('refreshAll', () => {
     expect(updated.some((u) => u.id === 'a1')).toBe(true)
   })
 
-  it('⚠️ 按账号条目自身的 credentialRef 读写凭据（写错 ref 会续错账号）', async () => {
+  it('⚠️ reconcile-only：按账号条目自身的 credentialRef 读凭据对账，但不写凭据（写权在巡检 renewEntry）', async () => {
     const read: string[] = []
     const written: string[] = []
+    const updated: { id: string; patch: unknown }[] = []
+    const pool = {
+      listAccounts: async () => [
+        { id: 'a1', credentialRef: 'MINIMAX_ACCOUNT_A1', refreshable: true, enabled: true, expiresAt: 0 },
+      ],
+      updateAccount: async (id: string, patch: unknown) => { updated.push({ id, patch }) },
+      findAccountIdByCredential: async () => 'a1',
+    }
+    const auth = new MinimaxAuth(makeContext({
+      resolve: async (ref) => { read.push(keyOf(ref)); return { value: JSON.stringify(CRED) } },
+      set: async (ref) => { written.push(keyOf(ref)) },
+    }), { fetchImpl: (async () => refreshOk()) as never })
+    await auth.refreshAll(pool as never)
+    // 对账读的是**自己条目**的 ref（写错 ref 会读错账号）
+    expect(read).toEqual(['MINIMAX_ACCOUNT_A1'])
+    // ⚠️ 2026-10-24 reconcile-only：refreshAll 不发 grant ⇒ **不写凭据** ——
+    //    凭据的写权收口在 renewEntry（60s 巡检 / 请求路径兜底）。
+    expect(written).toEqual([])
+    // 但池镜像必须对账（entry.expiresAt=0 → 凭据真实值），否则 UI 恒显「已过期」
+    expect(updated.some((u) => u.id === 'a1')).toBe(true)
+  })
+
+  it('⚠️ reconcile-only：凭据已过期也**不发请求**（轮换权已移交 60s 巡检）', async () => {
+    const expired = { ...CRED, expires_at: String(Date.now() - 1_000) }
+    const fetcher = vi.fn()
     const pool = {
       listAccounts: async () => [
         { id: 'a1', credentialRef: 'MINIMAX_ACCOUNT_A1', refreshable: true, enabled: true, expiresAt: 0 },
@@ -245,12 +327,197 @@ describe('refreshAll', () => {
       findAccountIdByCredential: async () => 'a1',
     }
     const auth = new MinimaxAuth(makeContext({
-      resolve: async (ref) => { read.push(keyOf(ref)); return { value: JSON.stringify(CRED) } },
-      set: async (ref) => { written.push(keyOf(ref)) },
-    }), { fetchImpl: (async () => refreshOk()) as never })
+      resolve: async () => ({ value: JSON.stringify(expired) }),
+      set: async () => {},
+    }), { fetchImpl: fetcher as never })
     await auth.refreshAll(pool as never)
-    expect(read).toEqual(['MINIMAX_ACCOUNT_A1'])
-    expect(written).toEqual(['MINIMAX_ACCOUNT_A1'])
+    // ⚠️ 这是本次重构的**核心断言**：定时批量轮换必须消失，轮换只由
+    //    60s 巡检（renewEntry）与请求路径兜底承担（官方 oauth-core 即按需制）。
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * ★★ **renewEntry**（2026-10-24 本地试验版：60s 巡检 / 精准续期 / 401 强刷
+ * 共用的核心入口）。
+ *
+ * ## 守的纪律（缺一都是事故）
+ *
+ * - **margin**：剩余有效期远超 margin 时绝不发请求（轮换次数 = 风险预算）；
+ * - **写回自己的 ref**：per-ref 读写（「续错账号」的老缺陷防线，语义从
+ *   refreshAll 迁移到这里）；
+ * - **previous_refresh_tokens**：旧 RT 压栈（新→旧、去重、截 3 条）；
+ * - **CAS**：grant 前后重读凭据，被别人写过就丢弃（绝不覆盖更新的会话）；
+ * - **单飞**：同 ref 并发只发一份 grant；
+ * - **终态**：当前 RT 死了先回退历史代际，全失败才标 `refreshable:false`。
+ */
+describe('renewEntry（2026-10-24 本地试验版）', () => {
+  const ENTRY = { id: 'a1', credentialRef: 'MINIMAX_ACCOUNT_A1', refreshable: true } as const
+
+  /**
+   * 造一个**可变凭据存储** + 真实 Context 的续期环境。
+   *
+   * ⚠️ `journalHome` 刻意不传 ⇒ journal **绝不写盘**（单测不得污染用户 `~/.dsh`）。
+   */
+  function makeRenewEnv(options: {
+    store: Map<string, string>
+    fetcher: typeof fetch
+    sleep?: (ms: number) => Promise<void>
+  }) {
+    const written: Array<{ ref: string; value: string }> = []
+    const updated: Array<{ id: string; patch: unknown }> = []
+    const ctx = new Context()
+    ctx.provide('credentials', {
+      resolve: async (ref: unknown) => {
+        const value = options.store.get(keyOf(ref))
+        return value === undefined ? undefined : { value }
+      },
+      set: async (ref: unknown, value: string) => {
+        const name = keyOf(ref)
+        written.push({ ref: name, value })
+        options.store.set(name, value)
+      },
+    } as never)
+    const auth = new MinimaxAuth(ctx, {
+      fetchImpl: options.fetcher as never,
+      ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
+    })
+    const pool = {
+      listAccounts: async () => [ENTRY],
+      updateAccount: async (id: string, patch: unknown) => { updated.push({ id, patch }) },
+      findAccountIdByCredential: async () => 'a1',
+    }
+    return { auth, pool, written, updated }
+  }
+
+  it('⚠️ 剩余远超 margin ⇒ 不发请求（轮换次数是风险预算）', async () => {
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(CRED)]]) // 1h 后过期
+    const fetcher = vi.fn()
+    const { auth, pool } = makeRenewEnv({ store, fetcher })
+    const out = await auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    expect(out.renewed).toBe(false)
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('⚠️ 已过期 ⇒ 发 grant、写回**自己的 ref**、池镜像更新、旧 RT 压入历史栈', async () => {
+    const expired = { ...CRED, expires_at: String(Date.now() - 1_000) }
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(expired)]])
+    const fetcher = vi.fn(async () => refreshOk())
+    const { auth, pool, written, updated } = makeRenewEnv({ store, fetcher })
+    const out = await auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    expect(out.renewed, '临期账号必须真的续期').toBe(true)
+    // 写回**自己的 ref**（续错账号的老缺陷防线，语义从 refreshAll 迁到这里）
+    expect(written.map((w) => w.ref)).toEqual(['MINIMAX_ACCOUNT_A1'])
+    const payload = JSON.parse(written[0]!.value) as {
+      access_token: string
+      previous_refresh_tokens?: string[]
+    }
+    expect(payload.access_token).toBe('n'.repeat(60))
+    expect(payload.previous_refresh_tokens, '旧 RT 必须压入历史栈（断链抢救的弹药）')
+      .toEqual([CRED.refresh_token])
+    expect(updated.some((u) => u.id === 'a1'), '池镜像必须跟着更新（UI 读池值）').toBe(true)
+  })
+
+  it('⚠️ 单飞：同 ref 并发只发一份 grant', async () => {
+    const expired = { ...CRED, expires_at: String(Date.now() - 1_000) }
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(expired)]])
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const fetcher = vi.fn(async () => { await gate; return refreshOk() })
+    const { auth, pool } = makeRenewEnv({ store, fetcher })
+    const first = auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    const second = auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    release()
+    await Promise.all([first, second])
+    expect(fetcher, '巡检/兜底/强刷并发想续同一账号时，只允许一份 grant 在天上').toHaveBeenCalledTimes(1)
+  })
+
+  it('⚠️ CAS：grant 期间凭据被别人改写 ⇒ 不覆盖新会话（但把本次新 RT 压进历史栈）', async () => {
+    const expired = { ...CRED, expires_at: String(Date.now() - 1_000) }
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(expired)]])
+    const fetcher = vi.fn(async () => {
+      // ⚠️ grant 在天上时「别的写入方」落盘了一份新会话 —— 模拟登录并发。
+      store.set('MINIMAX_ACCOUNT_A1', JSON.stringify({
+        ...CRED,
+        access_token: 'b'.repeat(60),
+        expires_at: String(Date.now() + 3_600_000),
+      }))
+      return refreshOk()
+    })
+    const { auth, pool, written } = makeRenewEnv({ store, fetcher })
+    const out = await auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    expect(out.renewed).toBe(false)
+    expect(out.superseded, '必须判为「被别人抢先」而不是「续期成功」').toBe(true)
+    /**
+     * ★★ 判据变更（2026-10-27 审计修）：**不再断言「一次都不写」**。
+     *
+     * 修前这里写 `expect(written).toEqual([])`，理由是「覆盖回去等于把新钥匙
+     * 换成旧钥匙」—— 那个**方向**是对的，但「一个字节都不落盘」在一次性 RT
+     * 语义下有**净损失**：本次 grant **已在上游完成轮换**，丢弃而**不压栈** =
+     * 那把新 RT 成为孤儿，抢救链的弹药反而少了一把（实测 `MINE_NEW_RT` 永久消失）。
+     *
+     * ⇒ 现在允许**恰好一次**写盘，但内容必须满足两条硬约束：
+     *   ① **令牌材料不得被覆盖**（`access_token` / `refresh_token` 仍是别人那份）；
+     *   ② 只多一个 `previous_refresh_tokens`，且含本次新拿到的 RT。
+     */
+    /**
+     * ⚠️⚠️ **判据必须收紧到「恰好一次 + 必含新 RT」**（2026-10-27 第二轮审计修）。
+     *
+     * 修前是 `toBeLessThanOrEqual(1)` **外面再套一个 `if (written.length === 1)`**
+     * —— 那个 `if` 让「一次都不写」也全绿 ⇒ 审计员实测**删掉补弹药逻辑后
+     * 64 条用例全绿**，即这条守卫**无牙**。
+     *
+     * 真实现的 CAS 分支确实写**恰好一次**（审计员用自己的探针复核过
+     * `written.length = 1`）⇒ 收紧成 `toBe(1)` 不会造成假红，
+     * 却能精确抓住「补弹药被删掉」这个回归。
+     */
+    expect(written.length, '★ CAS 分支必须**恰好写一次**（补弹药）；0 次 = 补弹药被删、2 次 = 整份覆盖').toBe(1)
+    const finalValue = store.get('MINIMAX_ACCOUNT_A1') as string
+    const finalCredential = JSON.parse(finalValue) as {
+      access_token: string
+      refresh_token?: string
+      previous_refresh_tokens?: string[]
+    }
+    expect(finalCredential.access_token, '★ 别人的新 access_token 不得被覆盖').toBe('b'.repeat(60))
+    expect(finalCredential.refresh_token, '★ 别人的新 refresh_token 不得被覆盖').toBe(CRED.refresh_token)
+    expect(
+      finalCredential.previous_refresh_tokens ?? [],
+      '★ 本次轮换出来的新 RT 必须压进历史栈（否则孤儿 + 弹药变少）',
+      // ⚠️ `refreshOk()` 的 `refresh_token` 是 `'r2'.repeat(30)`（不是 access_token 那个）
+    ).toContain('r2'.repeat(30))
+  })
+
+  it('⚠️ 终态：当前 RT invalid_grant → 回退历史代际 RT 成功 ⇒ 凭据救回', async () => {
+    const dead = {
+      ...CRED,
+      expires_at: String(Date.now() - 1_000),
+      previous_refresh_tokens: ['old-rt-1'],
+    }
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(dead)]])
+    const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      const body = String(init?.body)
+      // 当前 RT 已死；上一代 RT 仍活着（上游只作废被用的那条的假说成立形态）
+      return body.includes('old-rt-1') ? refreshOk() : json({ error: 'invalid_grant' }, 400)
+    })
+    const { auth, pool, written } = makeRenewEnv({ store, fetcher })
+    const out = await auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' })
+    expect(out.renewed, '★ 旧代际救回 = 账号免于重登（本特性的全部意义）').toBe(true)
+    const payload = JSON.parse(written[0]!.value) as { access_token: string }
+    expect(payload.access_token).toBe('n'.repeat(60))
+  })
+
+  it('⚠️ 终态全失败（无历史代际）⇒ 抛终态错误 + 池标 refreshable:false', async () => {
+    const dead = { ...CRED, expires_at: String(Date.now() - 1_000) }
+    const store = new Map([['MINIMAX_ACCOUNT_A1', JSON.stringify(dead)]])
+    const fetcher = vi.fn(async () => json({ error: 'invalid_grant' }, 400))
+    const { auth, pool, updated } = makeRenewEnv({ store, fetcher })
+    await expect(
+      auth.renewEntry(pool, ENTRY, { marginMs: 5 * 60_000, trigger: 'patrol' }),
+    ).rejects.toBeInstanceOf(MinimaxRefreshTokenExpiredError)
+    expect(
+      updated.some((u) => u.id === 'a1' && (u.patch as { refreshable?: boolean }).refreshable === false),
+      '全失败必须标记需重登（与旧 refreshAll 终态行为一致）',
+    ).toBe(true)
   })
 })
 
@@ -352,7 +619,14 @@ describe('persistLogin / fetchModels', () => {
     expect(auth.credentialRefName).toBe('MINIMAX_ACCESS_TOKEN')
     const result = await auth.persistLogin({ ...CRED }, { refName: 'MINIMAX_ACCOUNT_X1', nickname: 'X1' })
     expect(written).toEqual(['MINIMAX_ACCOUNT_X1'])
-    expect(result).toEqual({})
+    // ⚠️ **2026-10-23（Gitee IKP8UA）口径变更**：`persistLogin` 现在回传
+    // `nickname`（供 RPC 层写账号池）。显式传入的 nickname 原样回传 ——
+    // 这**不是**行为回退：返回值多一个字段，而调用方读的是 `result.nickname`
+    // （缺省时才走三级回退）。
+    //
+    // 原断言是 `toEqual({})`，那是在「返回值只有 `accountId`」时代写的；
+    // 现在 `accountId` 对它仍是 undefined（token 非 JWT），故只有 `nickname`。
+    expect(result).toEqual({ nickname: 'X1' })
   })
 
   it('⚠️ fetchModels 从 getAvailableAccount 的 credential 字段取凭据（两层结构，不是 available.id）', async () => {

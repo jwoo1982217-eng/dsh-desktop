@@ -7,7 +7,7 @@ import {
   type ExpiryAccessors,
 } from '../../src/expiry-sync.js'
 import { REFRESH_LEAD_MS } from '../../src/refresh.js'
-import { refreshTokenExpiresAt } from '../../src/oauth.js'
+import { refreshTokenExpiresAt, RefreshTokenExpiredError } from '../../src/oauth.js'
 import type { AccountPool, ProviderAccountStatus } from '../../src/account-pool.js'
 
 /**
@@ -225,6 +225,9 @@ describe('refreshAccountWithReconcile：需要刷就刷，不需要就对账', (
         calls.save += 1
         return Promise.resolve()
       },
+      // ⚠️ 测试替身的默认值刻意用一个**中性** Error：若某条用例忘了覆盖它，
+      //    期望 `instanceof <自家类>` 的断言会立刻变红，而不是静默通过。
+      makeTerminalError: (message) => new Error(message),
       ...overrides,
     }
     return { poolSpy, calls, params }
@@ -263,6 +266,112 @@ describe('refreshAccountWithReconcile：需要刷就刷，不需要就对账', (
     })
     await expect(refreshAccountWithReconcile(params)).rejects.toThrow(/缺少访问令牌/)
     expect(calls.save).toBe(0)
+  })
+
+  /**
+   * ★★ **续期成功但落盘失败 ⇒ 必须报终态**（真实缺陷，2026-10-27 两次事故）。
+   *
+   * ## 为什么这是终态而不是可重试的普通错误
+   *
+   * `refresh()` 成功 = 服务端已经把**一次性** refresh_token 消耗掉并签发了新的。
+   * 此时 `save()` 失败 ⇒ 新凭据只剩内存引用、随调用栈消失 ⇒ 本地永久停留在
+   * 那份**已被消耗**的旧 token 上。
+   *
+   * 旧实现让异常冒泡，`refreshAll` 的 catch 把它当**非终态**：只记 warn、
+   * 不标 `refreshable:false`、下一轮继续拿死 token 兑换 ⇒ 服务端回
+   * `STS5.1806 the refresh token has been used` ⇒ 每轮静默失败、面板照常
+   * 显示「自动续期」。
+   *
+   * 实测时间线（2026-10-27 17:58 那轮）：16:58 续期成功落盘 → 17:58
+   * 「兑换成功但 `.credentials.yaml` 零写入」→ 18:23 池值被标 false →
+   * 18:30 实测 STS5.1806。
+   *
+   * ⚠️ 终态类型由**调用方注入**（`makeTerminalError`），因为各家 `refreshAll`
+   * 判的是自己那个同名类 —— 详见下一条用例。
+   */
+  it('★★ 续期成功但 save 失败 → 抛调用方注入的终态错误（不是可重试）', async () => {
+    const warns: string[] = []
+    let saveCalls = 0
+    const { params } = build({
+      credential: { ...CRED, expires_at: String(Date.now() - 1) },
+      // refresh 成功（服务端 token 已消耗）……
+      refresh: (c) => Promise.resolve({ ...c, access_token: 'NEW', expires_at: String(Date.now() + 7_200_000) }),
+      // ……但落盘失败。⚠️ 这里自带计数器：覆盖 `save` 会连带丢掉默认那份的
+      //    `calls.save` 自增，故不能用外层计数器断言。
+      save: () => {
+        saveCalls += 1
+        return Promise.reject(new Error('EACCES: permission denied'))
+      },
+      makeTerminalError: (message) => new RefreshTokenExpiredError(message),
+      warn: (m) => warns.push(m),
+    })
+
+    let thrown: unknown
+    try {
+      await refreshAccountWithReconcile(params)
+    } catch (error) {
+      thrown = error
+    }
+    // ① 必须是终态类型 —— 各家的 catch 靠 instanceof 分流。
+    expect(thrown).toBeInstanceOf(RefreshTokenExpiredError)
+    // ② 必须真的调过 save（证明走到了「落盘」这一步）。
+    expect(saveCalls).toBe(1)
+    // ③ 错误文案要能区分「落盘失败」与「服务端拒绝」，并带上原始存储错误。
+    const message = (thrown as Error).message
+    expect(message).toMatch(/落盘失败/)
+    expect(message).toMatch(/EACCES/)
+    // ④ 抛终态前要单独记一条 warn：排查时能一眼分清是谁的锅。
+    expect(warns.some((w) => /落盘失败/.test(w))).toBe(true)
+  })
+
+  /**
+   * ★★ **终态错误的类型必须由调用方决定**（PR159 首版缺陷，2026-10-28 修）。
+   *
+   * ## 病根
+   *
+   * 首版让共享模块 `import { RefreshTokenExpiredError } from './oauth.js'`
+   * （codearts 的类），注释声称「各家 refreshAll 都按 `instanceof
+   * RefreshTokenExpiredError` 判终态 ⇒ **九家同时受益**」。**这句不成立**：
+   * 每家都有**自己的**同名类 —— buddy 用 `buddy-oauth.ts` 的
+   * （`buddy-auth.ts` 的 refreshAll 就判它）、trae/qoder/cline/lobsterai 各自
+   * 在自己的 auth 文件里定义、gemini 是 `GeminiRefreshTokenExpiredError`、
+   * minimax 是 `MinimaxRefreshTokenExpiredError`、accio 是
+   * `AccioRefreshTokenExpiredError`。跨模块 `instanceof` **恒为 false**
+   * ⇒ 另外 8 家仍落「非终态」分支，账号照样静默死（正是本修复要治的病）。
+   *
+   * ## 判据
+   *
+   * 注入一个**独有的**错误类，断言抛出来的就是它、且**不是** codearts 那个类。
+   * 只要共享模块里还藏着 provider 侧的 import（或写死某个类），这条必红。
+   *
+   * ## 为什么参数是**必填**而不是可选
+   *
+   * 可选参数 + 默认值 = 「漏传」是**静默**的（退回借用某个类、或退回普通 Error），
+   * 正是本缺陷的形态。必填 ⇒ 漏接线在 `tsc --noEmit` 就红，不靠人记得。
+   */
+  it('★★ 落盘失败的终态错误由调用方注入，不得借用别家 provider 的类', async () => {
+    /** 只有本用例认识这个类 —— 共享模块不可能「碰巧」抛它。 */
+    class MarkerTerminalError extends Error {
+      constructor(message: string) {
+        super(message)
+        this.name = 'MarkerTerminalError'
+      }
+    }
+    const { params } = build({
+      credential: { ...CRED, expires_at: String(Date.now() - 1) },
+      save: () => Promise.reject(new Error('EACCES: permission denied')),
+      makeTerminalError: (message) => new MarkerTerminalError(message),
+    })
+    let thrown: unknown
+    try {
+      await refreshAccountWithReconcile(params)
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toBeInstanceOf(MarkerTerminalError)
+    // 反向：**不得**是别家（示例用 codearts）的终态类。
+    expect(thrown).not.toBeInstanceOf(RefreshTokenExpiredError)
+    expect((thrown as Error).message).toMatch(/落盘失败/)
   })
 
   it('池值本就一致时不写盘（避免每轮定时器全量落盘）', async () => {
@@ -420,6 +529,7 @@ describe('refreshAccountWithReconcile：refresh 腿真的改变了「要不要�
         calls.save += 1
         return Promise.resolve()
       },
+      makeTerminalError: (message) => new Error(message),
       ...overrides,
     }
     return { poolSpy, calls, params }

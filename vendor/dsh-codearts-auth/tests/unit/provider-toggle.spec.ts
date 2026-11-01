@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import {
   groupProviders,
   nextProviderOrderAfterDrop,
+  nextProviderOrderAfterGroupDrop,
   providerSwitchRows,
   providerSwitchState,
   providerToggleSummary,
@@ -357,9 +358,16 @@ describe('供应商开关的接线（源码级回归）', () => {
    *
    * ⚠️ 判据用**位置先后**而不是「字符串包含」——后者对顺序完全不敏感，
    * 把两个按钮调换位置它照样绿（本仓库记过「源码级断言必须锚定片段」）。
+   *
+   * ⚠️ 2026-10-26 起「新建账号」是**纯图标按钮**（文字收进 title/aria-label），
+   *    源码里不再有 `+ 新建账号` 这个字面量 ⇒ 锚点换成它唯一的接线特征
+   *    `newAccountAsksChannel(provider)` 的 onClick 判据。
+   *    这里断言的是**两个片段在同一段 headerActions 里的先后**，不是整份源码
+   *    里字符串谁先出现（`国际站分流设置` 在 title 文案里也出现过一次，
+   *    用裸 indexOf 会取到错误的那个位置）。
    */
   it('★★ minimaxintl 面板里「+ 新建账号」排在「国际站分流设置」之前', () => {
-    const newAccountAt = source.indexOf("'+ 新建账号'")
+    const newAccountAt = source.indexOf('if (newAccountAsksChannel(provider)) setPendingLogin(false)')
     const xffAt = source.indexOf("'国际站分流设置'")
     expect(newAccountAt, '找不到「+ 新建账号」的渲染点').toBeGreaterThan(-1)
     expect(xffAt, '找不到「国际站分流设置」的渲染点').toBeGreaterThan(-1)
@@ -367,6 +375,122 @@ describe('供应商开关的接线（源码级回归）', () => {
       newAccountAt,
       '「+ 新建账号」必须排在「国际站分流设置」之前（主操作在前、排障入口在后）',
     ).toBeLessThan(xffAt)
+  })
+
+  /**
+   * ⚠️ 用户 2026-10-26 的两条要求合并成一条守卫：
+   *   「新建账号按钮改为图标」+「模型按钮移动到新建账号左边改为图标+模型」。
+   *
+   * 顺序契约：**模型列表 → 新建账号 → 刷新积分**。
+   * 三条都跟「本页有什么 / 怎么让本页变新」有关，挨在一起；而 minimaxintl 的
+   * 「国际站分流设置」是排障入口，必须排在它们之后。
+   *
+   * ⚠️ 锚点必须选**唯一**的接线特征：
+   *    - 模型列表：`aria-label': '模型列表'`（弹窗标题里也有「模型列表」三字，
+   *      用裸文本会命中错的那个）；
+   *    - 新建账号：`newAccountAsksChannel(provider)` 的 onClick 判据；
+   *    - 刷新积分：`loadCredits(true)` 的 onClick。
+   *    三者在 headerActions 里各只出现一次，位置比较才有意义。
+   */
+  it('★★ 模型列表（图标+文字）排在新建账号（图标）左边，两者都在刷新积分左边', () => {
+    const modelAt = source.indexOf("'aria-label': '模型列表'")
+    const newAt = source.indexOf('if (newAccountAsksChannel(provider)) setPendingLogin(false)')
+    const refreshAt = source.indexOf('onClick: () => void loadCredits(true)')
+    expect(modelAt, '找不到「模型列表」按钮').toBeGreaterThan(-1)
+    expect(newAt, '找不到「新建账号」按钮').toBeGreaterThan(-1)
+    expect(refreshAt, '找不到「刷新积分」按钮').toBeGreaterThan(-1)
+    expect(modelAt, '「模型列表」必须排在「新建账号」左边').toBeLessThan(newAt)
+    expect(newAt, '「新建账号」必须排在「刷新积分」左边').toBeLessThan(refreshAt)
+  })
+
+  /**
+   * 两枚按钮的**形态**：模型列表 = 图标 + 文字（`dim-jh-iconTextBtn` 且子节点有
+   * `'模型'` 文本）；新建账号 = 纯图标（`dim-jh-iconBtn` 且没有文字子节点）。
+   *
+   * ⚠️ 纯图标按钮必须自带 `aria-label` —— svg 是 aria-hidden，没有它读屏只会
+   *    念「按钮」（与「删除」「刷新积分」两枚图标按钮同源教训）。
+   * ⚠️ 必须**在切片里**断言，不能在整份源码里找：整份源码里 `dim-jh-iconBtn`
+   *    有三处（删除 / 刷新积分 / 新建账号），改错地方不会变红。
+   */
+  it('★★ 模型列表是图标+文字、新建账号是纯图标，两者都有 aria-label', () => {
+    const modelAt = source.indexOf("'aria-label': '模型列表'")
+    const modelStart = source.lastIndexOf("React.createElement('button'", modelAt)
+    // ⚠️ 切片必须**包住整个按钮表达式**（含 svg 子节点与文字子节点）——
+    //    `aria-label` 在属性区，svg 在子节点区，只切到 aria-label 附近
+    //    就取不到图标（第一版栽在这，报「必须带 svg 图标」假红）。
+    const modelEnd = source.indexOf("'模型'),", modelAt)
+    expect(modelEnd, '找不到「模型列表」按钮的文字子节点').toBeGreaterThan(modelAt)
+    const modelBlock = source.slice(modelStart, modelEnd + 10)
+    expect(modelBlock, '模型列表必须是图标+文字（dim-jh-iconTextBtn）')
+      .toContain('dim-jh-iconTextBtn')
+    expect(modelBlock, '模型列表必须带 svg 图标').toContain("createElement('svg'")
+    expect(modelBlock, '模型列表的按钮文字必须还在（只有「模型」二字）').toContain("'模型'")
+
+    const newAt = source.indexOf("'aria-label': creating ? '正在登录新账号' : '新建账号'")
+    expect(newAt, '新建账号必须是纯图标按钮（aria-label 收动作）').toBeGreaterThan(-1)
+    const newStart = source.lastIndexOf("React.createElement('button'", newAt)
+    const newBlock = source.slice(newStart, newAt + 200)
+    expect(newBlock, '新建账号必须带 dim-jh-iconBtn（纯图标，正方形）')
+      .toContain('dim-jh-iconBtn')
+    expect(newBlock, '新建账号不得再留文字子节点')
+      .not.toMatch(/\}\s*,\s*'(?:\+ 新建账号|正在登录…)'\)/)
+  })
+
+  /**
+   * 「永久积分」按钮：图标 + 固定文字，锁定/解锁只差图标形态与 `data-kind`。
+   *
+   * ⚠️ 2026-10-26 用户要求「解锁/锁定永久积分改为图标+永久积分」。
+   *    这条守的是**四件缺一不可的事**（任何一件漏掉都是净损失）：
+   *    ① 文字固定「永久积分」—— 不能再随状态切换（宽度会跳、且与图标重复）；
+   *    ② `aria-label` 必须说动作 —— svg 是 aria-hidden，读屏只念「永久积分」等于
+   *       没告诉用户点下去是锁还是解；
+   *    ③ 两种状态必须画出**不同的**锁梁路径 —— 共用一条 path 时按钮长得一模一样，
+   *       用户无从判断当前锁没锁；
+   *    ④ 加载态要挂 `data-loading` —— 文字变成「处理中…」的同时图标也转圈，
+   *       否则眼神在图标上的用户以为没点上。
+   */
+  it('★★ 「永久积分」是图标+固定文字，锁定/解锁靠图标与 aria-label 区分', () => {
+    const at = source.indexOf("'aria-label': permanentLocked ? '解锁永久积分' : '锁定永久积分'")
+    expect(at, '找不到「永久积分」按钮的 aria-label（动作必须可读）').toBeGreaterThan(-1)
+    const start = source.lastIndexOf("React.createElement('button'", at)
+    const end = source.indexOf("'永久积分')", at)
+    expect(end, '找不到「永久积分」按钮的文字子节点').toBeGreaterThan(at)
+    const block = source.slice(start, end + 10)
+
+    expect(block, '必须是图标+文字形态（dim-jh-iconTextBtn）').toContain('dim-jh-iconTextBtn')
+    expect(block, '必须带 svg 图标').toContain("createElement('svg'")
+    expect(block, '锁体矩形必须画出来（两种状态共用）').toContain("createElement('rect'")
+    expect(block, '按钮文字必须固定为「永久积分」').toContain("'永久积分')")
+    expect(block, '加载态必须挂 data-loading（图标要转圈）').toContain("'data-loading': lockBusy ? 'true' : undefined")
+    // 两种状态的锁梁必须是两条**不同**的 path
+    expect(block, '锁定态锁梁（闭合挂锁）不见了')
+      .toContain("createElement('path', { d: 'M7 11V7a5 5 0 0 1 10 0v4' })")
+    expect(block, '解锁态锁梁（开口挂锁）不见了')
+      .toContain("createElement('path', { d: 'M7 11V7a5 5 0 0 1 9.9-1' })")
+    // 反向钉子：文字不得再随状态切换。
+    // ⚠️ 不能直接 not.toContain("permanentLocked ? '解锁永久积分' : '锁定永久积分'")
+    //    —— aria-label 用的正是这个三元，那样写会打到它自己（第一版就栽在这）。
+    //    正确的判据是**次数**：「解锁永久积分」在整个按钮里只允许出现一次
+    //    （= aria-label 那一处）；文字子节点再长出一个三元就会变成两次。
+    expect((block.match(/'解锁永久积分'/g) ?? []).length, '「解锁永久积分」只允许出现在 aria-label 里一次')
+      .toBe(1)
+    expect((block.match(/'锁定永久积分'/g) ?? []).length, '「锁定永久积分」只允许出现在 aria-label 里一次')
+      .toBe(1)
+    expect(block, '文字子节点必须是固定字面量，不得再包一层三元')
+      .toMatch(/: '永久积分'\)/)
+  })
+
+  it('★★ 图标+文字按钮的加载态也必须转圈（iconTextBtn 那条选择器不能漏）', () => {
+    // ⚠️ 断言必须带上 animation: dim-jh-spin —— 降级块里也有一条
+    //    .dim-jh-iconTextBtn[data-loading="true"] svg，只断选择器名时
+    //    删掉真正那条动画仍会命中降级块（变异验证里报过 NO-TEETH）。
+    expect(styles, '只给 iconBtn 写动画时「永久积分」在加载态不会转')
+      .toMatch(/\.dim-jh-iconTextBtn\[data-loading="true"\] svg\s*\{[^}]*animation:\s*dim-jh-spin/)
+    // prefers-reduced-motion 的降级分支同样要覆盖两类按钮
+    const reduced = styles.match(/@media \(prefers-reduced-motion: reduce\) \{[\s\S]*?\n\}/)?.[0]
+    expect(reduced, '找不到 prefers-reduced-motion 降级块').toBeDefined()
+    expect(reduced, '降级块必须同时管住 iconTextBtn')
+      .toMatch(/\.dim-jh-iconTextBtn\[data-loading="true"\] svg\s*\{[^}]*animation:\s*none/)
   })
 
   /**
@@ -626,6 +750,354 @@ describe('供应商开关的样式约束（源码级回归）', () => {
   })
 
   /**
+   * ⚠️ 2026-10-26 用户要求「将按钮行合并到文案行最右侧」。
+   * 这是**结构**改动（排序提示从 accountList 挪进 panelHead），不是纯样式：
+   * 两者不同父级时 CSS 无论如何排不到同一行。
+   */
+  describe('★ 页头：排序提示与按钮组合并成一行', () => {
+    const panelHead = (() => {
+      const start = source.indexOf("React.createElement('div', { className: 'dim-jh-panelHead' }")
+      expect(start, '找不到 panelHead 容器').toBeGreaterThan(-1)
+      // panelHead 内只有标题/提示/按钮组三个子项，到按钮组开标签之后即可
+      const actions = source.indexOf("className: 'dim-jh-headerActions'", start)
+      expect(actions, 'panelHead 内找不到 headerActions').toBeGreaterThan(start)
+      return source.slice(start, actions)
+    })()
+
+    it('★★ 排序提示必须在 panelHead 内（不是 accountList 内）', () => {
+      // ⚠️ 必须断言**带引号的完整 className**：只断言裸类名 'dim-jh-orderHint'
+      //    时，把它改成 'dim-jh-orderHint-moved' 仍然命中（子串），变异验证会
+      //    判成 NO-TEETH。加引号后改名立刻变红。
+      expect(panelHead, '排序提示搬出 panelHead 会立刻变回三行')
+        .toContain("className: 'dim-jh-orderHint'")
+      // 反向钉子：accountList 那一侧不得再有它
+      const listStart = source.indexOf("className: 'dim-jh-accountList'")
+      expect(listStart, '找不到 accountList').toBeGreaterThan(-1)
+      const listEnd = source.indexOf("className: 'dim-jh-orderHint'", listStart)
+      expect(listEnd, '排序提示又跑回 accountList 了').toBe(-1)
+    })
+
+    it('★★ 提示必须排在按钮组**之前**（否则按钮组会被顶到左边）', () => {
+      // ⚠️ 用绝对位置比较，不要在 panelHead 切片里找按钮组：
+      //    切片**止于**按钮组开标签，它本身不在切片内（第一版就栽在这）。
+      const headStart = source.indexOf("React.createElement('div', { className: 'dim-jh-panelHead' }")
+      const hint = source.indexOf('dim-jh-orderHint', headStart)
+      const actions = source.indexOf("className: 'dim-jh-headerActions'", headStart)
+      expect(hint, '排序提示不见了').toBeGreaterThan(headStart)
+      expect(actions, '按钮组不见了').toBeGreaterThan(headStart)
+      expect(hint, '排序提示必须在前，按钮组才贴右').toBeLessThan(actions)
+    })
+
+    it('★ 提示的渲染条件仍是「两个以上账号」', () => {
+      // ⚠️ 必须在 panelHead 切片里断言，不能用整份源码 —— 该条件在文件里
+      //    另有一处（:2518 的 Token 用量分支），整份匹配时改这处不会变红。
+      expect(panelHead, '提示的显示条件被放宽了').toContain('accounts.length > 1')
+      expect(panelHead, '提示不能再加 >= 1 的口子').not.toContain('accounts.length >= 1')
+    })
+
+    it('★★ 样式侧：panelHead 必须换行 + 标题独占整行', () => {
+      expect(styles, 'panelHead 不换行时四项会挤在一行').toMatch(/\.dim-jh-panelHead \{[^}]*flex-wrap: wrap/)
+      expect(styles, '标题不占整行会与提示挤在同一行')
+        .toMatch(/\.dim-jh-panelHead > \.dim-jh-panelTitle \{[^}]*flex: 1 0 100%/)
+      // ⚠️ 账号列表已于 2026-10-26 挪出 panelHead（它现在是 .dim-jh-accountSection
+      //    的子项、并且是滚动容器），所以「列表占整行」不再由 flex-basis: 100% 表达，
+      //    改由 accountSection 那条规则守（见下面「只滚账号列表」那组用例）。
+      //    这里只钉住它**不许**再回到 flex-basis: 100% —— 纵向主轴下那等于
+      //    「高度取满且不许收缩」，内容一多就把滚动条推回 .dim-jh-panel。
+      expect(styles, '账号列表不许回 flex-basis: 100%（纵向主轴下会让页头跟着滚）')
+        .not.toMatch(/\.dim-jh-accountList \{[^}]*flex: 1 0 100%/)
+    })
+
+    it('★★ 账号管理页头的按钮组贴右：父级选择器里 margin-left: auto 与 flex-end 两条都在', () => {
+      // 提示为 null 时（账号 ≤ 1）本组独占一行，此时只有 flex-end 能把它推到右边；
+      // 提示存在时只有 margin-left: auto 能把它顶到最右。缺一条就有一种状态贴左。
+      // ⚠️ 必须断言**带父级前缀**的选择器：基础 .dim-jh-headerActions 是
+      //    全局页头与账号页头共用的，贴右只能写在 .dim-jh-panelHead > 下。
+      expect(styles).toMatch(/\.dim-jh-panelHead > \.dim-jh-headerActions \{[^}]*margin-left: auto/)
+      expect(styles).toMatch(/\.dim-jh-panelHead > \.dim-jh-headerActions \{[^}]*justify-content: flex-end/)
+    })
+
+    it('★★ 基础 .dim-jh-headerActions 必须保持居中（全局页头用它）', () => {
+      // 用户 2026-10-26 报障：把基础规则改成 flex-end 后，全局页头那排
+      // （供应商 / 一键签到 / 备份 / 恢复 / 网关 / Token 用量 / 渠道原生搜索）
+      // 也一起贴到了最右。共用类名改默认值会波及另一处。
+      const base = styles.match(/\.dim-jh-headerActions \{[^}]*\}/)?.[0]
+      expect(base, '找不到基础 .dim-jh-headerActions 规则').toBeDefined()
+      expect(base, '基础规则必须居中').toMatch(/justify-content: center/)
+      expect(base, '基础规则不得带 margin-left: auto（那会把它顶到最右）')
+        .not.toMatch(/margin-left: auto/)
+      // 反向钉子：全局页头那一组必须是基础规则直接命中，不能被 panelHead 那条误伤
+      expect(source, '全局页头用的是 .dim-jh-header，不是 panelHead')
+        .toContain("className: 'dim-jh-header'")
+    })
+
+    it('★ 提示自身必须能收缩（否则长文案把按钮组挤出容器）', () => {
+      // ⚠️ 2026-10-26「文案改为一行显示」后基准宽从 1 1 0 改成 0 1 auto：
+      //    1 1 0 的基准是 0，nowrap 下浏览器仍按 min-content 撑开，结果是
+      //    「要么整行、要么溢出」；0 1 auto 才真正可收缩。
+      expect(styles).toMatch(/\.dim-jh-orderHint \{[^}]*flex: 0 1 auto/)
+      expect(styles).toMatch(/\.dim-jh-orderHint \{[^}]*min-width: 0/)
+      // 独占一行时代的 10px 下边距必须清掉，否则按钮组下方多一截空隙
+      expect(styles, '提示的下边距必须归零').toMatch(/\.dim-jh-orderHint \{[^}]*margin: 0;/)
+    })
+
+    it('★★ 提示必须单行显示（nowrap + 截断 + 完整文案挂在 title 上）', () => {
+      // 用户 2026-10-26「文案改为一行显示」：折行会让第二行变两行高、
+      // 把按钮组挤到垂直居中的怪位置。
+      expect(styles, '提示必须禁止折行').toMatch(/\.dim-jh-orderHint \{[^}]*white-space: nowrap/)
+      // nowrap 的必要配套：没有它们，窄窗口下文本会溢出到按钮组底下压字。
+      expect(styles, '溢出必须裁掉').toMatch(/\.dim-jh-orderHint \{[^}]*overflow: hidden/)
+      expect(styles, '被裁掉的部分要给省略号').toMatch(/\.dim-jh-orderHint \{[^}]*text-overflow: ellipsis/)
+      // 截断后完整文案只能从 title 读到 ⇒ title 与正文必须同源常量。
+      expect(panelHead, '提示元素必须挂 title（截断后靠它读全）')
+        .toContain('title: ORDER_HINT_TEXT')
+      // 常量只定义一次，正文与 title 都引用它 —— 不可能写出两份不同文案。
+      const defs = source.match(/^const ORDER_HINT_TEXT = /gm) ?? []
+      expect(defs, 'ORDER_HINT_TEXT 必须唯一').toHaveLength(1)
+      expect(panelHead, '正文必须用常量而不是再抄一遍字面量').toContain('}, ORDER_HINT_TEXT)')
+      // 文案本体（用户定稿原文），防止改样式时顺手改字
+      expect(source, '提示文案被改动了').toContain('拖动卡片调整排序，按顺序选号。限额账号会沉到末尾、恢复后不复位')
+    })
+  })
+
+  /**
+   * ★ 用户 2026-10-26「页头滚动时应该只滚动账号列表」。
+   *
+   * 事故形态：滚动发生在 `.dim-jh-panel` 上 ⇒ 标题 / 排序提示 / 按钮组 /
+   * 六条状态提示全都跟着滚走。修法是给账号管理页 section 加类名
+   * （`dim-jh-accountSection`）当**滚动边界**，页头 `flex: none` 固定，
+   * 只有 `.dim-jh-accountList` 自己 `overflow-y: auto`。
+   *
+   * ⚠️ 只断言「accountList 有 overflow-y: auto」是不够的 —— 没有
+   *    `min-height: 0` 时 flex 子项默认 `min-height: auto`，会被内容撑到
+   *    内容高而不是收缩，滚动条**照旧**落回 `.dim-jh-panel`。三件套缺一不可：
+   *    ① 边界容器 flex-direction: column + min-height: 0
+   *    ② 页头 flex: none
+   *    ③ 列表 flex: 1 1 auto + min-height: 0 + overflow-y: auto
+   */
+  describe('★ 滚动：只有账号列表滚，页头固定', () => {
+    it('★★ section 必须挂 dim-jh-accountSection 类名（滚动边界的挂载点）', () => {
+      // 缺类名时下面那些规则无处可挂 —— 它曾经只靠 aria-label 定位、没有类名
+      expect(source, '账号管理页 section 丢了 className，滚动边界规则会全部失效')
+        .toContain("className: 'dim-jh-accountSection'")
+      expect(source, 'section 的 aria-label 不能丢（面板语义）')
+        .toMatch(/className: 'dim-jh-accountSection',\s*\n\s*'aria-label': `\$\{provider\} 账号管理`/)
+    })
+
+    it('★★ 边界容器必须是纵向 flex 且能收缩', () => {
+      const rule = styles.match(/\.dim-jh-accountSection \{[^}]*\}/)?.[0]
+      expect(rule, '缺少 .dim-jh-accountSection 规则').toBeDefined()
+      expect(rule, '必须是纵向 flex，页头才能与列表上下分区').toMatch(/display: flex/)
+      expect(rule, '必须是纵向，否则页头与列表并排').toMatch(/flex-direction: column/)
+      expect(rule, '必须能撑满剩余高度').toMatch(/flex: 1 1 auto/)
+      expect(rule, 'min-height: 0 缺了会把滚动条推回 .dim-jh-panel').toMatch(/min-height: 0/)
+    })
+
+    it('★★ 页头必须 flex: none（不参与收缩、不参与滚动）', () => {
+      expect(styles, '页头被压成可收缩 ⇒ 账号多时它会被挤扁')
+        .toMatch(/\.dim-jh-accountSection > \.dim-jh-panelHead \{[^}]*flex: none/)
+    })
+
+    it('★★ 账号列表自己滚：flex 1 1 auto + min-height 0 + overflow-y auto', () => {
+      const rule = styles.match(/\.dim-jh-accountList \{[^}]*\}/)?.[0]
+      expect(rule, '缺少 .dim-jh-accountList 规则').toBeDefined()
+      expect(rule, '必须能长能缩').toMatch(/flex: 1 1 auto/)
+      expect(rule, 'min-height: 0 缺了会被内容撑开，滚动条回退到外层').toMatch(/min-height: 0/)
+      expect(rule, '滚动必须落在列表自己身上').toMatch(/overflow-y: auto/)
+      // 反向钉子：flex-basis: 100% 是「页头跟着滚」那版的写法
+      expect(rule, '不许回 flex-basis: 100%（纵向主轴下等于高度取满且不许收缩）')
+        .not.toMatch(/flex: 1 0 100%/)
+    })
+
+    it('★★ 外层 .dim-jh-panel 必须是纵向 flex（否则子项撑不开、滚动无从发生）', () => {
+      const rule = styles.match(/\.dim-jh-panel \{[^}]*\}/)?.[0]
+      expect(rule, '缺少 .dim-jh-panel 规则').toBeDefined()
+      expect(rule, '必须是纵向 flex，账号 section 才能占满剩余高度').toMatch(/flex-direction: column/)
+      // overflow-y: auto 保留为兜底（子项没撑开时仍能滚），但正常路径不该出现滚动条
+      expect(rule, 'overflow-y: auto 是兜底，别删').toMatch(/overflow-y: auto/)
+    })
+
+    it('★ 聚合面板也要能自己滚（它不走 accountSection 那条路）', () => {
+      const rule = styles.match(/\.dim-jh-aggPanel \{[^}]*\}/)?.[0]
+      expect(rule, '缺少 .dim-jh-aggPanel 规则').toBeDefined()
+      expect(rule).toMatch(/overflow-y: auto/)
+      expect(rule, 'min-height: 0 缺了会被内容撑开，滚动条回退到 .dim-jh-panel').toMatch(/min-height: 0/)
+    })
+
+    /**
+     * ⚠️⚠️ 真实缺陷（用户 2026-10-27 报障「聚合页模型列表显示异常」）：
+     * 22 个聚合模型的每一行都被压成几像素高的细线，右侧只剩一片横线。
+     *
+     * 根因链：本容器同时是「高度受限」（flex: 1 1 auto + min-height: 0）
+     * 与「纵向 flex」（display: flex / flex-direction: column）⇒ 内容超高时
+     * 子项按 flex-shrink: 1 **被压缩**，而不是溢出滚动。.dim-jh-aggModel
+     * 又带 overflow: hidden ⇒ 它的 min-height: auto 下限失效，可被压到 0 高。
+     *
+     * ⇒ 必须给每个直接内容子项 flex: none。**这条用例就是防线**：
+     * 少了它，任何人只要再给本容器加一次高度约束，列表就会静默塌成横线
+     * （单测不渲染，肉眼之外没人会发现）。
+     */
+    it('★★★ 聚合面板的直接内容子项必须 flex: none（否则模型行被压扁）', () => {
+      // 断言「选择器里确实把这几类子项都列了」
+      const rule = styles.match(/\.dim-jh-aggPanel > \.dim-jh-aggIntro[\s\S]*?\{[^}]*flex: none[^}]*\}/)?.[0]
+      expect(rule, '缺少「聚合面板子项 flex: none」规则 —— 模型行会被压扁').toBeDefined()
+      // 逐个子项点名：漏掉任何一个，它就会成为新的塌陷点
+      for (const cls of [
+        'dim-jh-aggIntro',
+        'dim-jh-aggToolbar',
+        'dim-jh-aggNotice',
+        'dim-jh-aggEmpty',
+        'dim-jh-aggModel',
+        'dim-jh-aggFooter',
+      ]) {
+        expect(rule, `子项 .${cls} 未列入 flex: none`).toContain(`.dim-jh-aggPanel > .${cls}`)
+      }
+      // 反向钉子：不许用通配符 —— 它会连 aggCount 一起钉死，破坏 flex-basis: 100% 换行
+      expect(rule, '不得用通配符：会把 .dim-jh-aggCount 的 flex-basis: 100% 换行一起干掉')
+        .not.toContain('.dim-jh-aggPanel > *')
+      // 反向钉子：不许省成 flex: 0 1 auto（收缩因子仍是 1，白改）
+      expect(rule).toMatch(/flex: none/)
+    })
+
+    /**
+     * ⚠️⚠️ 用户 2026-10-27 报障「美化聚合页模型列表」的落地判据。
+     *
+     * 改造前：候选行里只有一个 `.dim-jh-aggCandidateLabel`，内容是
+     * `渠道名 · 模型 id · 倍率` 一整串 —— 三者同色同字号同权重。
+     * 而这一页的**唯一用途**就是逐条比较渠道（同一模型在 12 家渠道各有一条候选），
+     * 最该被一眼分辨的恰恰是「哪家渠道」「哪个模型」，倍率只是附注。
+     * ⇒ 必须拆成四格、四种视觉层级。
+     *
+     * ⚠️ 本用例守的是**拆分本身**（少一格就退回同权渲染）；
+     * 颜色与字号的具体值不在断言范围（那是设计细节，会随主题调）。
+     */
+    it('★★★ 聚合候选行必须拆成四格（渠道 / 模型 id / 倍率 / 补丁），不得退回单串渲染', () => {
+      // ── 分母：四格的样式必须各自存在 ──
+      for (const cls of [
+        'dim-jh-aggCandidateProvider',
+        'dim-jh-aggCandidateId',
+        'dim-jh-aggCandidatePrice',
+        'dim-jh-aggCandidatePatch',
+      ]) {
+        expect(styles, `缺少 .${cls} 的样式 —— 该格会退回继承父级的同一种字色`).toMatch(
+          new RegExp(`\\.${cls} \\{[^}]*\\}`),
+        )
+      }
+      // ── 层级：渠道名必须比模型 id 弱（否则「哪家渠道」和「哪个模型」又同权了）──
+      const providerRule = styles.match(/\.dim-jh-aggCandidateProvider \{[^}]*\}/)?.[0] ?? ''
+      const idRule = styles.match(/\.dim-jh-aggCandidateId \{[^}]*\}/)?.[0] ?? ''
+      expect(providerRule, '渠道名必须用 tertiary 色（三档里最弱的一档）')
+        .toContain('--dsw-alias-label-tertiary')
+      expect(idRule, '模型 id 必须用 primary 色（本行唯一的强调格）')
+        .toContain('--dsw-alias-label-primary')
+      // ── 弹性：只有模型 id 吃剩余宽度 ──
+      // ⚠️ 若渠道名也参与压缩，同一页里每行的「模型 id 起始位置」会错落，
+      //    对比渠道时眼睛要来回找起点 —— 这正是用户说的「不好看」的机制之一。
+      expect(providerRule, '渠道名必须 flex: none（否则各行的模型 id 起始位置错落）')
+        .toMatch(/flex: none/)
+      expect(idRule, '模型 id 必须吃掉剩余宽度').toMatch(/flex: 1/)
+      // ── 倍率为 0 必须另走一套配色（「免费」与「x0.15」不是同一类信息）──
+      expect(styles, '「免费」必须用 data-free 单独上色，否则会被当成折扣读')
+        .toMatch(/\.dim-jh-aggCandidatePrice\[data-free='true'\]/)
+    })
+
+    it('★ 展开箭头必须是 svg 且随 data-open 旋转（字符版没有过渡）', () => {
+      // ⚠️ 字符「▸ / ▾」在 React 里是**换字符**，浏览器没有中间态 ——
+      //    22 行的高频列表里每次都「跳」一下，观感廉价。
+      //    svg + transform: rotate 才有过渡（全站图标化口径也一致）。
+      expect(styles, '箭头容器必须有 transform 过渡').toMatch(
+        /\.dim-jh-aggChevron \{[^}]*transition: transform/,
+      )
+      expect(styles, '展开态必须把箭头转 90 度').toMatch(
+        /\.dim-jh-aggModel\[data-open='true'\][^{]*\.dim-jh-aggChevron \{[^}]*transform: rotate\(90deg\)/,
+      )
+      // ── 源码侧：模型块必须把 open 状态暴露给样式 ──
+      // ⚠️ 这是「样式能拿到 React 状态」的唯一出口。少了它，上面两条样式
+      //    规则永远不会命中 —— 而纯样式断言照样全绿（假绿陷阱）。
+      expect(source, '模型块必须落 data-open，否则展开态样式永不命中').toMatch(
+        /className: 'dim-jh-aggModel',\s*\n\s*'data-open': open \? 'true' : undefined,/,
+      )
+
+      // ── 渲染侧：箭头必须**真的是** svg + path ──
+      // ⚠️ 上面的样式断言只证明「有 rotate 规则」。把 svg 退回字符 `▸`、或把 path
+      //    删空，样式规则照样在、本文件照样全绿（2026-10-28 审计实测：path → null
+      //    仍是 **115 passed**）⇒ 必须再从渲染侧钉一遍。
+      const modelAt = source.indexOf('const renderModel = (model)')
+      expect(modelAt, 'renderModel 不见了').toBeGreaterThan(-1)
+      const modelBody = source.slice(modelAt, source.indexOf('const renderCandidate = (model', modelAt))
+      expect(modelBody.length, 'renderModel 切片为空 —— 本用例的判据失效').toBeGreaterThan(200)
+      expect(modelBody, '箭头容器不见了').toContain("className: 'dim-jh-aggChevron'")
+      expect(modelBody, '箭头必须 aria-hidden（可访问名不该被装饰图形污染）')
+        .toMatch(/className: 'dim-jh-aggChevron', 'aria-hidden': 'true'/)
+      expect(modelBody, '箭头必须真的是 svg（退回字符 ▸ 会丢掉过渡）')
+        .toMatch(/className: 'dim-jh-aggChevron'[\s\S]{0,600}React\.createElement\('svg'/)
+      // 方向也要钉：朝右的折线，靠 CSS rotate(90deg) 转成朝下 ——
+      // 把 d 换成朝左/朝下的折线，「展开时转 90°」就变成侧向或倒过来了。
+      expect(modelBody, '箭头路径必须是朝右的折线（d 换向会让 rotate 90° 的方向错）')
+        .toContain("d: 'M9 6l6 6-6 6'")
+    })
+
+    /**
+     * ⚠️ 反向钉子：**不得**把展开态的 `data-open` 写成布尔值。
+     * React 对自定义属性的布尔 `false` 会渲染成字符串 "false"（不是移除属性），
+     * 于是未展开的块也带 `data-open="false"` —— 而样式是按 `[data-open='true']`
+     * 写的，一旦有人改成 `=== 'true'` 之外的判据（或写成 `[data-open]`），
+     * 22 个块会**全部**呈现展开态。用 `undefined` 让属性彻底缺席才是稳的。
+     */
+    it('★ data-open 必须是「真时给 true、假时省略」，不得写成布尔值', () => {
+      expect(source).toMatch(/'data-open': open \? 'true' : undefined,/)
+      expect(source, '不得写 data-open: open（布尔 false 会渲染成 "false" 属性）')
+        .not.toMatch(/'data-open': open,/)
+    })
+
+    /**
+     * ★★ 四格必须**在 renderCandidate 里真的被渲染**，且各自喂对应字段。
+     *
+     * ⚠️ 前一条用例只断言「样式存在」。样式在、但 JSX 里没渲染那一格 ——
+     * 是完全可能的回退形态（改样式时手滑删掉一个 createElement，或者
+     * 有人嫌多格麻烦把四格又合并回 `candidateRowLabel` 一串）。
+     * 那时样式断言**全绿**，界面上却退回同权渲染。⇒ 必须再从**渲染侧**钉一遍。
+     */
+    it('★★★ renderCandidate 必须真的渲染这四格，且各喂对应字段', () => {
+      const at = source.indexOf('const renderCandidate = (model, candidate')
+      expect(at, 'renderCandidate 不见了').toBeGreaterThan(-1)
+      const body = source.slice(at, source.indexOf('const renderModel = (model)', at))
+      expect(body.length, 'renderCandidate 切片为空 —— 本用例的判据失效').toBeGreaterThan(200)
+
+      // 渠道格喂 parts.provider
+      expect(body, '渠道格必须渲染 parts.provider')
+        .toMatch(/className: 'dim-jh-aggCandidateProvider' \}, parts\.provider\)/)
+      // 模型 id 格喂 parts.realId
+      expect(body, '模型 id 格必须渲染 parts.realId')
+        .toMatch(/className: 'dim-jh-aggCandidateId' \}, parts\.realId\)/)
+      // 倍率格：必须存在，且**按 price 判空**（不是无条件渲染）
+      expect(body, '倍率格不见了 —— 倍率信息丢失').toContain("className: 'dim-jh-aggCandidatePrice'")
+      expect(body, '倍率格必须由 parts.price 判空后才渲染')
+        .toMatch(/parts\.price === null/)
+      // 补丁角标：必须由 parts.patched 控制
+      expect(body, '补丁角标不见了 —— 规格 §7.1 的人工核查标记丢失')
+        .toContain("className: 'dim-jh-aggCandidatePatch'")
+      expect(body, '补丁角标必须由 parts.patched 控制').toMatch(/parts\.patched/)
+
+      // ── 「免费」必须由 price === 0 触发 data-free（不是无条件、也不是恒 undefined）──
+      // ⚠️ 只断言「样式里有 [data-free='true'] 规则」是**假绿**：把这里的接线删掉，
+      //    样式规则依然在，而界面上的「免费」会悄悄退回普通灰（2026-10-28 审计实测：
+      //    把接线改成 `undefined` 后，本文件 **115 条全绿**）。
+      expect(body, '「免费」必须由 parts.price === 0 触发 data-free')
+        .toMatch(/'data-free':\s*parts\.price === 0 \? 'true' : undefined/)
+
+      // ── 反向钉子：不得退回「整串直接塞进 span」──
+      // ⚠️ 这正是改造前的形态：`React.createElement('span', { className: '...CandidateLabel' }, candidateRowLabel(candidate))`
+      //    三等号后面紧跟 `candidateRowLabel(` 说明那一整串又被当成**文本子节点**了。
+      expect(body, '不得把 candidateRowLabel 整串当文本渲染（那就是改造前的同权形态）')
+        .not.toMatch(/CandidateLabel'[^)]*?\},\s*\n?\s*candidateRowLabel\(/)
+      // 但**允许**它出现在 title 上（悬停读全文）：那是刻意保留的
+      expect(body, '整串文案必须保留在 title 上（长 id 被省略号截断后要能悬停读全文）')
+        .toMatch(/title: candidateRowLabel\(candidate\)/)
+    })
+  })
+
+  /**
    * ⚠️ 页头左侧标题必须**保持删除**（两次删除，都不要加回来）：
    *
    * ① 副标题「提供商凭据与多账号管理」（.dim-jh-brandDesc）—— 2026-10-06：
@@ -828,11 +1300,14 @@ describe('供应商弹窗的自定义排序（2026-10-06 拖拽需求）', () =>
       expect(all.indexOf('e')).toBe(all.indexOf('c') + 1)
     })
 
-    it('关闭组仍按声明顺序沉底（自定义顺序不覆盖关闭组的展示）', () => {
+    it('关闭组也按自定义顺序排（2026-10-26 起，组间先后仍不变）', () => {
       let order = dropThrough(null, [], 'd', 'b', 'after')
       order = dropThrough(order, ['d', 'e'], 'c', 'a', 'after')
-      // 展示侧只读 open 段并按声明序排关闭组：d、e 恒在末尾且 d 在 e 之前
-      expect(renderIds(order, ['d', 'e'])).toEqual(['a', 'c', 'b', 'd', 'e'])
+      // 展示：已打开段（a c b）+ 已关闭段（e d，按 order 里的相对次序）。
+      // ⚠️ 2026-10-06 的口径是「关闭组恒按声明顺序沉底」⇒ 那时期望 d 在 e 之前；
+      //    2026-10-26 用户要求「已关闭的供应商也应该支持调整顺序」后，关闭组
+      //    同样吃 `order`，故 e 在前。组间先后（open 全在 closed 之前）不变。
+      expect(renderIds(order, ['d', 'e'])).toEqual(['a', 'c', 'b', 'e', 'd'])
     })
 
     it('旧顺序缺失（未自定义）时退化为缀尾，不抛错', () => {
@@ -889,11 +1364,20 @@ describe('供应商弹窗的自定义排序（2026-10-06 拖拽需求）', () =>
     // （真实 provider.status 恒带模型计数，测试数据必须同形）。
     const statuses = { c: { closed: true, models: { total: 3 }, accounts: { total: 1 } } }
 
-    it('已打开组按 order 重排，已关闭组恒按声明顺序沉底（用户口径：逻辑不变）', () => {
-      const rows = providerSwitchRows(providers, statuses, ['d', 'a'])
-      expect(rows.map(r => r.id)).toEqual(['d', 'a', 'b', 'c'])
-      // 关闭组的位置在最后，且开关呈现仍是「已关闭」
-      expect(rows[3]!.checked).toBe(false)
+    it('两组各自按 order 重排，组间先后不变（2026-10-26：已关闭也能拖）', () => {
+      // 已打开 a/b/d 与已关闭 c/e/f 各给一份自定义顺序。
+      const many = [P('a'), P('b'), P('c'), P('d'), P('e'), P('f')]
+      const st = {
+        c: { closed: true, models: { total: 3 } },
+        e: { closed: true, models: { total: 3 } },
+        f: { closed: true, models: { total: 3 } },
+      }
+      const rows = providerSwitchRows(many, st, ['f', 'c', 'e', 'd', 'a'])
+      // 已打开段：d、a 在前，b 未定位按声明序补后 ⇒ d a b
+      // 已关闭段：f、c、e 按 order 的相对次序 ⇒ f c e
+      expect(rows.map(r => r.id)).toEqual(['d', 'a', 'b', 'f', 'c', 'e'])
+      // 组间不混：前 3 行 checked=true，后 3 行 false
+      expect(rows.map(r => r.checked)).toEqual([true, true, true, false, false, false])
     })
 
     it('order 未指定时与既有行为完全一致（向后兼容，rail 同源）', () => {
@@ -904,14 +1388,62 @@ describe('供应商弹窗的自定义排序（2026-10-06 拖拽需求）', () =>
     })
   })
 
+  describe('nextProviderOrderAfterGroupDrop（两组都能拖，跨组不生效）', () => {
+    it('已关闭组内拖动 → 只重排 closed 段，open 段原样保持', () => {
+      // open=[a,b]，closed=[c,d,e]；把 e 拖到 c 之前 ⇒ closed 变 e,c,d
+      expect(nextProviderOrderAfterGroupDrop(['a', 'b'], ['c', 'd', 'e'], 'e', 'c', 'before', null))
+        .toEqual(['a', 'b', 'e', 'c', 'd'])
+      // after 方向同样生效
+      expect(nextProviderOrderAfterGroupDrop(['a', 'b'], ['c', 'd', 'e'], 'c', 'e', 'after', null))
+        .toEqual(['a', 'b', 'd', 'e', 'c'])
+    })
+
+    it('已打开组内拖动 → 委托给 nextProviderOrderAfterDrop（关闭 id 按新 open 段重排）', () => {
+      const viaGroup = nextProviderOrderAfterGroupDrop(
+        ['a', 'b', 'c'], ['d'], 'c', 'a', 'before', ['a', 'b', 'c', 'd'],
+      )
+      const direct = nextProviderOrderAfterDrop(['a', 'b', 'c'], ['d'], 'c', 'a', 'before', ['a', 'b', 'c', 'd'])
+      expect(viaGroup).toEqual(direct)
+      // 与函数文档一致：结果 = 新 open 段 + 按「旧顺序里的直接前驱」插回的 closed。
+      // d 的前驱是 c ⇒ 紧跟 c 之后 ⇒ ['c','d','a','b']。
+      // ⚠️ 这里的形状**与展示无关**（展示侧会按 sortOpenProvidersByOrder 重排
+      // open 段、closed 段单独排序），它只决定「重开 d 时它回到哪一位」。
+      expect(viaGroup).toEqual(['c', 'd', 'a', 'b'])
+    })
+
+    it('⚠️ 跨组拖拽返回 null（组间顺序固定：已打开恒在前）', () => {
+      // 已打开行拖到已关闭行上
+      expect(nextProviderOrderAfterGroupDrop(['a', 'b'], ['c', 'd'], 'a', 'c', 'before', null)).toBeNull()
+      // 已关闭行拖到已打开行上
+      expect(nextProviderOrderAfterGroupDrop(['a', 'b'], ['c', 'd'], 'c', 'a', 'after', null)).toBeNull()
+    })
+
+    it('源与目标相同、或 id 不在任一组里 → null', () => {
+      expect(nextProviderOrderAfterGroupDrop(['a', 'b'], ['c'], 'c', 'c', 'before', null)).toBeNull()
+      expect(nextProviderOrderAfterGroupDrop(['a'], ['c'], 'zz', 'c', 'before', null)).toBeNull()
+    })
+
+    it('空组不抛错', () => {
+      expect(nextProviderOrderAfterGroupDrop([], ['a', 'b'], 'b', 'a', 'before', null))
+        .toEqual(['b', 'a'])
+      expect(nextProviderOrderAfterGroupDrop(['a', 'b'], [], 'b', 'a', 'before', null))
+        .toEqual(['b', 'a'])
+      expect(nextProviderOrderAfterGroupDrop(null, null, 'a', 'b', 'before', null)).toBeNull()
+    })
+  })
+
   describe('弹窗拖拽的接线（源码级回归）', () => {
     it('面板消费 order / onCommitOrder，并经 nextProviderOrderAfterDrop 提交', () => {
       const body = panelBody()
       expect(body).toContain('providerSwitchRows(providers, statuses, order)')
-      expect(body).toContain('nextProviderOrderAfterDrop(')
+      expect(body).toContain('nextProviderOrderAfterGroupDrop(')
       expect(body).toContain('onCommitOrder(next)')
-      // ⚠️ 已关闭的行不得可拖：它恒按默认顺序沉底，能拖而不能落只会误导。
-      expect(body).toContain('if (!row.checked || !dragEnabled) return { enabled: false };')
+      // ⚠️ 2026-10-26 起已关闭的行**也能拖**（用户需求「已关闭的供应商也应该
+      // 支持调整顺序」）。反向钉子：别把 `!row.checked` 那个早退写回来 ——
+      // 它会让已关闭组永远拖不动，且界面上没有任何提示。
+      expect(body, '已关闭的行被重新禁止拖拽了')
+        .not.toContain('if (!row.checked || !dragEnabled) return { enabled: false };')
+      expect(body).toContain('if (!dragEnabled) return { enabled: false };')
     })
 
     it('页面层走 provider.getOrder / provider.setOrder（宿主持久化）', () => {
@@ -939,10 +1471,10 @@ describe('供应商弹窗的自定义排序（2026-10-06 拖拽需求）', () =>
 
     // ⚠️ 回归（PR #63 复审发现）：初版 onDrop 漏传 oldOrder，已关闭 id 的位置
     // 在「关闭期间又拖一次」后永久丢失 —— 这条断言锁住调用点的实参个数。
-    it('⚠️ onDrop 必须把当前 order 作为 oldOrder 传给 nextProviderOrderAfterDrop', () => {
+    it('⚠️ onDrop 必须把当前 order 作为 oldOrder 传给 nextProviderOrderAfterGroupDrop', () => {
       const body = panelBody()
       expect(body).toMatch(
-        /nextProviderOrderAfterDrop\(openIds, closedIds, sourceId, row\.id, dropPosition, order\)/,
+        /nextProviderOrderAfterGroupDrop\(\s*openIds, closedIds, sourceId, row\.id, dropPosition, order,?\s*\)/,
       )
     })
   })

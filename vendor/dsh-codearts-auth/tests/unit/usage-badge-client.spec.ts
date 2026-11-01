@@ -69,11 +69,11 @@ function narrowPopBlock(styles: string): string {
   expect(start, '找不到浮层窄屏段的注释标题（可能被改名或删除）').toBeGreaterThan(-1)
   // ⚠️ 结束锚点必须是一个**独立段落**的标题，不能用模板闭合反引号 ——
   // 后者会把「本段之后、模板结束之前」的一切都算进本段（见上面第 3 条）。
-  // 当前本段是全文件最后一段，故结束锚点取模板闭合处；但**同时**要求
-  // 两者之间不含另一个段落标题（否则说明有人在本段之后插了新段，
-  // 那时必须改这个锚点，而不是让断言静默地跨段匹配）。
-  const end = styles.indexOf('\n`', start)
-  expect(end, '找不到 STYLES 模板的闭合位置').toBeGreaterThan(start)
+  // 本段（窄屏浮层）之后紧跟的是「插件详情页设置卡片」段（2026-10-24 新增），
+  // 故锚点取那一段的标题。该标题若被改名，下面的 expect 会直接红 —— 不设兜底，
+  // 兜底会让断言静默跨段（那正是上面第 3 条记录过的假绿）。
+  const end = styles.indexOf('── 插件详情页', start)
+  expect(end, '找不到紧随「窄屏浮层」之后的「插件详情页」段落标题：请改 narrowPopBlock 的结束锚点').toBeGreaterThan(start)
   const raw = styles.slice(start, end)
   const strayHeader = raw.indexOf('── ', raw.indexOf('\n'))
   expect(
@@ -492,7 +492,30 @@ describe('用量徽标：签到（本渠道 + 全部渠道）', () => {
 
   it('签到成功后强制重读（否则要等下一轮轮询才看到新数字）', () => {
     expect(badge).toMatch(/await claimCredits\(provider\)[\s\S]{0,500}?read\.current\(\)/)
-    expect(badge).toMatch(/setClaiming\(null\);\s*\n\s*read\.current\(\);/)
+    /**
+     * ⚠️ 判据从「`setClaiming(null)` **紧跟** `read.current()`」改成**行为不变的弱形式**
+     * （2026-10-27）：签到路径加了 `claimInFlightRef` 同步闸门后，释放动作变成
+     * `finally { claimInFlightRef.current = false; setClaiming(null) }`，而
+     * `read.current()` 移到了 finally **之后** —— 相邻关系不再成立，但「签到后必重读」
+     * 这条**语义没变**。
+     *
+     * ⇒ 真正要守的是「重读发生在签到**之后**」，而不是两条语句物理相邻
+     * （后者属于实现细节，且本次已因正当理由改变）。用 `onClaim` 函数体范围来判，
+     * 避免跨函数误匹配。
+     */
+    const onClaimBody = badge.slice(
+      badge.indexOf('const onClaim = async'),
+      badge.indexOf('const onClaimAll = async'),
+    )
+    expect(onClaimBody.length, '未定位到 onClaim 函数体').toBeGreaterThan(100)
+    expect(
+      onClaimBody,
+      'onClaim 里必须调用 read.current() —— 否则签到后要等下一轮轮询才看到新余额',
+    ).toMatch(/read\.current\(\)/)
+    // 且必须在 `await claimCredits` **之后**（签到前重读没有意义）
+    expect(onClaimBody.indexOf('read.current()')).toBeGreaterThan(
+      onClaimBody.indexOf('await claimCredits'),
+    )
   })
 
   it('签到结果按四态汇总成一句话 + 色调（「今天已领」不算失败）', () => {
@@ -1030,7 +1053,7 @@ describe('用量徽标：弹窗的紧凑布局（信息一项不少）', () => {
 })
 
 describe('用量徽标：依赖与样式', () => {
-  it('package.json 声明三个客户端依赖（含提供 modelDirectories 的那个包）', () => {
+  it('package.json 声明四个客户端依赖（含 modelDirectories 与 plugin-manager）', () => {
     const pkg = JSON.parse(read('package.json')) as {
       dsh?: { client?: { platform?: string; inject?: string[] } }
     }
@@ -1039,6 +1062,10 @@ describe('用量徽标：依赖与样式', () => {
       '@deepseek-ai/dsh-client-connection',
       '@deepseek-ai/dsh-client-ui-settings',
       '@deepseek-ai/dsh-client-ui-model-selection',
+      // ⚠️ 第 4 项（2026-10-24 新增）：插件详情页的 `plugins.bundle.config` 卡片
+      // 由 plugin-manager 提供，不声明的话本 bundle 可能先于它到达、
+      // `slots.inject` 一直等服务 ⇒ 卡片永不出现，且不报错。
+      '@deepseek-ai/dsh-client-ui-plugin-manager',
     ])
   })
 
@@ -1196,6 +1223,214 @@ describe('单位归一：宿主与客户端同一口径', () => {
       expect(normalizeUnit(unit), unit).toBe(unit === 'token' ? 'token' : 'credit')
       // 归一到 credit 的单位，展示名必须是「积分」，且**只有一种**写法
       expect(unitLabel(normalizeUnit(unit)), unit).toBe(unit === 'token' ? 'Token' : '积分')
+    }
+  })
+})
+
+/**
+ * ★★ **同一语义的两处渲染必须同时改**（2026-10-21 真实缺陷）。
+ *
+ * 设置页账号卡片（`jet-hub.js` 的 `CreditBalanceRow`）与**本徽标弹窗**
+ * （`usage-badge.js` 的 `splitParts`）是**两套独立渲染代码** —— 6d7f47a 只改了
+ * 前者，于是用户看到「设置页有「另有 25000 专属」、弹窗没有」。
+ *
+ * ⇒ 这里用源码级断言把**两处都锁住**：任一侧漏改都会红，而不是静默漂移。
+ *    ⚠️ 判据用 `isExclusivePool`（`credit-expiry.js` 单一持有）而不是各自的
+ *    文案 —— 只断言文案会让「改了文案但删了逻辑」这种改法溜过去。
+ */
+describe('独立池（AStudio 星火积分）：设置页与徽标弹窗两处渲染同步', () => {
+  // ⚠⚠ 断言必须基于 **`codeOf`（剥掉注释）**。
+  //
+  // ⚠⚠⚠ **为什么（合并审计发现，B4）**：本文件原先的断言用的是 **`read()`
+  // 的原始文本**（未剥注释）⇒ 字面量在**注释里也存在** ⇒ 把真条件改成
+  // `false && …`（死分支短路，本仓已记录过 6 次同型复发）依然全绿。
+  //
+  // 实测（变异验证）：
+  // - `usage-badge.js` 的 `if (false && exclusive > 0)` → 76 条全绿；
+  // - `jet-hub.js` 的 `false && exclusiveRemaining > 0` → 76 条全绿。
+  //
+  // ⚠ 同一文件的 `codeOf` helper 就在第 33 行，**新用例却没用它**。
+  const badge = codeOf(read('plugin-src/client/usage-badge.js'))
+  const jetHub = codeOf(read('plugin-src/client/jet-hub.js'))
+
+  it('徽标弹窗的 splitParts 追加独立池段（无色 muted）', () => {
+    // 必须走**唯一的判据函数**（与 credit-expiry.js 同一份），不能各写一套
+    expect(badge).toContain('exclusivePoolRemainingOf')
+    // 追加的是**分段**，故 key 与 tone 都要对（tone 用 muted：不是告警，是事实说明）
+    expect(badge).toContain("key: 'exclusive'")
+    expect(badge).toContain("tone: 'muted'")
+  })
+
+  it('设置页的 CreditBalanceRow 同样渲染独立池提示', () => {
+    expect(jetHub).toContain('exclusivePoolRemainingOf')
+    expect(jetHub).toContain('exclusiveRemaining > 0')
+  })
+
+  it('两处都**调用**同一个纯函数（不是只 import 了它）', () => {
+    // ⚠ 两处都必须**调函数**（而不只是 import 名字）—— 只坐实「import 了它」
+    // 未就等于「用了它」。
+    expect(badge).toContain('exclusivePoolRemainingOf(')
+    expect(jetHub).toContain('exclusivePoolRemainingOf(')
+  })
+
+  it('两处共用同一个 isExclusivePool 判据（不是各写一套）', async () => {
+    // 单一真相源：两处都从 credit-expiry.js import，而不是各自实现「独立池」匹配。
+    const { isExclusivePool } = await import('../../plugin-src/client/credit-expiry.js')
+    expect(isExclusivePool({ name: '星火积分（独立池，不参与主池合计）' })).toBe(true)
+    expect(isExclusivePool({ name: '赠送积分' })).toBe(false)
+    // 没有 name / name 不是字符串 ⇒ false（不抛，避免渲染整行崩掉）
+    expect(isExclusivePool({})).toBe(false)
+    expect(isExclusivePool(undefined)).toBe(false)
+  })
+})
+
+/**
+ * ⚠️⚠️ **徽标 tooltip 的「最早作废」标题不得对短语再拼后缀**
+ * （2026-10-21 合并审计发现，!135 引入的回归）。
+ *
+ * ## 缺陷
+ *
+ * !135 把 `expirySplitParts` 的 `countdown` 从「裸时长」改成「**可能是完整短语**」
+ * （倒计时只覆盖其中一批时为 `其中 500 于 6 天 0 小时后到期`），而**消费方**这一行
+ * 仍无条件拼 `后` ⇒ 实测残句：
+ *
+ * ```
+ * 最早作废：其中 500 于 6 天 0 小时后到期后
+ * ```
+ *
+ * ⚠️ 本处此前**零用例**：把整条 title 换成垃圾串，全量测试**零新增失败**。
+ *
+ * ## 判据为什么是源码级
+ *
+ * title 拼在 `renderSplitNote` 的 JSX 字面量里，没有可独立调用的纯函数。
+ * ⇒ 沿用本文件既有的 `codeOf`（**剥注释**）口径 —— 否则新增的解释性注释里若
+ * 提到 `countdown}后`（本文档上面就提到了一次）会把断言判成违规。
+ * ⚠️ 抽查那条 `\${part.countdown}` 的**正**断言同时存在，避免「只要不含 A」被
+ *    改写成删掉整条 title 也全绿。
+ */
+describe('徽标 tooltip 标题：短语不得再拼后缀（!135 回归的守卫）', () => {
+  const badge = codeOf(read('plugin-src/client/usage-badge.js'))
+
+  it('title 直接用 countdown，不再拼「后」', () => {
+    // 正：title 由 countdown 直接构成
+    expect(badge, 'title 必须来自 part.countdown').toContain('最早作废：${part.countdown}')
+    // 反：不得出现「拼了后缀」的形态
+    expect(badge, '不得对 countdown 再拼「后」（混合批次时它是完整短语）')
+      .not.toContain('${part.countdown}后')
+  })
+})
+
+/**
+ * ★★★ **签到必须有同步重入闸门**（2026-10-27 审计，与 `jet-hub.js` 的
+ * `claimInFlightRef` 同款）。
+ *
+ * ## 缺陷
+ *
+ * 本组件此前只用 `claiming` 这个**异步 state** 禁用按钮，而 state 更新要等下一帧
+ * ⇒ **同一 tick 内连点两次会穿透**，起两轮 `credits.claimAll`。
+ *
+ * ## 为什么在这条渠道上后果重
+ *
+ * AutoClaw 的签到腿会**先刷新 token 制造一次「登录事件」**（活动奖励依赖它）。
+ * 两轮并发 ⇒ 两次刷新；而刷新会**轮换 `refresh_token`**，两次写回的先后由网络
+ * 抖动决定 ⇒ 晚到的旧值把已作废的 token 覆盖回盘上 ⇒ 账号续期能力失效。
+ * （服务端那条腿已加单飞，客户端这层是第二道，挡的是白打两轮上游请求。）
+ *
+ * ## 判据为什么是这几条
+ *
+ * - **必须是 `useRef`**：`useState` 的 `disabled` 只挡下一帧之后的点击；
+ * - **闸门判断必须在第一个 `await` 之前**（否则两轮都已越过检查点，闸门无效）；
+ * - **拦住时不得静默 return**（本仓库记过「点了没反应」这条教训，IKJLK3 B）；
+ * - **两个入口共用同一个 ref**（`onClaim` 与 `onClaimAll` 各用一个的话，
+ *   交替点击仍能穿透）；
+ * - **释放必须在 `finally` 里**（否则一次未捕获异常就让签到永久卡死）。
+ */
+describe('用量徽标：签到同步重入闸门', () => {
+  const source = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/usage-badge.js'),
+    'utf8',
+  ).replace(/\r\n/g, '\n')
+
+  /**
+   * ⚠️⚠️ **必须剥掉块注释再取函数体**（2026-10-27 实测的假绿根因）：
+   * `onClaim` 上方有一段说明闸门的长注释，**注释里就写着「必须在第一个 `await`
+   * 之前」** ⇒ `body.indexOf('await ')` 命中的是注释文字，于是下面
+   * `guardBlock = slice(guardAt, firstAwait)` 变成一个**空/错位**切片，
+   * 「拦住时不得静默」那条断言拿到空串 ⇒ **`toMatch` 直接假绿**。
+   * 实测：把拦住分支改成 `{ return; }`（真缺陷），4 条断言**全绿**。
+   */
+  const stripBlockComments = (text: string): string => text.replace(/\/\*[\s\S]*?\*\//g, '')
+  const onClaimBody = stripBlockComments(source.slice(
+    source.indexOf('const onClaim = async'),
+    source.indexOf('const onClaimAll = async'),
+  ))
+  // ⚠️ 窗口按**下一个函数**的起点截，不要写死字符数（4000 不够 —— finally 在更后面，
+  //    第一版就这么假红了一次）。
+  const claimAllAt = source.indexOf('const onClaimAll = async')
+  const afterClaimAll = source.indexOf('\n  const tone =', claimAllAt)
+  const onClaimAllBody = source.slice(claimAllAt, afterClaimAll > claimAllAt ? afterClaimAll : claimAllAt + 6000)
+
+  it('★★ 闸门是 useRef（不是 state）', () => {
+    expect(source, '必须有 claimInFlightRef')
+      .toMatch(/const claimInFlightRef = React\.useRef\(false\)/)
+  })
+
+  it('★★ onClaim：闸门判断在第一个 await 之前，且拦住时不静默', () => {
+    const guardAt = onClaimBody.indexOf('claimInFlightRef.current')
+    const firstAwait = onClaimBody.indexOf('await ')
+    expect(guardAt, 'onClaim 里找不到闸门判断').toBeGreaterThan(-1)
+    expect(firstAwait, 'onClaim 里找不到 await').toBeGreaterThan(-1)
+    expect(guardAt, '闸门判断必须在第一个 await 之前，否则两轮都已越过检查点').toBeLessThan(firstAwait)
+    // 拦住时必须给用户一句话（静默 return 会让人分不清「没反应」与「正在跑」）
+    const guardBlock = onClaimBody.slice(guardAt, firstAwait)
+    /**
+     * ⚠️⚠️ 判据必须是「**带文案**的 setClaimNotice」，不能只匹配 `setClaimNotice(` ——
+     * 拦住分支**之后**紧跟一行 `setClaimNotice(null)`（进入正常流程前清空旧提示），
+     * 它落在同一个切片里 ⇒ 只匹配函数名**恒真**。
+     * 实测：把拦住分支改成 `{ return; }`（真缺陷），这条断言仍绿 —— 就是栽在这。
+     */
+    expect(
+      guardBlock,
+      '拦住后必须给用户一句话（不得静默 return —— 用户分不清「没反应」与「正在跑」）',
+    ).toMatch(/setClaimNotice\(\s*\{/)
+  })
+
+  it('★★ onClaimAll 与 onClaim **共用同一个** ref（否则交替点击仍可穿透）', () => {
+    expect(onClaimAllBody, 'onClaimAll 没接闸门').toMatch(/claimInFlightRef\.current/)
+    expect(onClaimAllBody, 'onClaimAll 拦住后必须 setClaimNotice').toMatch(/setClaimNotice\(/)
+  })
+
+  /**
+   * 取某个 `finally {` **块内部**的内容（按花括号配对，不是按字符距离）。
+   *
+   * ⚠️ 判据必须是「在 finally 块**内部**」，不能用 `finally\s*\{[\s\S]{0,200}?…`
+   * 这种**距离**判据 —— 把释放语句挪到 `}` 之后的下一行，它离 `finally {` 仍然
+   * 只有几十个字符 ⇒ 距离判据**照样命中**（2026-10-27 实测：该变异下断言仍绿）。
+   */
+  const finallyBlockBody = (text: string): string | null => {
+    const at = text.lastIndexOf('} finally {') >= 0 ? text.lastIndexOf('} finally {') : text.indexOf('finally {')
+    if (at < 0) return null
+    const open = text.indexOf('{', at)
+    let depth = 0
+    for (let i = open; i < text.length; i += 1) {
+      if (text[i] === '{') depth += 1
+      else if (text[i] === '}') {
+        depth -= 1
+        if (depth === 0) return text.slice(open + 1, i)
+      }
+    }
+    return null
+  }
+
+  it('★★ 释放必须在 finally **块内部**（否则一次异常就让签到永久卡死）', () => {
+    for (const [name, body] of [['onClaim', onClaimBody], ['onClaimAll', onClaimAllBody]] as const) {
+      const inner = finallyBlockBody(body)
+      expect(inner, `${name} 里找不到 finally 块`).not.toBeNull()
+      expect(
+        inner,
+        `${name} 的闸门释放必须在 finally **块内** —— 挪到块之后时，一次未捕获异常`
+        + '就会让闸门永久占住（此后点签到只看到「上一次仍在进行中」）',
+      ).toMatch(/claimInFlightRef\.current = false/)
     }
   })
 })

@@ -176,7 +176,15 @@ describe('目录可见性', () => {
         { id: 'big-pickle', isFree: true, contextWindow: 262144 },
         { id: 'glm-5.2', isFree: false, contextWindow: 200000 },
       ]),
-      ...disabled === undefined ? {} : { disabledModels: () => disabled },
+      ...disabled === undefined ? {} : {
+        // ⚠️⚠️ 2026-10-23 迁移：黑名单来源从 `disabledModels` 选项回调改为
+        // **账号池**（本家已走共享骨架）。老写法用 `as never` 强转时**不会**报
+        // 类型错，但行为会静默退回「不过滤」—— 正是本仓库反复记录的形态。
+        accountPool: {
+          disabledModelsFor: () => disabled,
+          providerClosedFor: () => false,
+        } as never,
+      },
     })
   }
 

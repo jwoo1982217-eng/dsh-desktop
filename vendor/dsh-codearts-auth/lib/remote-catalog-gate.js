@@ -52,6 +52,7 @@
  *
  * ⇒ **显示与广播按 `got`，永久缓存与清冷却按 `complete`**。
  */
+import { withoutAccountRotation } from './account-rotation.js';
 /** 失败 / 空结果后的默认冷却时长。 */
 export const REMOTE_CATALOG_COOLDOWN_MS = 30_000;
 /**
@@ -147,7 +148,9 @@ export class RemoteCatalogGate {
         // ⇒ 先把任务落成局部量、await 之后再清，并只清「仍是自己那一个」。
         const task = (async () => {
             try {
-                return normalizeLoadResult(await run());
+                // 目录取凭据若继承当前请求，会触发免费资格检查，再次等待本目录而自锁。
+                // 仅隔离加载任务；await 返回后，调用方仍保留原请求的选号与取消语义。
+                return normalizeLoadResult(await withoutAccountRotation(run));
             }
             catch {
                 // 拉取自身抛错与「返回空目录」同等对待：都没拿到目录。

@@ -186,6 +186,24 @@ describe('withDeadModelPruning —— 记录与剔除', () => {
     expect((await wrapped.listModels()).some((m) => m.id === 'gone-1')).toBe(true)
   })
 
+  /**
+   * ★★ **`catalogConfirmedRemote` 必须原样透传**（接线守卫，2026-10-28）。
+   *
+   * 本 Proxy 只拦截 `listModels` / `listAllModels` / `stream` / `prepareCall`，
+   * 其余成员原样透传。`model.list` 的「已下架」判据**只信**这个自报钩子
+   * （见 `ModelCatalogSource.catalogConfirmedRemote` 的注释）—— 它若被包装层
+   * 吞掉，钩子恒 `undefined` ⇒ 判据**静默放弃** ⇒ PR159 那半个修复无声失效
+   * （不报错、不告警，只是已下架的幽灵条目又回来了）。
+   *
+   * ⇒ 用真跑 `withDeadModelPruning` 包装的形式钉住它，而不是只测裸适配器。
+   */
+  it('★★ catalogConfirmedRemote 经包装后仍可调用且拿到真实判定', () => {
+    const wrapped = withDeadModelPruning([PROVIDER], makeAdapter({ catalogConfirmedRemote: () => true }))
+    expect(wrapped.catalogConfirmedRemote()).toBe(true)
+    const wrappedFalse = withDeadModelPruning([PROVIDER], makeAdapter({ catalogConfirmedRemote: () => false }))
+    expect(wrappedFalse.catalogConfirmedRemote()).toBe(false)
+  })
+
   it('stream 抛「模型不存在」⇒ 记入剔除表', async () => {
     const wrapped = withDeadModelPruning([PROVIDER], makeAdapter())
     await expect(drain(wrapped.stream({ model: 'gone-1' }) as AsyncIterable<unknown>)).rejects.toThrow('model not found')

@@ -237,7 +237,104 @@ export interface CreditPackage {
    * 依赖方必须把 `undefined` 当作「到期时间未知」而不是「已过期」。
    */
   deductionEndTime?: number
+  /**
+   * 本包中**即将到期**的额度（可选；`undefined` = 上游未按包下发该口径）。
+   *
+   * ## 为什么需要它（`expiringTotal` 不够）
+   *
+   * CodeArts 的赠送积分包（签到/活动）**没有逐笔到期时刻**，但上游会在
+   * 该分类 metric 上给一个 `package_credit_expiring_amount` 标量，说明
+   * 「这 25000 分里有 2000 即将到期」。
+   *
+   * 只把这个数放在 `CreditBalance.expiringTotal` 上，分档就会把**整包 25000
+   * 都算进永久桶**，然后旁边补一句「另有 2000 即将到期」—— 数字自相矛盾
+   * （用户 2026-10-20 报障：「2000+500临期不应该是2500嘛」）。
+   *
+   * ⇒ 拆到包上：临期桶 += `expiringRemaining`，永久桶 += `remaining - expiringRemaining`。
+   *
+   * ## ⚠️ 与 `deductionEndTime` 的关系
+   *
+   * 两者**互斥**：
+   * - 有 `deductionEndTime`（基础包，随套餐周期）⇒ 按真实时刻分档，不读本字段；
+   * - 无 `deductionEndTime` 但有本字段（赠送包）⇒ 进临期桶，但**没有倒计时**
+   *   （上游不给日期，绝不编一个）。
+   *
+   * ## ⚠️ 实测校验（2026-10-20，两个真实账号）
+   *
+   * `总额 expiring - 赠送 expiring = 0` ⇒ 总额那个标量**就是各分类之和**，
+   * 故逐包读取不会重复计数；`CreditBalance.expiringTotal` 保留为总额口径
+   * 用于交叉校验。
+   */
+  expiringRemaining?: number
 }
+
+/**
+ * 这个包是不是**独立池**（不参与主池合计、也不能当通用积分消耗）。
+
+ * ## 为什么需要它（2026-10-21 合并审计发现）
+
+ * AStudio（讯飞 AstronStudio）的服务端给**两个互不相通**的池：主池
+ * （会员 / 购买 / 赠送）与「星火池」。上游自己写明了星火池「不参与主池合计」，
+
+ * `src/astudio-credits.ts` 的 `buildAstudioBalance` 据此把它起名为
+ * `星火积分（独立池，不参与主池合计）`。
+
+ * ## ⚠️⚠️ 为什么判据必须在**宿主侧**（本文件）而不是各处分写
+
+ * PR !134 只在**客户端**（`plugin-src/client/credit-expiry.js`）把独立池从
+
+ * 三档里摘出，后端选号侧（`src/buddy-balance-rank.ts` 的
+
+ * `splitBuddyCreditsByExpiry`）**完全不看 `pkg.name`** ⇒ **两侧口径分叉**：
+
+ * 同一份数据，前端说「永久 0」，后端说「永久 25000」。
+
+ * ⇒ 用户可见症状（**阻断级**）：AStudio 账号只剩星火池时，
+
+ * 面板显示「另有 25000 专属（不计入）」而三档一行不渲染（看起来「没积分」），
+
+ * 但后端把 25000 算成**临期** ⇒ `buddyBalanceTier` 判 `expiring` ⇒
+
+ * **锁定永久积分时该账号仍被判「可用」** ⇒ 选号把请求发给一个只有专属池的
+
+ * 账号 ⇒ 上游按主池计费 ⇒ 请求失败。
+
+ * ## ⚠️ 为什么用「池名含『独立池』」而不是 provider 白名单
+
+ * 池名是**运行时字符串**，而本文件（宿主侧）与客户端（`plugin-src/client/`）
+
+ * **不共享模块图**（见 AGENTS.md）⇒ 两处各存一份判据必然漂移。
+
+ * ⇒ 判据收敛到**本文件一份**，客户端那份由**单测锁死**（见
+
+ * `tests/unit/credit-expiry.spec.ts` 的「独立池判据必须两侧同源」段）。
+
+ * ⚠️ 这条判据依赖**池名** ⇒ 上游/本仓改池名会让它静默失效 ⇒ 那条同步锁
+
+ * 就是为此存在（改池名会让它当场变红）。
+
+ * @param pkg - 资源包（`name` 缺失/非字符串一律当「不是独立池」）。
+
+ * @returns 是独立池则为 `true`。
+
+ */
+export function isExclusiveCreditPool(pkg: { name?: string } | null | undefined): boolean {
+
+  const name = pkg !== null && pkg !== undefined && typeof pkg.name === 'string' ? pkg.name : ''
+
+  return name.includes(EXCLUSIVE_POOL_NAME_MARK)
+
+}
+
+/**
+ * 独立池在**池名**里的标记（宿主侧唯一持有点）。
+
+ * ⚠️ 客户端那份在 `plugin-src/client/credit-expiry.js`（两侧不共享模块图），
+
+ * 由单测锁死一致 —— 改这里必须同步改那边，否则守卫会红。
+
+ */
+export const EXCLUSIVE_POOL_NAME_MARK = '独立池'
 
 /** 账号的积分余额汇总。 */
 export interface CreditBalance {
@@ -263,6 +360,73 @@ export interface CreditBalance {
    * UI 可以据此提示「另有 N 已失效」，既不误导也不丢信息。
    */
   expiredTotal: number
+  /**
+   * `total` 中**即将到期**的额度（可选；`undefined` = 上游未下发该口径）。
+   *
+   * ## 为什么需要这个字段（而不是只靠 `packages[].deductionEndTime`）
+   *
+   * 绝大多数 provider 的到期信息是**逐包**的（CodeBuddy 的 `DeductionEndTime`、
+   * AStudio 的 `*NextExpireTime`、MiniMax 的 `expire_at_ms`），故分档
+   * （永久 / 长期 / 临期）只需读 `packages` 即可。
+   *
+   * **CodeArts 只能部分做到**（实测 2026-10-20，两个真实账号）：
+   *
+   * - **基础积分包**随套餐周期到期（响应顶层 `end_date`）⇒ 有确切时刻，
+   *   已写进 `packages[].deductionEndTime`，可正常参与三档分档。
+   * - **赠送积分包**（签到/活动，逐笔「发放日 +30 天」）与**按需包**没有
+   *   逐包到期字段，只有 `package_credit_expiring_amount` 这个**聚合标量**
+   *   告诉你「有 N 分即将到期」，但**不说**是哪几笔、**不说**哪天到期。
+   *   逐包/逐笔明细端点在上游不存在（探了 85+ 个候选全 404，且解包
+   *   `D:\CodeArts\resources\app.asar` 后全量枚举只有 27 条 `/v1/*` 路径，
+   *   其中唯一的积分端点是 `/v1/ops/credit/usage`，返回的是**单次对话消耗**
+   *   `{credits, cacheHitRatio}`，不是余额明细）。
+   *
+   * ⇒ 赠送/按需那部分**没有确切日期**，但上游给了「其中 N 即将到期」的
+   * 标量，已拆到 `packages[].expiringRemaining`（进临期桶、无倒计时）。
+   * 本字段保留为**总额口径**用于交叉校验（= 各包 `expiringRemaining` 之和）。
+   * **不要**为了让它看起来和别家一样而臆造 `deductionEndTime`
+   * —— 那会让「永久锁」按一个编造的日期做决策。
+   *
+   * ## ⚠️ 时间窗口未知
+   *
+   * 华为**没有**定义「即将到期」是未来多少天内（字段名里没有、官方计费文档
+   * 也没有）。故 UI 文案必须原样说「即将到期」，**不得**写成「30 天内到期」
+   * 之类 —— 那是编造。
+   *
+   * ## ⚠️ 与 `expiredTotal` 的方向相反
+   *
+   * `expiredTotal` 是「已经失效、不可用」；本字段是「仍然可用、但快失效」。
+   * 两者互斥，不会同时有值。
+   */
+  expiringTotal?: number
+  /**
+   * ⚠️⚠️ **本次读数是「降级结果」**（可选；`true` = 明细不可达、`packages` 是兜底包）。
+   *
+   * ## 为什么需要它（2026-10-21 二轮审计发现，P1）
+   *
+   * 某些渠道的余额有**两条数据源**：一个总额端点（必成）+ 一个明细端点（可能失败）。
+   * 明细失败时实现会**静默回退**到「钱包包」——总额正确，但**逐包到期时刻全部丢失**
+   * （回退包没有 `deductionEndTime`）。
+   *
+   * 而 `splitBuddyCreditsByExpiry` 对「没有到期时刻」的判据是**永久桶**（保守方向，
+   * 对「真·永久积分」是对的）。⇒ 一次明细抖动会让「有临期积分的账号」被判成
+   * **只剩永久积分** ⇒ 锁定状态下报「积分都已用尽」—— 那句会把用户推向
+   * **不可撤回的解锁**（本仓库红线级误导）。
+   *
+   * 实测复现（AutoClaw，`autoclaw-credits.ts` 的 `catch {}` 回退）：
+   * ```
+   * 流水正常   → pkgs=[{每日签到, 5000, end:…}]  split={expiring:5000} tier=expiring  ✅
+   * 流水 500   → pkgs=[{奖励积分, 5000, 无 end}]  split={permanent:5000} tier=none     ❌
+   * ```
+   * 同一账号、同一余额，只因明细端点抖动，结论从「可用」翻成「积分都已用尽」。
+   *
+   * ⇒ 本字段让**选号层**能区分「确实只剩永久积分」与「读不到明细」：
+   * 降级时不应断言 `exhausted`，而应报 `unknown`（「无法确认」）。
+   *
+   * ⚠️ 语义边界：`true` **不表示失败** —— 总额仍然可信（可正常展示余额），
+   *    只是**逐包到期信息不可用**。故它不能替代 `error`（后者表示「连总额都没拿到」）。
+   */
+  degraded?: boolean
 }
 
 /**

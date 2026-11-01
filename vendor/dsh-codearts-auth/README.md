@@ -11,7 +11,7 @@ deepseek-harness 插件：统一管理多个 AI 编程服务的账号，并把�
 的模型选择器。支持**多账号池**（同一服务登录多个账号，按可用性自动选号）与
 **凭据静默续期**（到期前自动刷新，无需再次打开浏览器）。
 
-- **17 个 provider 路由**，外加 1 个**聚合**路由（见下）
+- **18 个 provider 路由**，外加 1 个**聚合**路由（见下）
 - 登录、状态、续期、积分领取**全部在 Jet Hub 设置页完成**，不注册任何斜杠命令
 - 附带一个**本机 OpenAI 兼容网关**，供其它客户端复用已登录账号
 
@@ -29,6 +29,7 @@ deepseek-harness 插件：统一管理多个 AI 编程服务的账号，并把�
 ## 目录
 
 - [安装](#安装)
+- [Windows 服务器部署（引导式 / 离线式）](#windows-服务器部署引导式--离线式)
 - [用法](#用法)
 - [支持的渠道](#支持的渠道)
 - [聚合路由](#聚合路由aggregate)
@@ -101,6 +102,10 @@ dsh plugin --profile <name> add "https://gitee.com/iJetLi/deepseek-harness-codea
 `add` 以 git 仓库方式安装（pnpm 内部走 `git+https:` 协议），会运行本包的 `prepare`
 脚本自动构建 `lib/`，无需手动 `pnpm build`。
 
+⚠️ `prepare` **不依赖任何包管理器**（它直接内联 `tsc` / `node`）：pnpm 在 clone
+目录里跑 `prepare` 时，**pnpm 10 / 11 不会把 npm 注入 PATH**（只有 pnpm ≥ 12 会）
+⇒ 若 `prepare` 里写 `npm run …`，那两代上安装会直接失败。
+
 ⚠️ pnpm 10 起会拦截依赖的构建脚本，必须先在 profile 的 `pnpm-workspace.yaml`
 （路径形如 `~/.dsh/profiles/<name>/pnpm-workspace.yaml`）里放行；而**放行键的写法
 在 pnpm 10 与 pnpm 11 之间互不兼容**，写错就装不上。
@@ -169,6 +174,160 @@ dsh plugin --profile <name> install <path-to-this-repo>
 
 ---
 
+## Windows 服务器部署（引导式 / 离线式）
+
+`service.bat` 除了把程序注册成 Windows 服务外，还能打出两种部署产物：
+
+| 模式 | 命令 | 体积 | 目标机要求 |
+|---|---|---|---|
+| **引导式**（推荐） | `package -Mode bootstrap` | **约 20 MB** | 能访问网络；首次执行 `install.cmd` 自动备好 Node 并下载依赖（约 730 MB） |
+| 离线式 | `package -Mode standalone` | 约 800 MB | **无需 anything**：Node 与全部依赖都内置，可完全断网 |
+
+两者都**不包含** profile 的账号与设置数据 —— 那部分用 Jet Hub 的「账号备份导入」恢复。
+
+### 引导式产物（按需下载，约 20 MB）
+
+```bat
+service.bat package -Mode bootstrap
+```
+
+产物在 `dist\bootstrap\dsh-providers-hub-<版本>-win-x64\`，部署只需两条命令：
+
+```bat
+install.cmd     :: 下载 DSH 宿主依赖 + 组装 profile（首次 1-3 分钟）
+start.cmd       :: 启动
+```
+
+产物结构：
+
+```
+dsh-providers-hub-<版本>-win-x64\
+├─ MANIFEST.json          版本 / 依赖版本 / 关键文件 sha256
+├─ README.txt             部署说明
+├─ install.cmd / install.ps1   目标机安装（下载依赖 + 组装 profile）
+├─ start.cmd / stop.cmd / stop.ps1
+├─ service.bat            注册 Windows 服务（产物随附，目标机就地可跑）
+├─ runtime\
+│  ├─ service-runner.mjs  服务包装器
+│  └─ node.exe            ← 仅 --with-node 打包时存在（含 npm，+130 MB）
+├─ plugin\                插件本体（lib / locale / cordis.patch.yml / package.json）
+│  └─ node_modules\       插件生产依赖（4 个包；--thin 时改为目标机下载）
+└─ host\
+   ├─ package.json        宿主依赖声明
+   └─ package-lock.json   精确锁定 548 个包的版本与 integrity（install 用 npm ci）
+```
+
+`install.cmd` 做 8 件事：**备好 Node（缺则自动下载）** → 校验 npm → 从 lock 安装宿主依赖 →
+**核验 peer 闭包**（`dsh` / `dsh-base` / `dsh-web-app` / `dsh-llm` / `cordis-plugin-loader`）→
+建 profile 骨架 → 把插件拷进 profile → 核验 `.node` 是否当前平台 → 打印后续命令。
+
+**Node 是怎么解决的**（三级回退，无需人工干预）：
+
+1. 产物内 `runtime\node.exe`（用 `--with-node` 打包时才有）；
+2. 系统 `PATH` 上的 `node.exe`；
+3. **都没有 → 自动下载**官方 Node win-x64 zip（版本取打包机自身版本，约 35 MB，自带 npm），
+   解压到产物 `runtime\`。之后 `start.cmd` 与 `service.bat` 都会自动用这份 Node，
+   不再依赖系统 PATH。
+
+> 下载源顺序：`-NodeMirror <基址>`（若给）→ `npmmirror.com` → `nodejs.org`。
+> 内网无外网时用 `-SkipNodeDownload` 让它老实报错，或事先把 Node 装好。
+
+可选参数：`install.cmd -Profile prod -Registry https://registry.npmmirror.com -Force -SkipVerify`、
+`-NodeMirror https://npmmirror.com/mirrors/node -SkipNodeDownload -NodeVersion v24.13.0`。
+
+需要产物自带 Node（目标机没装 Node）时：
+
+```bat
+node scripts\build-bootstrap.mjs --with-node
+```
+
+> ⚠️ **不能给 `npm install` 加 `--omit=peer`**：DSH 宿主的 peerDependencies 是它运行的一部分，
+> 漏一个就 `ERR_MODULE_NOT_FOUND` 起不来。`install.ps1` 会在装完后显式核验这 5 个包。
+
+### 离线式产物（完全自包含，约 800 MB）
+
+目标机**不需要安装 Node / npm / pnpm，也无法联网**，解压即跑。
+
+```bat
+service.bat package -Mode standalone
+```
+
+产物落在 `dist\standalone\dsh-providers-hub-<版本>-win-x64\`，把它整个目录拷到服务器即可。
+下面的目录结构说明针对离线式产物；引导式产物在 `install.cmd` 跑完后，`home\` 下的布局与它一致。
+
+### 目录结构
+
+```
+dsh-providers-hub-<版本>-win-x64\
+├─ MANIFEST.json          版本 / 依赖清单 / 原生二进制清单（可审计）
+├─ README.txt             部署说明（目录结构、启动方式、限制）
+├─ start.cmd              启动（前台，用内置 Node）
+├─ stop.cmd / stop.ps1    停止
+├─ service.bat            注册 Windows 服务（产物随附，目标机就地可跑）
+├─ runtime\
+│  ├─ node.exe            内置 Node 运行时（目标机无需装 Node）
+│  └─ service-runner.mjs  服务包装器
+└─ home\                  == DSH_HOME
+   ├─ cordis.patch.yml    home 级 patch 层
+   └─ profiles\
+      ├─ node_modules\
+      │  └─ @deepseek-ai\dsh\           DSH 宿主
+      │     ├─ lib\  package.json
+      │     └─ node_modules\            宿主依赖闭包（548 个包，真实目录）
+      └─ prod\                          预置 profile（免 npm install）
+         ├─ package.json                dsh.profile.bundles
+         ├─ cordis.patch.yml
+         └─ node_modules\
+            └─ dsh-providers-hub\       本插件
+               ├─ lib\  locale\  cordis.patch.yml
+               └─ node_modules\          插件生产依赖（真实目录）
+```
+
+要点：
+
+- **全部依赖以真实目录分发**（不是 junction），所以产物可以随意移动/复制，zip 也不会损坏。
+  宿主启动时若发现链接失效会**自动重建**。
+- **原生模块按 Windows 平台收录**（如 `@img/sharp-win32-x64`、
+  `node-addon-require-builtin-win32-x64-msvc`），打包时逐个核验，缺失即中止。
+- **预置 profile 里插件已就位**，目标机**不需要执行任何 `npm install` / `pnpm install`**，
+  也不需要联网。
+- 插件与宿主共用的依赖会做**去重**（按 semver 判定），避免同一模块出现两个实例。
+
+### 启动
+
+```bat
+start.cmd
+```
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `DSH_PROFILE` | `prod` | profile 名 |
+| `DSH_HOST` | `127.0.0.1` | Web UI 监听地址 |
+| `DSH_PORT` | `8123` | Web UI 端口 |
+| `DSH_OPENAI_GATEWAY_PORT` | `8326` | 本机 OpenAI 网关端口 |
+| `DSH_OPENAI_GATEWAY_HOST` | `127.0.0.1` | 网关监听地址 |
+
+Web UI：`http://<DSH_HOST>:<DSH_PORT>`；网关：`http://<网关地址>:<端口>/v1`。
+
+⚠️ 不要把监听地址改成 `0.0.0.0` / `::` —— 宿主与网关都会在启动前**显式拒绝**并报错退出；
+要给内网访问请填**具体网卡 IP**，并务必设置 `DSH_OPENAI_GATEWAY_API_KEY`。
+
+注册成 Windows 服务（需管理员 + NSSM；两种产物根目录都已随附 `service.bat`）：
+
+```bat
+service.bat install -Mode standalone -BundleDir <产物目录> -Profile prod   :: 离线式
+service.bat install -Mode bootstrap  -BundleDir <产物目录> -Profile prod   :: 引导式（先跑过 install.cmd）
+```
+
+> ⚠️ 2026-10-31 审计（P1）：新版 `service.bat` 检测到 `-BundleDir` 已是完整产物时
+> **自动跳过打包**（打印一行提示），无需再加 `-NoPackage`；`-Force` 仍可强制重打包。
+> 老版本（无自动检测的）必须显式加 `-NoPackage`，否则它会在目标机上尝试重新打包而失败。
+
+> ⚠️ 账号登录仍需在浏览器里完成（Jet Hub 设置页）；无浏览器环境请用「账号备份与迁移」里的
+> 导出/导入把账号搬过去。
+
+---
+
 ## 用法
 
 **登录入口：Jet Hub 设置页的对应 provider 面板。**
@@ -177,16 +336,44 @@ dsh plugin --profile <name> install <path-to-this-repo>
 
 基本流程：
 
-1. 打开 Jet Hub 设置页（侧边 rail 选择要用的渠道）；
+1. 打开 Jet Hub（点主导航里的 **Jet Hub** 一行；也可从「设置 → 插件 → Jet Hub」
+   进入 —— 两条路径渲染的是**同一个页面**）；
 2. 点「**+ 新建账号**」→ 浏览器打开授权页 → 完成登录；
 3. 需要多个账号时重复第 2 步（账号池会自动选号）；
 4. 回到 dsh 的模型选择器，选中该渠道的模型即可开始对话。
+
+### 「面板入口」：两个入口二选一
+
+上面那两条进入路径是**互斥**的，只能保留一条。改法在**插件详情页**：
+「设置 → 插件 → dsh-providers-hub」，页面里有一张设置卡，卡里一个「**面板入口**」
+下拉：
+
+| 选项 | 结果 |
+|---|---|
+| **仅侧栏**（默认） | 主导航里多一行「Jet Hub」；设置弹层里**没有** Jet Hub 那一节 |
+| **仅设置页** | 只剩「设置 → 插件 → Jet Hub」；主导航那一行消失 |
+
+⚠️ 默认是「仅侧栏」，所以**设置弹层里默认找不到 Jet Hub 一节**，这不是插件没装好。
+想从设置里进，就把下拉切成「仅设置页」——切换后主导航那一行会消失。
+
+偏好存在宿主侧而不是浏览器存储，重启后保持 —— 理由见 `docs/agent-notes/client-ui.md`。
 
 「+ 新建账号」是**两步式**的：先返回 `loginUrl` 由前端弹窗打开，后台再轮询换取
 令牌 —— 这样不会阻塞浏览器手势窗口，弹窗不会被拦截。
 
 账号卡片支持：**测试 / 重测 / 重置 / 停用 / 代理 / 指纹 / 删除**，以及拖拽排序
 （**顺序即选号优先级**）。停用只影响自动选号，**不影响凭据续期与积分领取**。
+
+> **ZCode 例外**：`zcode` 多账号默认按 DSH 的 `sessionId` 做会话亲和 —— 同一会话
+> **优先**落到同一账号、不同会话分散到不同账号；**没有 `sessionId` 的请求**（例如本机
+> OpenAI 网关的一次性调用）每次随机选号。其余 provider 仍按上面的手动顺序优先。
+>
+> ⚠️ 这个「优先」有例外，**不是**「整个会话永远固定在一个账号上」：账号的**今日
+> 请求数达到阈值**（默认 300）后会被沉底 ⇒ **新会话**绕开它；而一个**正在跑的长
+> 会话**，一旦它所在的账号越阈，**下一次请求会迁移**到别的账号 —— 这是把「一个长
+> 会话独占一个号」（本机实测单号占当日 71.6%、max/mean 4.3）摊开的唯一手段，代价是
+> 这次迁移会让上游输入缓存失效一次。阈值可用
+> `DSH_ZCODE_SESSION_BALANCE_OVERFLOW_REQUESTS` 调整（`0` = 关闭溢出，纯哈希亲和）。
 
 ⚠️ 「**代理**」按钮目前只对 `opencode` 与 `gemini` 渲染（两者语义不同，见
 「出不去墙外服务」一节）；其余渠道的账号卡片上没有这个按钮。
@@ -195,7 +382,7 @@ dsh plugin --profile <name> install <path-to-this-repo>
 
 ## 支持的渠道
 
-17 个 provider 路由，互不覆盖，可同时使用。
+18 个 provider 路由，互不覆盖，可同时使用。
 
 | id | 渠道 | 登录方式 | 积分能力 |
 |---|---|---|---|
@@ -211,11 +398,12 @@ dsh plugin --profile <name> install <path-to-this-repo>
 | `raccoon` | Raccoon Work（商汤） | 微信扫码 / 短信 | 余额 + 一次性登录奖励 |
 | `minimax` | MiniMax Code (中国版) | OAuth 设备码 + PKCE | 余额 + 每日签到 |
 | `minimaxintl` | MiniMax Code (国际版) | 同上（共用实现） | 余额 + 每日签到 |
-| `zcode` | ZCode（智谱 z.ai） | OAuth 设备码 | 余额 + 每日领取 |
+| `zcode` | ZCode（智谱 z.ai） | OAuth 设备码 | 余额 + 每日领取（含**营销活动**投放，如 1024 程序员节 5 亿 token） |
 | `opencode` | OpenCode | — | 余额 |
 | `gemini` | Gemini Code Assist | 浏览器回调 | 余额 |
 | `officeace` | OfficeAce（华为 MaaS / 果办） | 华为云 OAuth PKCE | 余额 + 自动领取（**无手动签到入口**） |
 | `accio` | Accio（阿里） | 浏览器回调 | 余额（三类桶；**无签到**） |
+| `qiniu` | Qiniu（七牛云） | 粘贴 API Key | **无**（用量只在控制台可见） |
 
 各渠道的能力与限制要点：
 
@@ -235,6 +423,64 @@ dsh plugin --profile <name> install <path-to-this-repo>
   不带验证头先发一发，被 `3007` 拒了才产）；一旦服务端翻成 `false`，
   插件会**自动改为首发直接带上**，不再白吃那发注定失败的往返
   （判据是三态：缺席 = 不知道 = 保持先探，见 `requiresCaptchaUpfront`）。
+  ⚠️ **找不到浏览器时用 `ZCODE_CHROME_PATH` 指定**（Gitee issue IKQ4JN）：
+  这是该链路**唯一**的人工出口，值是 chromium 内核浏览器的**绝对路径**
+  （如 `C:\Program Files\Google\Chrome\Application\chrome.exe`）。
+  候选链按优先级为 `ZCODE_CHROME_PATH` → `SCOOP` / `SCOOP_GLOBAL` →
+  **从 `PATH` 反推的 scoop 根** → `~/scoop` → 系统 Chrome / Chromium /
+  **Brave** / Edge。
+  ⚠️ **设完必须重启 `dsh web`，且新进程要继承新环境** —— 从**旧终端**重启时
+  新进程继承的仍是旧 shell 的环境快照，变量实际为空。找不到浏览器时的报错
+  会回显「本进程看到的 `ZCODE_CHROME_PATH` = …」与**逐条候选路径**，
+  照着它能立刻分清「变量没生效」与「路径写错」。
+  ⚠️ **scoop 装在非默认根时不必设变量**：从 `PATH` 的 `<root>\shims` 反推
+  已覆盖（用 `root_path` 把 scoop 挪到 D 盘的机器上 `SCOOP` 是空的，
+  旧版因此一个 chromium 都找不到）。
+  ⚠️ **不支持两类「看着能用」的封装**：Chrome++ 之类**外层 exe 启动后自行退出**
+  （CDP 端口会正常起来，但退出码 0 被判为异常退出）；以及
+  `chrome-headless-shell`（headless 一律 `F001`，必须 headful）。
+- **`zcode` 的领取有「两个来源」，签到会同时查、一起去领**（2026-10-23）：
+  ① 每日赠送 —— `GET /api/v1/zcode-plan/billing/preview` 的 `plans`；
+  ② **营销活动投放** —— `GET /api/v1/marketing/touch` 里横幅按钮的
+  `claim_zcode_plan`。后者就是官方客户端那类「限时可领取」横幅（如
+  **1024 程序员节 5 亿 token**），它**不在** `preview` 里 —— 只查 preview 时
+  它与「今天没有活动」在报文上**完全同形**（都是 `plans: []`）。
+  ⚠️ **营销端点与领取端点都按客户端版本门控**：插件凭据里记的是自己的版本号
+  （如 `3.14.3`）；用它查投放会拿到**空投放**，用它**领取**则回
+  `400 / code 1004 no permission`（官方文案：「当前账号或**客户端版本**不满足
+  领取条件」—— 极易被误读成「这个账号没资格」）。两条请求都会**按需抬到
+  `3.16.3`**（`ZCODE_VERSION_GATED_MIN_APP_VERSION`；实测同一账号、其余头完全相同，
+  只改这一个字段：查投放 `3.14.3` → `deliveries: []` / `3.16.3` → 有投放；
+  领取 `3.14.3` → `1004` / `3.16.2` → `code 0`）。该覆盖**只作用于这两条请求**，
+  不影响推理与额度两条已实测路径。
+  ✅ **真机验收**（2026-10-23，走插件自己的生产路径）：`{"kind":"claimed",
+  "credit":500000000,"unit":"token"}` —— 5 亿 token 领取成功。
+  ⚠️ **「领取成功但额度仍是 0」是正常的**：活动的 `effective_at` 是 **23:00**
+  （UTC+8），而额度桶要等那个时刻才建（上游 `plans[].status:"active"` 里
+  额度已锁定，`balances` 仍是空的）。插件会把它单独显示成一个
+  「**待生效**」的包并带出生效时刻，**不并进当前可用额度** ——
+  并进去会让折算层在生效前就把 zcode 派发出去（必然失败）。
+  ⚠️ **国际版（`zai`）账号同样能领到**（2026-10-23 实测：4 个账号含 2 个
+  国际版都拿到同一个 1024 计划）⇒ 服务端**不按 OAuth 渠道区分**；
+  「只有中国版有」是官方客户端**奖励中心分站**（`/cn/rewards` vs `/en/rewards`）
+  造成的**入口**差异，插件不做渠道特判。
+  ⚠️ 领取成功后插件会回报一次 `POST /marketing/touch/action`（`confirm`），
+  否则服务端会**反复投放同一个活动** ⇒ 每轮签到白烧一个验证参数
+  （阿里云验证是**设备级**配额）。失败时**绝不**回报 —— 那会让用户白丢一次机会。
+- **`qiniu`（七牛云 AI）** 登录方式是**粘贴 API Key**（无浏览器、无需回调）：
+  在面板点「+ 新建账号」，把 `portal.qiniu.com/ai-inference/api-key` 创建的 Key 贴进去即可
+  （至少 16 位、无空白）。Key **长期有效、不需要续期**，同一条 Key 重复添加会**复用**
+  同一个账号（不会平白多出一个额度桶）。
+  ⚠️ **面板不显示余额，也没有签到按钮** —— 七牛云 AI 的用量与计费只在它的 web 控制台
+  可见，没有可调用的余额接口。这不是「还没做」，是上游确实没有。
+  ⚠️ 它的**模型 id 由平台动态下发**（形如 `deepseek-v3` 与 `moonshotai/kimi-k3` 两种写法
+  混排），插件**原样透传**、不做任何改写 —— 手填模型 id 时必须与七牛云模型广场的
+  「API model 参数」**逐字一致**，多写斜杠或少写斜杠都会 404。
+  ⚠️ **图片输入与思考档位都未声明**：VL 系模型确实在目录里，但七牛云侧**未做读图实测**，
+  插件按「不支持」处理（宁可挡住也不让模型对着图片编答案）；思考档位同理 —— 上游支持
+  `low|medium|high` 但目录不下发每个模型的支持情况，故不显示档位选择器。
+  ⚠️ 额度耗尽后的冷却**对齐 UTC+8 当日 24:00**（七牛的额度按自然日重置），不会把账号
+  锁满 24 小时。
 - **`qoder` / `qodercn`** 共用同一套实现，差异仅在产品配置。
 - **`minimax` / `minimaxintl`** 共用同一套实现（**唯一**的 Anthropic Messages
   协议族渠道），差异仅在产品配置。⚠️ 两站的**账号不互通、API 主机也不同**，
@@ -869,8 +1115,3 @@ E2E 探针**按 provider 分列**（如 `pnpm test:e2e:codearts`、`pnpm test:e2
 | `docs/agent-notes/` | 逐 provider 的事故史与约定（开发向） |
 | `docs/implementation-notes.md` | **全部实现细节与协议笔记（不入库）**。⚠️ **目前没有 accio 章节** —— accio 的实测笔记在 `docs/agent-notes/providers-accio.md`，补写该章节是独立任务 |
 | `cordis.patch.yml` | DSH bundle 补丁 |
-
-
-## 本地桌面增强保留
-
-本仓库以固定上游为基础保留 ChatGPT 会员入口、AutoClaw 既有登录、OrcaTerm、同模型粘滞与账号接续、ZCode个人/机构来源、WorkBuddy隔离登录、OpenCode原生服务、共享OFM账号池和原备份回执。具体接线与验证状态见本轮桌面升级记录；源码合并不等于正式桌面服务已部署。

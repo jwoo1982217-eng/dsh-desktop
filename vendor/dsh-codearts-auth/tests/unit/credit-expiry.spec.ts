@@ -25,6 +25,7 @@ import {
   formatPackageExpiry,
   formatPackageTooltip,
   formatPoolSplitLine,
+  exclusivePoolRemainingOf,
   packageExpiryMs,
   splitCreditsByExpiry,
 } from '../../plugin-src/client/credit-expiry.js'
@@ -80,18 +81,18 @@ function reduceFrontendToBackend(frontend: { expiring: number; longTerm: number;
 describe('splitCreditsByExpiry（前端三档分桶）', () => {
   it('15 天内到期算临期，更久算长期，无到期时间算永久', () => {
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 9 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 9 * DAY, earliestExpiringAmount: 100 })
+      .toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 9 * DAY, earliestExpiringAmount: 100, exclusivePoolRemaining: 0 })
     // ⚠️ 3008 天有**明确到期时间** ⇒ 长期（黄），不是永久（绿）。
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 3008 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0 })
+      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0, exclusivePoolRemaining: 0 })
     // 只有**服务端没给到期时间**才是真·永久。
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: undefined })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 0, longTerm: 0, permanent: 100, earliestExpiringAt: null, earliestExpiringAmount: 0 })
+      .toEqual({ expiring: 0, longTerm: 0, permanent: 100, earliestExpiringAt: null, earliestExpiringAmount: 0, exclusivePoolRemaining: 0 })
   })
 
   it('恰好 15 天归长期（判据是"不足 15 天"）', () => {
     expect(splitCreditsByExpiry([pkg({ deductionEndTime: NOW + 15 * DAY })], WINDOW_DAYS, NOW))
-      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0 })
+      .toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0, exclusivePoolRemaining: 0 })
   })
 
   it('失效包与零余额包不计入', () => {
@@ -99,7 +100,7 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
       pkg({ active: false, remaining: 999, deductionEndTime: NOW + DAY }),
       pkg({ remaining: 0 }),
       pkg({ remaining: 100, deductionEndTime: NOW + 20 * DAY }),
-    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0 })
+    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0, exclusivePoolRemaining: 0 })
   })
 
   it('到期时间未知归永久（保守方向）', () => {
@@ -107,7 +108,125 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
       pkg({ deductionEndTime: undefined }),
       pkg({ deductionEndTime: 0 }),
       pkg({ deductionEndTime: Number.NaN }),
-    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 0, permanent: 300, earliestExpiringAt: null, earliestExpiringAmount: 0 })
+    ], WINDOW_DAYS, NOW)).toEqual({ expiring: 0, longTerm: 0, permanent: 300, earliestExpiringAt: null, earliestExpiringAmount: 0, exclusivePoolRemaining: 0 })
+  })
+
+  /**
+   * ⚠️ **独立池不进三档**（2026-10-21 用户报障「没标注星火专属」）。
+   *
+   * AStudio 的星火积分是服务端下发的独立池（`buildAstudioBalance` 的池名原话
+   * 「独立池，不参与主池合计」）。它若混进 `permanent`，主行只显示「永久 25000」
+   * ⇒ 用户会以为那是能随便用的通用积分，而它只能用于特定场景。
+   *
+   * ⇒ 摘出来单独给 `exclusivePoolRemaining`，三档一个子都不多算。
+   */
+  it('独立池（池名含「独立池」）摘出到 exclusivePoolRemaining，不进三档', () => {
+    expect(splitCreditsByExpiry([
+      pkg({ name: '赠送积分', remaining: 1900, deductionEndTime: NOW + 11 * DAY }),
+      pkg({ name: '星火积分（独立池，不参与主池合计）', remaining: 25000, deductionEndTime: undefined }),
+    ], WINDOW_DAYS, NOW)).toEqual({
+      expiring: 1900,
+      longTerm: 0,
+      permanent: 0,
+      earliestExpiringAt: NOW + 11 * DAY,
+      earliestExpiringAmount: 1900,
+      exclusivePoolRemaining: 25000,
+    })
+  })
+
+  it('独立池有到期时间也不进三档（判据只看池名，不看字段）', () => {
+    // 即便上游将来给独立池补了到期字段，它仍不是主池的一部分 ⇒ 仍须摘出。
+    expect(splitCreditsByExpiry([
+      pkg({ name: '赠送积分', remaining: 1900, deductionEndTime: NOW + 11 * DAY }),
+      pkg({ name: '星火积分（独立池，不参与主池合计）', remaining: 25000, deductionEndTime: NOW + 3 * DAY }),
+    ], WINDOW_DAYS, NOW)).toEqual({
+      expiring: 1900,
+      longTerm: 0,
+      permanent: 0,
+      earliestExpiringAt: NOW + 11 * DAY,
+      earliestExpiringAmount: 1900,
+      exclusivePoolRemaining: 25000,
+    })
+  })
+
+  it('失效的独立池不计入（active=false 与零余额都不算）', () => {
+    expect(splitCreditsByExpiry([
+      pkg({ name: '赠送积分', remaining: 1900, deductionEndTime: NOW + 11 * DAY }),
+      pkg({ name: '星火积分（独立池，不参与主池合计）', active: false, remaining: 25000 }),
+      pkg({ name: '另一独立池', remaining: 0 }),
+    ], WINDOW_DAYS, NOW)).toEqual({
+      expiring: 1900,
+      longTerm: 0,
+      permanent: 0,
+      earliestExpiringAt: NOW + 11 * DAY,
+      earliestExpiringAmount: 1900,
+      exclusivePoolRemaining: 0,
+    })
+  })
+
+  it('没有独立池时 exclusivePoolRemaining 为 0（现有 provider 逐字不变）', () => {
+    expect(splitCreditsByExpiry([
+      pkg({ name: '会员积分', remaining: 100, deductionEndTime: NOW + 11 * DAY }),
+      pkg({ name: 'Bonus Pack', remaining: 200, deductionEndTime: undefined }),
+    ], WINDOW_DAYS, NOW)).toEqual({
+      expiring: 100,
+      longTerm: 0,
+      permanent: 200,
+      earliestExpiringAt: NOW + 11 * DAY,
+      earliestExpiringAmount: 100,
+      exclusivePoolRemaining: 0,
+    })
+  })
+
+  /**
+   * ## ★ `expiringRemaining`：无日期的包也要拆出临期部分
+   *
+   * 用户 2026-10-20 报障（逐字）：`2000+500临期不应该是2500嘛`。
+   *
+   * CodeArts 赠送包没有逐笔到期时刻，上游只给「其中 N 即将到期」的标量
+   * ⇒ 解析到 `pkg.expiringRemaining`。若不拆，整包进永久桶，卡片上
+   * 「永久 25000」与「临期 500」并存，用户算不平（应为 永久 23000 + 临期 2500）。
+   */
+  describe('expiringRemaining（无到期日期但上游标了「即将到期」）', () => {
+    it('★ 拆成 临期 expiringRemaining + 永久 余下部分', () => {
+      expect(splitCreditsByExpiry([
+        pkg({ remaining: 25000, total: 25000, deductionEndTime: undefined, expiringRemaining: 2000 }),
+      ], WINDOW_DAYS, NOW)).toEqual({
+        expiring: 2000, longTerm: 0, permanent: 23000, earliestExpiringAt: null, earliestExpiringAmount: 0,
+        // ⚠️ PR !134 合并时补：该字段是「独立池」摘出量（PR !134 新增）。
+        //    本仓的 `toEqual` 是**全等**断言 ⇒ 少一个字段就会红。
+        exclusivePoolRemaining: 0,
+      })
+    })
+
+    it('★ 拆出的临期部分**不**参与倒计时（没有日期，绝不编造）', () => {
+      const split = splitCreditsByExpiry([
+        pkg({ remaining: 25000, deductionEndTime: undefined, expiringRemaining: 2000 }),
+        pkg({ remaining: 500, deductionEndTime: NOW + 7 * DAY }),
+      ], WINDOW_DAYS, NOW)
+      // 只有带真实日期的那个包能进 earliestExpiringAt。
+      expect(split?.earliestExpiringAt).toBe(NOW + 7 * DAY)
+      expect(split?.expiring).toBe(2500)
+      expect(split?.permanent).toBe(23000)
+    })
+
+    it('expiringRemaining 超过 remaining 时夹到 remaining', () => {
+      expect(splitCreditsByExpiry([
+        pkg({ remaining: 100, deductionEndTime: undefined, expiringRemaining: 999 }),
+      ], WINDOW_DAYS, NOW)).toEqual({
+        expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0,
+        exclusivePoolRemaining: 0,
+      })
+    })
+
+    it('有真实到期日期的包**不读** expiringRemaining（日期更权威）', () => {
+      expect(splitCreditsByExpiry([
+        pkg({ remaining: 100, deductionEndTime: NOW + 60 * DAY, expiringRemaining: 50 }),
+      ], WINDOW_DAYS, NOW)).toEqual({
+        expiring: 0, longTerm: 100, permanent: 0, earliestExpiringAt: null, earliestExpiringAmount: 0,
+        exclusivePoolRemaining: 0,
+      })
+    })
   })
 
   /**
@@ -148,10 +267,21 @@ describe('splitCreditsByExpiry（前端三档分桶）', () => {
     // ★ 数字必须只反映最早那批 —— 这才是「4 天 20 小时后会掉多少」
     expect(split?.earliestExpiringAmount, '★ 用总额会让「N 天后掉 X」读成全部同时到期')
       .toBe(19656)
-    // 渲染侧：临期文本取 earliestExpiringAmount
+    /**
+     * 渲染侧：**数字用总额（合计守恒），倒计时限定它只覆盖其中一批**。
+     *
+     * ⚠️ 这里曾断言 `text === '临期 19656'`（2026-10-20）。那个形态修了
+     *    「全部同时到期」的误读，却让三档**不再等于 `total`**
+     *    （22000 + 19656 ≠ 25500 那类算不平，用户 2026-10-21 报障）。
+     *    ⇒ 现形态：数字 20856（= 总额）+ 「其中 19656 于…后到期」。
+     */
     const parts = expirySplitParts(split, (v) => String(v), NOW)
     const expiringPart = parts.find((p) => p.key === 'expiring')
-    expect(expiringPart?.text).toBe('临期 19656')
+    expect(expiringPart?.text).toBe('临期 20856')
+    // 夹具里最早那批是 NOW + 5 DAY ⇒ 倒计时 5 天 0 小时（原文案里的
+    // 「4 天 20 小时」来自 autoclaw 真机数据，与本夹具的时刻无关）。
+    expect(expiringPart?.countdown, '倒计时必须限定它只覆盖最早那批')
+      .toBe('其中 19656 于 5 天 0 小时后到期')
   })
 
   it('★ 同一到期时刻的多个包 ⇒ earliestExpiringAmount 累加（同批）', () => {
@@ -290,6 +420,43 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
     ]],
     ['空列表', []],
     ['窗口放宽到 31 天', [pkg({ remaining: 100, deductionEndTime: NOW + 17 * DAY })], 31],
+    /**
+     * ★ `expiringRemaining` 场景（CodeArts 赠送包，2026-10-20）。
+     *
+     * 这是**最需要前后端对账**的一组：前端拆错的后果是数字对不上，
+     * 后端拆错的后果更严重 —— 锁定永久积分时该账号被判 `none` 不可用，
+     * 尽管它其实还有临期积分可用，直接报「积分已用尽」。
+     */
+    ['expiringRemaining 拆包（临期 + 永久）', [
+      pkg({ name: '赠送积分包', remaining: 25000, total: 25000, deductionEndTime: undefined, expiringRemaining: 2000 }),
+    ]],
+    ['expiringRemaining 与真实日期包共存', [
+      pkg({ name: '基础积分包', remaining: 500, deductionEndTime: NOW + 7 * DAY }),
+      pkg({ name: '赠送积分包', remaining: 25000, deductionEndTime: undefined, expiringRemaining: 2000 }),
+    ]],
+    ['expiringRemaining 超过 remain（夹取）', [
+      pkg({ remaining: 100, deductionEndTime: undefined, expiringRemaining: 999 }),
+    ]],
+    ['expiringRemaining 为 0（等同未标）', [
+      pkg({ remaining: 6000, deductionEndTime: undefined, expiringRemaining: 0 }),
+    ]],
+    /**
+     * ★ **独立池**（AStudio 星火池，2026-10-21 合并审计发现，阻断级）。
+     *
+     * PR !134 只在**客户端**把独立池从三档里摘出，后端选号侧不看 `pkg.name`
+     * ⇒ **两侧口径分叉** ⇒ 锁定永久积分时选号判据与面板数字相反。
+     *
+     * ⚠️ 这条 fixture 是**修复前后唯一会变红**的那条 —— 修好后两侧都把独立池
+     * 排除在两桶之外（`expiring` 0 / `permanent` 0）。
+     */
+     ['独立池不进任何一桶（前后端同判）', [
+      pkg({ name: '赠送积分', remaining: 1900, deductionEndTime: NOW + 11 * DAY }),
+      pkg({ name: '星火积分（独立池，不参与主池合计）', remaining: 25000, deductionEndTime: undefined }),
+    ]],
+    ['只有独立池（主池全空）', [
+      pkg({ name: '会员积分', remaining: 0, deductionEndTime: NOW + 200 * DAY }),
+      pkg({ name: '星火积分（独立池，不参与主池合计）', remaining: 25000, deductionEndTime: NOW + 3 * DAY }),
+    ]],
   ]
 
   for (const [label, packages, windowDays] of fixtures) {
@@ -314,7 +481,7 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
     // 40 秒后越过 15 天线
     const later = NOW + 40_000
     const after = splitCreditsByExpiry(packages, WINDOW_DAYS, later)
-    expect(after).toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 15 * DAY + 30_000, earliestExpiringAmount: 100 })
+    expect(after).toEqual({ expiring: 100, longTerm: 0, permanent: 0, earliestExpiringAt: NOW + 15 * DAY + 30_000, earliestExpiringAmount: 100, exclusivePoolRemaining: 0 })
     expect(reduceFrontendToBackend(after!)).toEqual(backendSplit(packages, WINDOW_DAYS, later))
   })
 
@@ -342,7 +509,7 @@ describe('与后端 splitBuddyCreditsByExpiry 对账', () => {
       pkg({ name: '签到奖励', remaining: 150, deductionEndTime: base + 30 * DAY }),
     ]
     expect(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base))
-      .toEqual({ expiring: 500, longTerm: 450, permanent: 0, earliestExpiringAt: base + 1 * DAY, earliestExpiringAmount: 500 })
+      .toEqual({ expiring: 500, longTerm: 450, permanent: 0, earliestExpiringAt: base + 1 * DAY, earliestExpiringAmount: 500, exclusivePoolRemaining: 0 })
     expect(formatExpirySplitLine(splitCreditsByExpiry(traePackages, WINDOW_DAYS, base), v => String(v)))
       .toBe('长期 450 · 临期 500')
     // 与后端同规则（TRAE 复用 buddy 的分桶判据，不存在第二套标准）——
@@ -473,6 +640,134 @@ describe('expirySplitParts（三档带色分段）', () => {
       .toEqual([{ key: 'expiring', text: '临期 50', tone: 'error' }])
     expect(expirySplitParts({ permanent: 0, longTerm: 0, expiring: 50, earliestExpiringAt: NOW_MS - DAY }, format, NOW_MS))
       .toEqual([{ key: 'expiring', text: '临期 50', tone: 'error' }])
+  })
+
+  /**
+   * ## ★★ 三档合计必须恒等于 `total`（2026-10-21 用户报障）
+   *
+   * 用户报障截图（CodeArts 账号卡片）原文：
+   * `积分 25500  永久 22000 · 临期 500（5 天 20 小时）`
+   * ⇒ `22000 + 500 = 22500 ≠ 25500`，**差的 3000 在任何地方都没出现**。
+   *
+   * 根因：本函数曾用 `earliestExpiringAmount`（只统计**带 `deductionEndTime`
+   * 的批次**）作为临期段数字，而 CodeArts 赠送包那 3000 只有
+   * `expiringRemaining` 标量、**没有日期** ⇒ 不进 Election ⇒ 不显示。
+   *
+   * ⚠️ 这个不变量**此前没有任何一条用例守卫** —— 分桶层有对账用例
+   * （`reduceFrontendToBackend`），但分桶正确就会被显示层改错，两层各自正确
+   * 不蕴含合起来正确。故这里直接在**渲染层**断言守恒。
+   */
+  describe('★★ 三档合计恒等于 total（可见数字不许凭空消失）', () => {
+    /** 从 `text`（形如 `永久 22000`）里取回数字。 */
+    const numberOf = (text: string) => Number(/(\d+)/.exec(text)?.[1] ?? 'NaN')
+
+    /** 真实数据：`CODEARTS_ACCOUNT_A3294816` 实测（2026-10-21）。 */
+    const codeArtsPackages = () => [
+      // 基础积分包：有确切到期时刻（套餐 10-27 结束）
+      pkg({ name: '基础积分包', remaining: 500, total: 500, deductionEndTime: NOW + 6 * DAY }),
+      // 赠送积分包：**无日期**，只有「其中 3000 即将到期」的标量
+      pkg({ name: '赠送积分包', remaining: 25000, total: 25000, deductionEndTime: undefined, expiringRemaining: 3000 }),
+    ]
+
+    it('★ 真实 CodeArts 数据：永久 + 临期 = total（3000 不许消失）', () => {
+      const split = splitCreditsByExpiry(codeArtsPackages(), WINDOW_DAYS, NOW)
+      expect(split).not.toBeNull()
+      // 分桶层本身是对的（这里先钉住前提）
+      expect(split!.expiring, '基础 500 + 赠送无日期 3000').toBe(3500)
+      expect(split!.permanent).toBe(22000)
+      expect(split!.expiring + split!.longTerm + split!.permanent, '分桶层守恒').toBe(25500)
+
+      const parts = expirySplitParts(split, format, NOW)
+      const visible = parts.reduce((acc, p) => acc + numberOf(p.text), 0)
+      // ★ 缺陷现场：修前这里是 22500（少了 3000）
+      expect(visible, '★ 卡片可见数字合计必须等于 total，否则用户一加就发现少了')
+        .toBe(25500)
+      expect(parts.find((p) => p.key === 'expiring')?.text).toBe('临期 3500')
+    })
+
+    it('★ 倒计时只覆盖其中一批时必须写明「其中 N」', () => {
+      const parts = expirySplitParts(
+        splitCreditsByExpiry(codeArtsPackages(), WINDOW_DAYS, NOW),
+        format,
+        NOW,
+      )
+      const expiring = parts.find((p) => p.key === 'expiring')
+      // 3500 里只有带日期的 500 能倒计时 ⇒ 必须限定，否则读成「3500 一起掉」
+      expect(expiring?.countdown).toBe('其中 500 于 6 天 0 小时后到期')
+    })
+
+    it('倒计时**正好覆盖全部临期**时不加「其中」（那两个字是废话）', () => {
+      const parts = expirySplitParts(
+        { permanent: 0, longTerm: 0, expiring: 500, earliestExpiringAt: NOW_MS + 3 * DAY, earliestExpiringAmount: 500 },
+        format,
+        NOW_MS,
+      )
+      expect(parts).toEqual([
+        { key: 'expiring', text: '临期 500', tone: 'error', countdown: '3 天 0 小时' },
+      ])
+    })
+
+    it('临期**全部无日期**（earliestExpiringAmount=0）时只给金额，不编造倒计时', () => {
+      const parts = expirySplitParts(
+        { permanent: 22000, longTerm: 0, expiring: 3000, earliestExpiringAt: null, earliestExpiringAmount: 0 },
+        format,
+        NOW_MS,
+      )
+      expect(parts).toEqual([
+        { key: 'permanent', text: '永久 22000', tone: 'ok' },
+        { key: 'expiring', text: '临期 3000', tone: 'error' },
+      ])
+    })
+
+    /**
+     * ⚠️ `format` 可能带千分位（CodeArts 用 `formatUnits` 就是这么渲染的）。
+     * 若拿**格式化后的字符串**做 `<` 比较，`"3,500"` 会隐式转成 `NaN`
+     * ⇒ `partial` 恒 false ⇒ 倒计时丢掉「其中 N」限定，静默退回误读形态。
+     */
+    it('format 带千分位时仍能正确判定「其中」（数值比较不许走字符串）', () => {
+      const parts = expirySplitParts(
+        { permanent: 22000, longTerm: 0, expiring: 3500, earliestExpiringAt: NOW_MS + 3 * DAY, earliestExpiringAmount: 500 },
+        (v) => v.toLocaleString('en-US'),
+        NOW_MS,
+      )
+      const expiring = parts.find((p) => p.key === 'expiring')
+      expect(expiring?.text, '数字仍带千分位').toBe('临期 3,500')
+      expect(expiring?.countdown, '★ 千分位不许把「其中」限定弄丢')
+        .toBe('其中 500 于 3 天 0 小时后到期')
+    })
+
+    /**
+     * ⚠️ **字符串版与分段版必须同口径**（都是窗口内总额）。
+     *
+     * 两者是同一个数的两种呈现：`formatExpirySplitLine` 出单行文本、
+     * `expirySplitParts` 出逐段带色。若只改其中一个，同一条数据在
+     * 「卡片单行」和「胶囊分段」两处会显示不同的临期数字 —— 用户对比
+     * 两个界面就会看到矛盾。
+     */
+    it('★ 字符串版与分段版的临期数字必须一致（同一数据的两种呈现）', () => {
+      const split = splitCreditsByExpiry(codeArtsPackages(), WINDOW_DAYS, NOW)!
+      expect(formatExpirySplitLine(split, format), '字符串版用窗口内总额').toBe('永久 22000 · 临期 3500')
+      expect(expirySplitParts(split, format, NOW).find((p) => p.key === 'expiring')?.text)
+        .toBe('临期 3500')
+    })
+
+    /**
+     * ⚠️ **倒计时时刻无效时绝不出「其中 …于 后到期」这种残句**。
+     *
+     * 正常分桶下 `earliestExpiringAmount > 0` 必然蕴含 `earliestExpiringAt`
+     * 有效，但本函数是对外公开的纯函数（`usage-badge` 等直接传对象）。
+     * 一旦调用方手搓 `split` 时两字段不同步，`countdown` 会是空串 ——
+     * 此时若仍走「其中」分支，文案就成了 `其中 500 于 后到期`。
+     */
+    it('★ earliestExpiringAt 无效但 earliestExpiringAmount>0 时不产生残句', () => {
+      const parts = expirySplitParts(
+        { permanent: 0, longTerm: 0, expiring: 3500, earliestExpiringAt: null, earliestExpiringAmount: 500 },
+        format,
+        NOW_MS,
+      )
+      // 无倒计时可给 ⇒ 只给金额，且**不许**留「其中 …于」的空壳
+      expect(parts).toEqual([{ key: 'expiring', text: '临期 3500', tone: 'error' }])
+    })
   })
 })
 
@@ -895,7 +1190,12 @@ describe('supportsCreditPackageList 的门控', () => {
   })
 
   it('其余 provider 与未知值一律为假（默认关闭）', () => {
-    for (const p of ['codearts', 'cline', 'raccoon', '', undefined]) {
+    // ⚠️ **codearts 已移出本名单**（2026-10-20 合并审计）：PR !123 让它的
+    //    `packages[]` 真正有内容（`expiringRemaining` 拆包 + 基础包
+    //    `deductionEndTime`），并登记了 `creditPackages: true` ——
+    //    `provider-registry.spec.ts` 的「usesExpiryWindow 必须有 creditPackages」
+    //    守卫强制两者一致。它**不**开 `permanentLock`，与本用例无关。
+    for (const p of ['cline', 'raccoon', '', undefined]) {
       expect(supportsCreditPackageList(p as never), String(p)).toBe(false)
     }
   })
@@ -934,3 +1234,130 @@ describe('包列表排序的覆盖面（源码级）', () => {
 })
 
 
+
+
+/**
+ * ⚠️⚠️ **独立池判据必须两侧同源**（2026-10-21 合并审计发现的**假绿**）。
+ *
+ * ## 背景
+ *
+ * PR !134 的 `isExclusivePool`（客户端）与宿主侧的池名（`src/astudio-credits.ts`）
+ * **不共享模块图**（AGENTS.md 明示）⇒ 两处各存一份判据。
+ *
+ * ⚠️ 而 PR !134 自带的守卫只断言**客户端自己写死的那个字符串**
+ * （`isExclusivePool({ name: '星火积分（独立池，不参与主池合计）' })` 为 true），
+ * **不碰宿主侧真正产出的池名** ⇒ **把宿主侧的池名改掉，判据立刻恒 false，
+ * 而全部单测仍然全绿**（合并审计实测：改池名 ⇒ 全量 vitest 仅剩那条与本次
+ * 无关的既有失败）。
+ *
+ * ## 本段做什么
+ *
+ * 用**宿主侧真实产出的池**（`buildAstudioBalance` 的输出）去喂**客户端的判据**
+ * ⇒ 两侧任一侧改了池名/判据，本段当场变红。
+ */
+describe('独立池判据必须两侧同源（宿主侧真实池名 → 客户端判据）', () => {
+  it('宿主侧产出的星火池必须命中客户端的 isExclusivePool', async () => {
+    // ⚠️ 用**真实报文**走 `buildAstudioBalance`，而不是手抄一个池名 ——
+    // 手抄的那份正是「锁客户端字面量」的假绿写法。
+    const { buildAstudioBalance } = await import('../../src/astudio-credits.js')
+    const { isExclusivePool } = await import('../../plugin-src/client/credit-expiry.js')
+    const balance = buildAstudioBalance({
+      totalBalance: 1900,
+      totalAmount: 1900,
+      memberTotal: 500, memberBalance: 500, memberNextExpireTime: '2026-11-20T01:50:14',
+      buyTotal: 700, buyBalance: 700, buyNextExpireTime: '2026-11-20T01:50:14',
+      activityTotal: 700, activityBalance: 700, activityNextExpireTime: '2026-11-01T00:00:00',
+      sparkTotalAmount: 500, sparkTotalBalance: 500, sparkNextExpireTime: '2026-11-01T00:00:00',
+    } as never)
+    expect(balance).not.toBeNull()
+    const spark = balance!.packages.find((p) => p.remaining === 500 && p.name.includes('星火'))
+    expect(spark, '宿主侧应产出星火池').toBeDefined()
+    // ⚠️ 这一行是本段的全部价值：宿主池名 → 客户端判据。
+    expect(
+      isExclusivePool(spark!),
+      `宿主侧池名「${spark!.name}」必须命中客户端的独立池判据（两侧不共享模块图，靠本条锁住）`,
+    ).toBe(true)
+    // 反向对照：主池**不得**被误判成独立池。
+    for (const p of balance!.packages) {
+      if (p.name.includes('星火')) continue
+      expect(isExclusivePool(p), `主池「${p.name}」不该被误判成独立池`).toBe(false)
+    }
+  })
+
+  it('宿主侧的 isExclusiveCreditPool 与客户端判据对同一批池名给出相同结论', async () => {
+    const { isExclusiveCreditPool } = await import('../../src/credits.js')
+    const { isExclusivePool } = await import('../../plugin-src/client/credit-expiry.js')
+    const names = [
+      '星火积分（独立池，不参与主池合计）',
+      '会员积分', '购买积分', '赠送积分', 'Bonus Pack', '',
+    ]
+    for (const name of names) {
+      expect(
+        isExclusiveCreditPool({ name }),
+        `两侧对「${name}」的判定必须一致（宿主侧 ${isExclusiveCreditPool({ name })} vs 客户端 ${isExclusivePool({ name })})`,
+      ).toBe(isExclusivePool({ name }))
+    }
+  })
+})
+
+
+/**
+ * ⚠️ `exclusivePoolRemainingOf`（2026-10-21 合并审计发现 B4 的修法）。
+ *
+ * ## 为什么需要它
+ *
+ * PR !134 让**三处**各写了一份「独立池剩余量」的汇总（前端 `split`、设置页
+ * `CreditBalanceRow`、徽标弹窗 `splitParts`），而三份的判据**很接近但不相同**：
+ * `split` 用 `active === true` 且跳过 `remaining <= 0`，两处渲染用
+ * `active !== false` 且**不过滤负余额**。
+ *
+ * ⇒ 合并审计实测：`packages: [{active:undefined, remaining:-5}, {active:true, remaining:100}]`
+ * ⇒ `split.exclusivePoolRemaining` = 100，而渲染层 = 95 ⇒ **同一屏上两个数**。
+ *
+ * ## 本段锁住的口径
+ *
+ * - `active === true`（**不是** `!== false`）：`undefined` 不算有效；
+ * - `remaining > 0`（负余额是 autoclaw 的冲正/退款，**不得**加进合计）；
+ * - 只累加独立池。
+ */
+describe('exclusivePoolRemainingOf（独立池剩余量的唯一判据）', () => {
+  const spark = (over: Partial<CreditPackage> = {}) => pkg({
+    name: '星火积分（独立池，不参与主池合计）',
+    remaining: 25000,
+    deductionEndTime: undefined,
+    ...over,
+  })
+
+  it('只累加独立池，且与 split.exclusivePoolRemaining 同值', () => {
+    const packages = [
+      pkg({ name: '赠送积分', remaining: 1900, deductionEndTime: NOW + 11 * DAY }),
+      spark(),
+    ]
+    expect(exclusivePoolRemainingOf(packages)).toBe(25000)
+    // ⚠️ 与前端三档的那一份**逐分相同**（同一份判据的必然结果）。
+    expect(splitCreditsByExpiry(packages, WINDOW_DAYS, NOW)?.exclusivePoolRemaining).toBe(25000)
+  })
+
+  it('active 未定义（undefined）不算有效 —— 与 split 的循环逐格同判', () => {
+    // ⚠️ `active !== false` 会把 `undefined` 当有效（错），`active === true` 不会。
+    const packages = [spark({ active: undefined as never, remaining: 100 })]
+    expect(exclusivePoolRemainingOf(packages)).toBe(0)
+    expect(splitCreditsByExpiry(packages, WINDOW_DAYS, NOW)?.exclusivePoolRemaining).toBe(0)
+  })
+
+  it('负余额（冲正/退款）不加进合计', () => {
+    const packages = [spark({ remaining: -5 }), spark({ remaining: 100 })]
+    expect(exclusivePoolRemainingOf(packages)).toBe(100)
+    expect(splitCreditsByExpiry(packages, WINDOW_DAYS, NOW)?.exclusivePoolRemaining).toBe(100)
+  })
+
+  it('非数组 / 空数组 ⇒ 0（不抛错）', () => {
+    expect(exclusivePoolRemainingOf(undefined)).toBe(0)
+    expect(exclusivePoolRemainingOf(null)).toBe(0)
+    expect(exclusivePoolRemainingOf([])).toBe(0)
+  })
+
+  it('主池不计入', () => {
+    expect(exclusivePoolRemainingOf([pkg({ name: '赠送积分', remaining: 1900 })])).toBe(0)
+  })
+})

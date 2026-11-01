@@ -4,6 +4,7 @@
  * project 仍按账号/匿名条目与代次派生 40hex，不改变账号池的指纹隔离语义。
  */
 
+import { maskProxyPassword } from './proxy-mask.js'
 import { createHash, randomBytes } from 'node:crypto'
 import { OPENCODE } from './opencode-product.js'
 
@@ -17,7 +18,7 @@ export interface OpencodeFingerprint {
 
 /** 账号凭据（存 `ctx.credentials`，不进 settings 明文）。 */
 export interface OpencodeCredential {
-  /** Zen API key（`sk-…`），身份本体；匿名槽用字面量 `public`。 */
+  /** Zen API key（旧 `sk-…`／2026-10-22 起 `oc_sk_…`），身份本体；匿名槽用字面量 `public`。 */
   api_key: string
   nickname?: string
   /** 首次添加时生成；旧账号缺失时由 `newAccountFingerprint` 补。 */
@@ -127,10 +128,15 @@ export interface NormalizedProxy {
   label: string
 }
 
-/** 脱敏 URL 中的密码（面板与日志都只回显这个）。 */
-function maskLabel(url: string): string {
-  return url.replace(/^(\w+:\/\/[^:@/]+):[^@/]*@/, '$1:***@')
-}
+/**
+ * 脱敏 URL 中的密码（面板与日志都只回显这个）。
+ *
+ * ⚠️ **实现已搬到 `src/proxy-mask.ts`**（2026-10-25 审计 A2-02）：
+ * `account-pool.ts` 写日志时也要脱敏，而池**不能** import 本文件
+ * （provider 实现在依赖图的上层）。放中立文件让两侧共用**同一份**判据 ——
+ * 各写一份正是本仓库「同一语义两套判据」的红线。
+ */
+const maskLabel = maskProxyPassword
 
 /**
  * 从**原始输入**里取权威段（scheme 之后、path 之前）。

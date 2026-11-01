@@ -184,7 +184,7 @@ describe('BuddyAuth silent refresh', () => {
     expect(url).toContain('/v2/plugin/auth/token/refresh')
     const headers = init.headers as Record<string, string>
     expect(headers['X-Refresh-Token']).toBe('RT')
-    expect(headers['X-Auth-Refresh-Source']).toBe('ide-main')
+    expect(headers['X-Auth-Refresh-Source']).toBe('plugin')
     expect(headers.Authorization).toBe('Bearer AT')
   })
 
@@ -479,6 +479,55 @@ describe('产品参数化', () => {
     expect(updated).toEqual([])
   })
 
+  /**
+   * ★★ **续期成功但凭据落盘失败 ⇒ 必须按「凭据已死」处置**（接线守卫）。
+   *
+   * ## 为什么这条必须打在**本 provider** 上
+   *
+   * 共享实现 `refreshAccountWithReconcile` 在 `save()` 失败时抛的是**调用方
+   * 注入的**终态类；而本类的 `refreshAll` 判的是 `buddy-oauth.ts` 的
+   * `RefreshTokenExpiredError`。PR159 首版让共享模块直接 import **codearts**
+   * 的同名类 ⇒ 这里的 `instanceof` **恒为 false** ⇒ 落进非终态分支
+   * ⇒ 账号静默死（正是本修复要治的病）。共享模块自己的单测**抓不到**这处，
+   * 因为那里注入的是替身 —— 只有在本 provider 上真跑一遍才能证明接线。
+   *
+   * ## 判据
+   *
+   * `updateAccount` 必须收到 `refreshable: false`。
+   * ⚠️ 只断言「调过 updateAccount」**不够**：非终态分支同样会（以别的字段）
+   * 写池 —— 那正是缺陷形态本身。
+   */
+  it('★★ 续期成功但凭据落盘失败 → 按终态标记该账号不可续期', async () => {
+    const ctx = createMockContext()
+    // 快到期 ⇒ 真的走续期路径（否则只做有效期对账，不落盘）
+    await ctx.credentials.set(
+      credentialRef('BUDDY_ACCOUNT_S1'),
+      JSON.stringify(makeCredential({ expires_at: String(Date.now() + 60_000) })),
+    )
+    // ⚠️ **只让落盘失败**：`resolve` 仍正常（续期请求要能读到凭据），
+    //    且 `refreshCredential` 不写库 ⇒ 这个替身精确命中 `save` 这一步。
+    const setSpy = vi.spyOn(ctx.credentials, 'set').mockRejectedValue(new Error('EACCES: permission denied'))
+    const patches: Array<{ id: string; patch: Record<string, unknown> }> = []
+    const pool = {
+      listAccounts: async (provider: string) => [
+        { id: 's1', provider, enabled: true, refreshable: true, credentialRef: 'BUDDY_ACCOUNT_S1' },
+      ],
+      updateAccount: async (id: string, patch: Record<string, unknown>) => { patches.push({ id, patch }) },
+    }
+    const auth = new BuddyAuth(ctx as never, { product: CODEBUDDY, fetcher: refreshFetcher() })
+    services.push(auth)
+
+    await auth.refreshAll(pool as never)
+    setSpy.mockRestore()
+
+    const terminal = patches.find((entry) => entry.patch.refreshable === false)
+    expect(
+      terminal,
+      '落盘失败未被当成终态 ⇒ 账号会一直显示「自动续期」而实际已死',
+    ).toBeDefined()
+    expect(terminal!.id).toBe('s1')
+  })
+
   it('WorkBuddy 的 refresh 只续期自己的凭据', async () => {
     const ctx = createMockContext()
     // 只有 CodeBuddy 的凭据 → WorkBuddy 必须报「未配置」，且不得发出刷新请求。
@@ -566,7 +615,7 @@ describe('产品参数化', () => {
     }
   })
 
-  it('默认 CodeBuddy 实例的 fetchModels 仍带 codebuddy 产品码', async () => {
+  it('默认国内实例的 fetchModels 使用 WorkBuddy 产品码', async () => {
     const ctx = createMockContext()
     await ctx.credentials.set(credentialRef('BUDDY_ACCESS_TOKEN'), JSON.stringify(makeCredential()))
     const fetcher = vi.fn(async () => new Response(JSON.stringify({
@@ -577,6 +626,6 @@ describe('产品参数化', () => {
     expect((await auth.fetchModels()).map((m) => m.id)).toEqual(['glm-5.3'])
 
     const init = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0][1]
-    expect((init.headers as Record<string, string>)['X-Product-Code']).toBe('codebuddy')
+    expect((init.headers as Record<string, string>)['X-Product-Code']).toBe('workbuddy')
   })
 })

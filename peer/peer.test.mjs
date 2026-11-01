@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { runInNewContext } from 'node:vm';
 import { randomBytes } from 'node:crypto';
 import WebSocket, { WebSocketServer } from 'ws';
 import { newPair, pairCode, connectionLink, parsePair, makeCipher, relayProof, relayUrl } from './protocol.mjs';
@@ -39,6 +40,55 @@ test('pairing roundtrip, encrypted direction/session binding, tamper and replay 
   assert.throws(() => makeCipher(p, 'computer', 'previous').open(raw));
   const corrupt = JSON.parse(writer.seal({ action: 'edit' })); corrupt.tag = Buffer.alloc(16).toString('base64');
   assert.throws(() => reader.open(JSON.stringify(corrupt)));
+});
+
+test('an offline computer page waits locally and returns to the saved document when the same peer reconnects', async t => {
+  const f = await proxyFixture(t);
+  let mutations = 0;
+  f.ui.on('request', (req,res) => { if (req.method !== 'GET') mutations++; res.writeHead(200, {'content-type':'text/html'}).end('<html><head></head><body><textarea>ready</textarea></body></html>'); });
+  f.computer.retire('FIXTURE_OFFLINE', false);
+  await waitFor(() => !f.phone.online);
+  const base = `http://127.0.0.1:${f.uiProxyPort}`;
+  const offline = await fetch(base+'/');
+  assert.equal(offline.status, 503);
+  const html = await offline.text();
+  const script = /<script id="dsh-peer-recovery">([\s\S]*?)<\/script>/.exec(html)?.[1];
+  assert.ok(script, 'offline root must run foreground reconnection recovery');
+  const calls=[], replacements=[], timers=[];
+  const events = new Map();
+  let now=100000;
+  const storage=new Map();
+  const context={location:{hash:'#saved-session',replace:url=>replacements.push(url)},document:{hidden:false,addEventListener:(name,fn)=>events.set(name,fn)},window:{addEventListener:(name,fn)=>events.set(name,fn)},sessionStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)},Date:{now:()=>now},setTimeout:fn=>{timers.push(fn);return timers.length},clearTimeout:()=>{},fetch:async(url,options)=>{calls.push({url,options});return fetch(base+url,options)}};
+  runInNewContext(script,context);
+  await waitFor(()=>timers.length>0);
+  assert.equal(replacements.length,0);
+  assert.ok(calls.every(c=>c.url==='/__dsh_peer_status'&&(!c.options.method||c.options.method==='GET')));
+  f.computer.start();await waitFor(()=>f.phone.online&&f.computer.online);
+  now+=1500;timers.shift()();
+  await waitFor(()=>replacements.length>0);
+  assert.deepEqual(replacements,['/#saved-session']);
+  const restored=await fetch(base+replacements[0]);
+  assert.equal(restored.status,200);
+  const body=await restored.text();assert.match(body,/<textarea>ready<\/textarea>/);
+  assert.match(body,/dsh-peer-bootstrap-recovery/);
+  assert.equal(mutations,0);
+});
+
+test('a disconnect while the root document is loading returns a recovery page instead of an empty response', async t => {
+  const f = await proxyFixture(t);let arrived;
+  const waiting=new Promise(resolve=>{arrived=resolve});
+  f.ui.on('request',()=>arrived());
+  const response=fetch(`http://127.0.0.1:${f.uiProxyPort}/`);
+  await waiting;f.computer.retire('FIXTURE_OFFLINE',false);
+  const result=await response;assert.equal(result.status,503);assert.match(await result.text(),/dsh-peer-recovery/);
+});
+
+test('foreground recovery status rejects cross-origin callers and never retries a failed POST', async t => {
+  const f=await proxyFixture(t);f.computer.retire('FIXTURE_OFFLINE',false);await waitFor(()=>!f.phone.online);
+  const base=`http://127.0.0.1:${f.uiProxyPort}`;
+  assert.equal((await fetch(base+'/__dsh_peer_status',{headers:{origin:'https://unrelated.invalid'}})).status,403);
+  const post=await fetch(base+'/',{method:'POST',body:'do-not-replay'});assert.equal(post.status,503);
+  assert.doesNotMatch(await post.text(),/dsh-peer-recovery|location\.replace/);
 });
 
 test('WAN asset downloads compress, preserve bytes and use a bounded concurrent acknowledgement window', async t => {
@@ -148,16 +198,22 @@ test('combined plugin URLs use compression; streamed API responses remain increm
   assert.equal(await api.text(), 'data: fixture\n\n');
 });
 
-test('real relay, fresh handshake, RPC, wrong proof and duplicate device', async t => {
+test('real relay authenticates proof and same-role takeover cannot be cleared by a stale close', async t => {
   const { relay, pair, phone, computer } = await peers(t);
   computer.handler = (action, value) => ({ action, value });
   assert.deepEqual(await phone.call('fixture', { n: 3 }), { action: 'fixture', value: { n: 3 } });
-  for (const proof of ['0'.repeat(64), relayProof(pair)]) {
-    const denied = new WebSocket(pair.relay); await once(denied, 'open');
-    denied.send(JSON.stringify({ type: 'join', role: 'phone', room: pair.room, proof }));
-    assert.equal((await once(denied, 'close'))[0], 1008);
-  }
-  assert.equal(relay.rooms.size, 1); assert.equal(phone.online, true);
+  const denied = new WebSocket(pair.relay); await once(denied, 'open');
+  denied.send(JSON.stringify({ type: 'join', role: 'phone', room: pair.room, proof: '0'.repeat(64) }));
+  assert.equal((await once(denied, 'close'))[0], 1008);
+  const stale = relay.rooms.get(pair.room).phone, oldClosed = once(phone.socket, 'close');
+  // Model the old process exiting on takeover, without leaving its retry running.
+  phone.socket.once('close', () => phone.stop());
+  const replacement = new PeerTunnel(pair, 'phone', { reconnectMs: 20 }); t.after(() => replacement.stop());
+  replacement.start(); await oldClosed;
+  await waitFor(() => replacement.online && computer.online);
+  assert.equal(relay.rooms.size, 1); assert.notEqual(relay.rooms.get(pair.room).phone, stale);
+  assert.ok(relay.rooms.get(pair.room).phone);
+  assert.deepEqual(await replacement.call('fixture', { n: 4 }), { action: 'fixture', value: { n: 4 } });
 });
 
 test('disconnect rejects pending mutation and reconnect never repeats it; stale ciphertext cannot execute', async t => {
@@ -186,6 +242,29 @@ async function proxyFixture(t, { computerHeaders, computerReusableScripts = [], 
   t.after(async () => { phoneProxy.close(); computerProxy.close(); await Promise.all([ui, gateway, phoneProxy.ui, computerProxy.gateway].map(closeServer)); });
   return { ...f, ui, gateway, uiProxyPort, remoteGatewayPort, webPort, phoneProxy, computerProxy, denyGateway() { allowed = false; } };
 }
+
+test('an upstream closed during upload releases the peer handler instead of leaking its concurrency slot', async t => {
+  const f = await proxyFixture(t);
+  let disconnected;
+  const closed = new Promise(resolve => { disconnected = resolve; });
+  f.ui.on('request', req => { req.socket.once('close', disconnected); req.socket.destroy(); });
+  const id = 'closed-upload';
+  await f.phone.call('http.begin', { id, service: 'ui', url: '/closed', method: 'POST', headers: {} });
+  await f.phone.call('http.upload', { id, data: Buffer.from('first').toString('base64') });
+  await closed;
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await assert.rejects(f.phone.call('http.upload', { id, data: Buffer.from('second').toString('base64') }, 500));
+  assert.equal(f.computer.activeCalls, 0, 'a destroyed request must settle the upload handler');
+});
+
+test('cancelling a request before upstream headers releases the encrypted peer call', async t => {
+  const f=await proxyFixture(t);let arrived=false;f.ui.on('request',()=>{arrived=true});
+  const abort=new AbortController(),response=fetch(`http://127.0.0.1:${f.uiProxyPort}/waiting`,{signal:abort.signal});
+  await waitFor(()=>arrived&&f.computer.activeCalls>0);abort.abort();await assert.rejects(response);
+  await waitFor(()=>f.computer.activeCalls===0&&f.phone.pending.size===0);
+  f.ui.removeAllListeners('request');f.ui.on('request',(_req,res)=>res.end('still available'));
+  assert.equal(await(await fetch(`http://127.0.0.1:${f.uiProxyPort}/after`)).text(),'still available');
+});
 
 test('ordinary file uploads above the old 16 MB proxy cap preserve all bytes through the encrypted relay', async t => {
   const f = await proxyFixture(t), bytes = Buffer.alloc(20*1024*1024, 65); let received;
@@ -267,6 +346,61 @@ test('WebSocket retains immediate DSH snapshot, streams updates and denies clien
   await once(ws, 'open'); await waitFor(() => messages.length === 2);
   assert.deepEqual(messages, ['initial snapshot', 'task progress']); ws.send('unauthorized upstream');
   assert.equal((await once(ws, 'close'))[0], 1008);
+});
+
+test('large history crosses encrypted peer frames as one ordered text message and supports large uplink', {timeout:10000}, async t => {
+  const f=await proxyFixture(t),events=new WebSocketServer({server:f.ui});t.after(()=>events.close());
+  // The real failing history was 824982 bytes: legal for the UI socket,
+  // too large after two layers of base64 for the 1 MiB encrypted relay.
+  const history=JSON.stringify({type:'item',value:'历史😀'.repeat(85000)});
+  const upload=Buffer.alloc(900000,37),received=[];
+  const frames=[];const send=f.computer.socket.send.bind(f.computer.socket);
+  f.computer.socket.send=function(data,...args){frames.push(Buffer.byteLength(data));return send(data,...args)};
+  events.on('connection',ws=>{ws.send(history);ws.send('after history');ws.on('message',(value,binary)=>{received.push({value,binary});ws.send(value,{binary})})});
+  const ws=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`),messages=[];
+  t.after(()=>ws.terminate());ws.on('message',(value,binary)=>messages.push({value,binary}));
+  await once(ws,'open');await waitFor(()=>messages.length===2);
+  assert.equal(messages[0].value.toString(),history);assert.equal(messages[0].binary,false);
+  assert.equal(messages[1].value.toString(),'after history');
+  ws.send(upload,{binary:true});await waitFor(()=>received.length===1&&messages.length===3);
+  assert.equal(received[0].binary,true);assert.deepEqual(received[0].value,upload);
+  assert.equal(messages[2].binary,true);assert.deepEqual(messages[2].value,upload);
+  assert.ok(frames.length>20);assert.ok(frames.every(size=>size<=1024*1024));
+  assert.equal(f.phone.online,true);assert.equal(f.computer.online,true);assert.equal(ws.readyState,WebSocket.OPEN);
+});
+
+test('bad or oversized socket fragments close only that socket and never deliver a partial message', async t => {
+  const f=await proxyFixture(t),events=new WebSocketServer({server:f.ui});t.after(()=>events.close());
+  events.on('connection',ws=>ws.send('ready'));
+  let id;const action=f.computer.handler;f.computer.handler=(name,value)=>{if(name==='ws.open')id=value.id;return action(name,value)};
+  for(const overflow of [false,true]){
+    const ws=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`),messages=[];t.after(()=>ws.terminate());ws.on('message',x=>messages.push(x.toString()));
+    await waitFor(()=>messages.length===1);const closed=once(ws,'close');
+    const chunk=Buffer.alloc(65536).toString('base64');
+    f.computer.send({type:'ws.data.chunk',id,index:0,final:false,binary:false,data:chunk});
+    if(overflow){for(let index=1;index<16;index++)f.computer.send({type:'ws.data.chunk',id,index,final:false,binary:false,data:chunk})}
+    f.computer.send({type:'ws.data.chunk',id,index:overflow?16:2,final:true,binary:false,data:'YQ=='});
+    await closed;assert.deepEqual(messages,['ready']);assert.equal(f.phone.online,true);assert.equal(f.computer.online,true);
+  }
+});
+
+test('a partial socket message is discarded on disconnect and a fresh socket starts cleanly', async t => {
+  const f=await proxyFixture(t),events=new WebSocketServer({server:f.ui});t.after(()=>events.close());events.on('connection',ws=>ws.send('ready'));
+  let id;const action=f.computer.handler;f.computer.handler=(name,value)=>{if(name==='ws.open')id=value.id;return action(name,value)};
+  const ws=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`),messages=[];ws.on('message',x=>messages.push(x.toString()));t.after(()=>ws.terminate());await waitFor(()=>messages.length===1);
+  let receivedPartial=false;const partial=m=>{if(m.type==='ws.data.chunk'&&m.id===id)receivedPartial=true};f.phone.on('packet',partial);t.after(()=>f.phone.off('packet',partial));
+  f.computer.send({type:'ws.data.chunk',id,index:0,final:false,binary:false,data:'cGFydGlhbA=='});
+  await waitFor(()=>receivedPartial);
+  const closed=once(ws,'close');f.computer.reconnect();await closed;assert.deepEqual(messages,['ready']);
+  await waitFor(()=>f.computer.online&&f.phone.online);
+  const fresh=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`),restored=[];t.after(()=>fresh.terminate());fresh.on('message',x=>restored.push(x.toString()));await waitFor(()=>restored.length===1);assert.deepEqual(restored,['ready']);
+});
+
+test('an older peer without chunk negotiation keeps small messages on the original wire format', async t => {
+  const f=await proxyFixture(t),events=new WebSocketServer({server:f.ui});t.after(()=>events.close());events.on('connection',ws=>{ws.send('legacy snapshot');ws.on('message',value=>ws.send(value.toString()))});
+  const action=f.computer.handler;f.computer.handler=async(name,value)=>{if(name==='ws.open'){const result=await action(name,{...value,chunks:false});assert.equal(result.chunks,false);return{}}return action(name,value)};
+  const wire=[];f.phone.on('packet',m=>wire.push(m.type));
+  const ws=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`),messages=[];t.after(()=>ws.terminate());ws.on('message',x=>messages.push(x.toString()));await waitFor(()=>messages.length===1);ws.send('legacy uplink');await waitFor(()=>messages.length===2);assert.deepEqual(messages,['legacy snapshot','legacy uplink']);assert.ok(!wire.some(type=>type.endsWith('.chunk')));
 });
 
 test('proxy rejects cross-origin access, arbitrary targets, forbidden ws, revoked gateway and cancels stream', async t => {

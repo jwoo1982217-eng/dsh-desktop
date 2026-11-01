@@ -55,7 +55,11 @@ declare module '@deepseek-ai/dsh-llm' {
  * @returns 可按 `ContentBlock` 使用的包裹块。
  */
 export declare function gatewayToolResultBlock(toolCallId: string, content: readonly ContentBlock[]): ContentBlock;
+/** 工具结果由当前宿主工厂构造，兼容旧包裹块和新 role:tool。 */
+export declare function createGatewayToolMessage(toolCallId: string, content: Message['content'], isError?: boolean): Message;
 export interface OpenAiChatMessage {
+    reasoning_content?: unknown;
+    reasoning?: unknown;
     role?: unknown;
     content?: unknown;
     tool_calls?: unknown;

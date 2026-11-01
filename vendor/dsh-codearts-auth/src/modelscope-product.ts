@@ -188,7 +188,19 @@ export const MODELSCOPE_FALLBACK_MODELS: readonly ModelscopeFallbackModel[] = [
   // ── DeepSeek 系（仓库实测 1_048_576：officeace-product.ts 的 deepseek-v4.1-flash
   //    与 loomy-product.ts 的 deepseek-v4-flash-0731 均为该值）──
   {
-    id: 'deepseek-ai/DeepSeek-V4.1-Flash',
+    // ⚠️⚠️ **必须写当前在服务的日期快照 id**（Issue #12）：本表在**远端拉取失败**
+    // 时会被直接当成「可调用的模型清单」暴露给用户（见 `loadCatalogEntries` 的
+    // catch 分支与 `syncCatalogEntries`），所以表里的 id **必须真的能调**。
+    //
+    // 实测（报障者 yukinomon 取证，本仓库无外网无法独立复核）：
+    //   - `deepseek-ai/DeepSeek-V4.1-Flash-1017` ⇒ HTTP 200，收图正常；
+    //   - `deepseek-ai/DeepSeek-V4.1-Flash`（无后缀）⇒ **HTTP 400**
+    //     `Model id : … , has no provider supported` ⇒ 已下线。
+    //
+    // 而魔搭**只下发 4 个字段**（无 `modalities`/`context_window`）⇒ 远端命中时
+    // 能力判据仍回落到本表，靠 `findModelscopeFallback()` 的 `-` 边界前缀匹配
+    // 把 `-1017` 及其后续快照归到本条目（最长前缀优先）。
+    id: 'deepseek-ai/DeepSeek-V4.1-Flash-1017',
     name: 'DeepSeek-V4.1-Flash (魔搭)',
     contextWindow: 1_048_576,
     // ⚠️ 视觉能力有实测出处（旧 fork remote-upstream.ts:87-91：
@@ -285,6 +297,81 @@ export function isKnownModelscopeModel(id: string): boolean {
   return MODELSCOPE_FALLBACK_MODELS.some((m) => m.id === id)
 }
 
+/**
+ * 剥掉 id 末尾的**日期快照后缀**（`-1017` / `-0731` / `-20251017` 等）。
+ *
+ * 判据：末尾一段是 **4 位或 8 位纯数字**时视为快照版本，剥掉它。
+ *
+ * ⚠️ 为什么是 4/8 位而不是「任意数字」：
+ * - 魔搭实测的日期快照是 `-1017`（MMDD）与 `-20251017`（YYYYMMDD）两种；
+ * - 若放宽到「任意位数字」，会把 `Qwen2.5-72B` 这类**参数规模**当成快照
+ *   （`72`）而错误剥掉 ⇒ 完全不同族的模型被并到一起。
+ * - `-V4.1` / `-235B` / `-32B` 这类含字母或点号的段**不动**。
+ *
+ * ⚠️ 只剥**一层**：`X-1017` → `X`，不递归（`X-1017-1101` 这种形态不存在，
+ * 若真出现说明上游改了命名法，那时应当显式处理而不是靠递归猜）。
+ */
+function stripDateSnapshotSuffix(id: string): string {
+  return id.replace(/-(?:\d{4}|\d{8})$/, '')
+}
+
+/**
+ * 在兜底表里查一个 id，**支持日期快照后缀**（Issue #12）。
+ *
+ * ## 为什么需要它
+ *
+ * 魔搭的推理目录 `/v1/models` **只下发 4 个字段**（`id` / `object` / `owned_by` /
+ * `created`）—— **没有 `modalities`、没有 `context_window`**。所以能力判据
+ * **必然**回落到本兜底表。而魔搭会**定期换快照 id**：
+ *
+ * - 兜底表登记的是某个快照（如 `deepseek-ai/DeepSeek-V4.1-Flash-1017`）；
+ * - 上游下个月可能换成 `…-1101`，或直接退回无后缀的 `…-Flash`；
+ * - 精确查找在任一条缝里都**恒不命中** ⇒ 那个模型被判成纯文本
+ *   （`supportsImage: false`）且 `contextWindow: 0`，而真机实测它能收图
+ *   （32×32 纯红 PNG 答 `Red`）。
+ *
+ * ## 匹配规则（按优先级，四条）
+ *
+ * 1. **精确命中**：兜底表里真有这个 id ⇒ 直接用它；
+ * 2. **剥快照后精确命中**：`id` 剥掉末尾日期段 == 某条目 `id` 剥掉日期段
+ *    ⇒ 同族，用它。⚠️ 这一条是**双向**的（`X-1017` ↔ `X` 互相能认），
+ *    所以兜底表登记的是快照还是无后缀**都不影响**；
+ * 3. **`-` 边界前缀**：`id` 以 `m.id + '-'` 开头（旧快照被新快照包含的形态，
+ *    例如表里是 `X`、远端给了 `X-1017`）—— 只认 `-` 边界，避免 `Foo` 误吞
+ *    `Foobar`（那不是快照，是另一个模型）；
+ * 4. **最长优先**：多个条目都命中时取 `m.id` 最长的，避免短 id 把更具体的
+ *    条目盖掉。
+ *
+ * ⚠️ **只用于「兜底」，绝不覆盖远端明确声明**：调用方必须先看远端
+ * `modalities` / `context_window`，只有它们缺失时才走这里。远端说「纯文本」
+ * 就是纯文本 —— 本函数不能反向推翻它（否则就是「声明支持但实际不支持」的
+ * 反方向错误，同样违反本仓库的硬约定）。
+ *
+ * @param id 归一化后的模型 id（`normalizeModelscopeModelId` 的结果）
+ * @returns 命中的兜底条目；没命中返回 `undefined`
+ */
+export function findModelscopeFallback(
+  id: string,
+): ModelscopeFallbackModel | undefined {
+  const exact = MODELSCOPE_FALLBACK_MODELS.find((m) => m.id === id)
+  if (exact !== undefined) return exact
+  const bare = stripDateSnapshotSuffix(id)
+  let best: ModelscopeFallbackModel | undefined
+  const consider = (candidate: ModelscopeFallbackModel): void => {
+    if (best === undefined || candidate.id.length > best.id.length) best = candidate
+  }
+  for (const candidate of MODELSCOPE_FALLBACK_MODELS) {
+    // ② 剥快照后同族（双向）
+    if (stripDateSnapshotSuffix(candidate.id) === bare) {
+      consider(candidate)
+      continue
+    }
+    // ③ `-` 边界前缀（旧快照被新快照包含）
+    if (id.startsWith(`${candidate.id}-`)) consider(candidate)
+  }
+  return best
+}
+
 export type ModelscopeErrorKind =
   | 'rate_limit'
   | 'quota'
@@ -326,13 +413,15 @@ function readableDetail(body: string): string {
 /**
  * 把一次失败的 HTTP 响应归类为语义化错误。
  *
- * ## ⚠️ 顺序即优先级（三条都来自本项目真实缺陷）
+ * ## ⚠️ 顺序即优先级（每条都来自本项目真实缺陷）
  *
- * 1. **限流/额度必须排在 auth 之前**：魔搭与同源的 chatanywhere 在额度耗尽时
- *    可能回 401/403 而不是 429（旧 fork `src/proxy/upstream.ts` 的
- *    `NON_RETRYABLE_CODES` 与 key-pool 的 `isQuotaLikeError` 就是为这个形态写的）。
- *    若先判状态码，用户看到的会是「API key 失效」——而他的唯一有效动作
- *    （等窗口恢复 / 换一个 key）被完全掩盖。
+ * 1. **⚠️ 401/403 先判，恒归 `auth`**（2026-10-31 对抗审计同批修，与 qiniu
+ *    `classifyQiniuError` 同步）：状态码与额度文案并存时**以状态码为准** ——
+ *    认证类是**账号态**、不是模型冷却，落 quota 会被 `markLimited` 写成
+ *    UTC+8 次日零点冷却，把认证故障放大成封池（loomy 2026-10-06「全池被封」
+ *    事故同型；不变式见 `docs/agent-notes/providers-loomy-raccoon-minimax.md`）。
+ *    原「额度耗尽可能回 401/403 故额度先判」的方向反了：宁可漏判额度
+ *    （不换号）不可误判成封号。
  * 2. **400 单独归 `invalid_request`**：魔搭对请求体形状极严格（见模块头的
  *    工具包装事故），把它归成 server/可重试会让 harness 白重试 5 次、
  *    每次都拿到同一个 400。
@@ -390,6 +479,8 @@ export function classifyModelscopeError(
     // ⚠️ `retryAfterMs` **刻意不给**：超限不是配额问题，重试无意义、也无处可退。
     return { kind: 'context_window', detail }
   }
+  // ⚠️ 认证先于额度/限流（不变式 1）：401/403 带额度文案 ⇒ 恒归 auth。
+  if (status === 401 || status === 403) return { kind: 'auth', detail }
   if (
     status === 429
     || lower.includes('too many requests')
@@ -420,7 +511,6 @@ export function classifyModelscopeError(
     return { kind: 'transport', detail }
   }
   if (status === 400 || status === 422) return { kind: 'invalid_request', detail }
-  if (status === 401 || status === 403) return { kind: 'auth', detail }
   if (status >= 500) return { kind: 'server', detail }
   return { kind: 'server', detail }
 }

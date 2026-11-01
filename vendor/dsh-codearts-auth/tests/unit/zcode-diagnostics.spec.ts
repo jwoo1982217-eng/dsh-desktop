@@ -24,7 +24,7 @@ import {
   noteZcodeRequestSent,
   resetZcodeDiagnostics,
 } from '../../src/zcode-diagnostics.js'
-import { buildZcodeSystemBlocks, withContextPrefix } from '../../src/zcode-identity.js'
+import { buildZcodeSystemBlocks, withCallerSystem, withContextPrefix } from '../../src/zcode-identity.js'
 import { describeUpstreamError, httpErrorCodeForZcode } from '../../src/zcode-adapter.js'
 
 /** 源码接线断言用（与 `zcode-captcha-upfront.spec.ts` 同一套定位法）。 */
@@ -37,12 +37,16 @@ function stripComments(source: string): string {
 
 /** 走真实构造路径拿一份请求体形态（与 `stream()` 里用的是同一批函数）。 */
 function realShape(): ReturnType<typeof describeZcodeRequestShape> {
-  const system = buildZcodeSystemBlocks('You are DSH, a coding agent.', {
+  const system = buildZcodeSystemBlocks({
     cwd: process.cwd(),
     provider: 'zcode',
     model: 'GLM-5.3-Flash',
   })
-  const messages = withContextPrefix([{ role: 'user', content: '你好' }])
+  // ⚠ 调用方 system 注入 messages（不进 system 数组）—— 2026-10-25 实测修复。
+  const messages = withCallerSystem(
+    withContextPrefix([{ role: 'user', content: '你好' }]),
+    'You are DSH, a coding agent.',
+  )
   return describeZcodeRequestShape(system, messages)
 }
 
@@ -54,9 +58,10 @@ describe('ZCode 3012 可观测诊断（issue IKJI0Y）', () => {
   describe('请求形态实测', () => {
     it('★ 身份块字符数读的是**实际构造出来的 system**，不是常量', () => {
       const shape = realShape()
-      // 2898 = cliPrefix(42) + stable(2856)，与 README 实测矩阵同量级。
-      expect(shape.identityChars).toBe(2898)
-      expect(shape.identityBlockChars).toEqual([42, 2856])
+      // 2632 = cliPrefix(42) + stable(2590)，官方 2026-10-23 版实测。
+      // ⚠ 官方再改身份块结构时这里要跟着动（见 src/zcode-identity.ts 的提取记录）。
+      expect(shape.identityChars).toBe(2632)
+      expect(shape.identityBlockChars).toEqual([42, 2590])
       expect(shape.cliPrefixChars).toBe(42)
       expect(shape.systemBlocks).toBeGreaterThanOrEqual(3)
     })
@@ -74,13 +79,13 @@ describe('ZCode 3012 可观测诊断（issue IKJI0Y）', () => {
       expect(line).toContain('本进程 成功')
       expect(line).toContain('最近成功')
       expect(line).toContain('距上条')
-      expect(line).toContain('身份块 2898 字符(42+2856)')
+      expect(line).toContain('身份块 2632 字符(42+2590)')
       expect(line).toContain('日期块 有')
       expect(line).toContain('HTTP 405')
     })
 
     /**
-     * ★ 反向验证：常量说 2898，但如果真出现「身份块没进请求体」，
+     * ★ 反向验证：常量说 2632，但如果真出现「身份块没进请求体」，
      * 诊断必须**如实显示 0** —— 读实际值才做得到这一点。
      */
     it('★ 身份块缺失时如实报 0 字符（读实际值，不是读常量）', () => {
@@ -91,12 +96,12 @@ describe('ZCode 3012 可观测诊断（issue IKJI0Y）', () => {
         accountId: 'a', sentAt: 1, status: 405, shape, now: 1,
       })
       expect(line).toContain('身份块 0 字符(无)')
-      expect(line).not.toContain('2898')
+      expect(line).not.toContain('2632')
     })
 
     it('日期块有无被如实识别（去掉日期块即报「无」）', () => {
       const without = describeZcodeRequestShape(
-        buildZcodeSystemBlocks(undefined, { cwd: '.' }),
+        buildZcodeSystemBlocks({ cwd: '.' }),
         [{ role: 'user', content: '裸文本' }],
       )
       expect(without.hasDateBlock).toBe(false)
@@ -363,7 +368,7 @@ describe('ZCode 3012 可观测诊断（issue IKJI0Y）', () => {
       const text = describeUpstreamError(405, '{"code":3012,"msg":"blocked"}', diag)
       expect(text).toContain('本机诊断：')
       expect(text).toContain('账号#1')
-      expect(text).toContain('身份块 2898 字符')
+      expect(text).toContain('身份块 2632 字符')
     })
 
     it('★ 不给诊断时行为与原来**逐字一致**（旧调用点不受影响）', () => {
@@ -385,7 +390,7 @@ describe('ZCode 3012 可观测诊断（issue IKJI0Y）', () => {
     it('非 3012 的错误**不附**诊断（那些文案本身已说明原因）', () => {
       // 适配器只在 `text.includes('3012')` 时传诊断；这里验证纯函数侧：
       // 即使误传，3007/1005 的固定文案仍以自己的说明开头。
-      const diag = '账号#1 · 身份块 2898 字符'
+      const diag = '账号#1 · 身份块 2632 字符'
       expect(describeUpstreamError(400, '{"code":3007}', diag)).toContain('阿里云 captcha 校验失败')
       expect(describeUpstreamError(429, '{"code":1005}', diag)).toContain('额度用尽')
     })

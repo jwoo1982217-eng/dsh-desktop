@@ -88,7 +88,9 @@ export class BrowserPanelService {
         case 'back': await this.browser.history(id, -1); break;
         case 'forward': await this.browser.history(id, 1); break;
         case 'reload': await this.browser.reload(id); break;
-        case 'resize': this.frames.delete(id); await this.browser.resize(id, payload.width, payload.height); break;
+        // A static page may not emit another frame for an unchanged viewport.
+        // Keep the last valid image (and its dimensions) until Chrome replaces it.
+        case 'resize': await this.browser.resize(id, payload.width, payload.height); break;
         case 'pointer': await this.browser.pointer(id, payload); break;
         case 'text': await this.browser.text(id, payload.text); break;
         case 'key': await this.browser.key(id, payload); break;

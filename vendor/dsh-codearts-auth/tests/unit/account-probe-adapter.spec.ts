@@ -396,7 +396,7 @@ describe('account-probe 适配器选择按产品判定', () => {
     expect(instances[0]?.product?.productCode).toBe('workbuddy')
   })
 
-  it('buddy 账号仍走 BuddyAdapter 且携带 CodeBuddy 产品配置', async () => {
+  it('buddy 账号仍走 BuddyAdapter 且携带国内 WorkBuddy 产品配置', async () => {
     const { retestAccount } = await import('../../src/account-probe.js')
     await retestAccount(makePool([makeEntry({
       id: 'buddy-1',
@@ -407,7 +407,7 @@ describe('account-probe 适配器选择按产品判定', () => {
     const instances = await adapterInstances()
     expect(instances).toHaveLength(1)
     expect(instances[0]?.product?.id).toBe('buddy')
-    expect(instances[0]?.product?.productCode).toBe('codebuddy')
+    expect(instances[0]?.product?.productCode).toBe('workbuddy')
   })
 })
 

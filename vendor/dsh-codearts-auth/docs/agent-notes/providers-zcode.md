@@ -2248,6 +2248,342 @@ for (const account of accounts) {              ← jet-hub-rpc.ts 的逐账号�
    撞到 3012 时拿到的就是**上游能查日志的凭据** —— 归因从「猜」变成「可查」；
 3. 脚本**已就位**（在 `scripts/`，被 gitignore），下次直接跑即可。
 
+---
+
+## ⚠️⚠️ 营销投放（1024 程序员节）与**客户端版本门控**（用户报障，2026-10-23）
+
+**用户报障原文**：
+
+> 「我在 scoop 中装了 zcode 最新版 3.16.3，其中有 1024 程序员节送的 5 亿 token，
+>  （截图）**把这个领取功能集成在每日签到中一并领取**，只有 zcode 中国版有，
+> 国际版好像没有」
+
+### 一、先钉住结论：这不是「多一个活动」，而是**签到漏了一个来源**
+
+| | 端点 | 实测（本机 4 个账号，全部一致） |
+|---|---|---|
+| 每日赠送 | `GET /api/v1/zcode-plan/billing/preview` | `data.plans` 里有 `…start-plan-trust-…`（有投放时） |
+| **营销投放** | `GET /api/v1/marketing/touch` | **1024 活动只在这里** |
+| 余额桶 | `GET /api/v1/zcode-plan/billing/balance` | `balances: []`（活动未领前为空） |
+
+**决定性判据**：领取 1024 的账号，`preview.plans` 与 `balance.balances`
+**都是空数组**，而 `marketing/touch` 里明明有横幅。
+⇒ 只查 preview 的签到，**与「今天没有活动」在 wire 上完全同形**
+（都是 `plans: []`），永远不会去领它。这就是「官方客户端有、插件借不到」的全部原因。
+
+### 二、逆向取证（scoop 安装版 `resources/app.asar`，341 MB）
+
+⚠ 本机实际是 **3.16.2**（`3.16.3` 是用户口述的版本；活动是**按请求头**版本门控的，
+与本机安装版本无关，见第三节）。读取方法与 §7.1 同（asar 头 + JSON 表尾部填充）。
+
+| 事实 | 出处（asar 内路径 + 符号） |
+|---|---|
+| 投放查询与回执 | `out/host/index.js` 的 `createMarketingTouchService`：`GET /api/v1/marketing/touch?seq=<n>`、`POST /api/v1/marketing/touch/action` |
+| 请求头只有**四个** | 同上：`X-Device-Mid` / `X-Client-Language` / `X-ZCode-App-Version` /（可选）`Authorization` |
+| 投放 schema | `out/renderer/assets/src-oukR4Y1K.js`：`resource_position` = `banner` \| `popup`，按钮 action ∈ `close` / `open_url` / **`claim_zcode_plan{plan_id}`** / `navigate` / `copy_text` |
+| **点击后走哪** | `out/host/index.js` 的 `claimManualPlan(planId)` → **`POST /api/v1/zcode-plan/billing/claim`**，body `{plan_id}`，带 `Authorization` + **captcha 头** |
+| 成功后回执 | `out/renderer/assets/styles-n-UNIiNg.js`：动作成功后立刻 `p(delivery, 'confirm')` |
+| 需要 captcha 的旁证 | i18n `manualClaimPlan.claim.failure.captcha`＝「Captcha verification failed.」（`out/renderer/assets/IntlProvider-C2IbGUkl.js`） |
+
+**★ 最关键的一条**：`claimManualPlan` 用的**就是我们既有签到用的同一个 claim 端点、同一套 captcha**
+⇒ 集成只需要「多一个 plan 来源 + 一次回执」，**不需要**新协议、新验证机制。
+
+### 三、⚠️⚠️ 版本门控：同一个账号、同一套头，**只改一个字段**结果完全不同
+
+本机只读实测（`scripts/probe-zcode-marketing-touch.mjs`，4 个账号，只发 GET）：
+
+| `X-ZCode-App-Version` | `marketing/touch` 的 `data.deliveries` |
+|---|---|
+| `3.14.3`（**插件凭据里记的版本**） | **`[]`（空）** |
+| `3.16.3` | `[{campaign_id:"2113475573403824128", …}]` ★ |
+
+且「完整头集」与「官方最小头集」**结果相同** ⇒ 判据只有版本这一个变量。
+
+官方文案也印证：`manualClaimPlan.claim.failure.ineligible`
+＝「当前账号或**客户端版本**不满足领取条件」。
+
+⚠ **因此必须按请求覆盖版本**（`ZCODE_VERSION_GATED_MIN_APP_VERSION`），
+而**不能**去改凭据里的 `app_version`、也**不能**全局抬
+`ZCODE_APP_VERSION_FALLBACK`：推理 / 额度 / 领取三条路径的既有实测结论
+（含 §「3012 的消融矩阵」那一整表）都是在 3.14.3 上取到的，
+无证据地整体抬版本会把这些结论一起作废。
+落地形态：`buildZcodeHeaders` 新增可选的 `appVersion` 覆盖，**只有营销请求**传它。
+
+⚠ **下限未二分**：只测了 `3.14.3` 空 / `3.16.3` 有，中间档没测。
+取值即「与用户官方客户端同版本」，**不声称 3.16.3 是最低下限**。
+
+#### 3.1 ⚠️⚠️ **领取端点（claim）也受同一个门控** —— 只抬投放的版本会「看得到、领不到」
+
+**这条是真机一发定音**（`scripts/probe-zcode-claim-version-gate.mjs`，同一账号、
+**其余头完全相同**，只改 `X-ZCode-App-Version`）：
+
+| 版本 | `POST /zcode-plan/billing/claim` |
+|---|---|
+| `3.14.3`（凭据里的） | **`400 / code 1004 "no permission"`** ← 官方文案 `ineligible`＝「当前账号或**客户端版本**不满足领取条件」 |
+| `3.16.2` | **`200 / code 0`** + `data.plan.{user_plan_id, status:"active", entitlements:[3 亿 + 2 亿]}` ★ |
+
+⚠⚠ **形态极具误导性**：`1004` 读起来像「这个账号没资格」，而真实原因是
+**我们报的版本号旧了**。第一次用生产路径（`claimDailyFor`）跑就是这个结果 ——
+「活动查得到、却领不到，且理由看起来像账号问题」。
+
+⚠ 官方客户端 claim 同样报自己的版本：`app.asar` → `out/host/index.js` 的
+`claimManualPlan` 用 `'X-ZCode-App-Version': Ir`，而本机 `Ir` 即客户端版本
+`3.16.2`（同文件 `var Vu="3.16.2"`）⇒ **报 3.14.3 的一直是我们**。
+
+⚠ **顺带纠正一条逆向读法**：官方 `claimManualPlan` 的**显式** headers 里
+**没有** `X-Device-Mid`，但**照抄它会回 `3001 parameter error`** ——
+因为那层公共头由 `Fa(this.apiClient, …)` 注入，**在片段里看不见**。
+⇒ 照抄「显式 headers」时，必须把「封装层注入的公共头」一起算上。
+
+⚠ **两个端点必须同抬**：`fetchZcodeMarketingPlans` 与 `claimZcodePlan`
+都过 `zcodeVersionGatedAppVersion()`（同一份实现，不许各写一份）。
+**每日赠送 plan 的领取在抬高版本下的表现未单独实测**，但官方客户端
+（3.16.2）自己也在领它 ⇒ 风险低（如实登记）。
+
+### 四、1024 活动的实际形状（实测原文，测试 fixture 逐字取自它）
+
+```json
+{ "campaign_id": "2113475573403824128", "resource_position": "banner", "priority": 50,
+  "banner": {
+    "buttons": [ { "action": { "type": "close" } },
+                 { "action": { "type": "claim_zcode_plan",
+                               "args": { "plan_id": "zcode-v3-start-plan-1024" } } } ],
+    "background": { "args": { "zcode_plan": {
+      "plan_id": "zcode-v3-start-plan-1024", "name": "ZCode 1024 Dev Day", "priority": 101,
+      "starts_at": 1792756800, "ends_at": 1792976400,
+      "entitlements": [
+        { "show_name": "GLM-5.3-Flash", "unit_type": "token", "grant_units": 300000000 },
+        { "show_name": "GLM-5.3",       "unit_type": "token", "grant_units": 200000000 } ] } } } } } }
+```
+
+⇒ **3 亿 + 2 亿 = 5 亿**，正是用户截图那行「5 亿 TOKENS」。
+
+⚠⚠ **额度必须**求和**，不能只取 `entitlements[0]`**：`fetchZcodeClaimablePlans`
+（preview 那条）历来只取第一条 —— 那条路径实测每个 plan 只有一条 entitlement，
+**故刻意不动它**；营销这条一个 plan 有多条（按模型分），只取第一条会**少报 2 亿**。
+两条路径各有实测依据，**分开实现、分别钉住**。
+
+⚠ 同一份 `zcode_plan` 元数据被服务端**镜像**到多个资产位
+（`banner.background.args` 与 `success_popup.hero.args` 各一份，实测如此）
+⇒ 解析必须**递归找** `plan_id` 而不是写死路径（但有深度上限，
+服务端下发的任意 JSON 必须有界扫描）。
+
+### 五、落地形态（三处）
+
+1. `src/zcode-upstream.ts`：`fetchZcodeMarketingPlans()`（只读，失败一律降级 `[]`）、
+   `claimablePlansFromMarketingDeliveries()`（纯函数，便于测）、
+   `reportZcodeMarketingAction()`（`confirm` 回执，只有 `{code:0}` 算成功）、
+   `mergeZcodeClaimablePlans()`（去重 + priority 降序，preview 优先但**补** `campaignId`）。
+2. `src/zcode-auth.ts`：新增 `fetchAllClaimablePlans()`（两个来源合并），
+   **`claimDailyWith` 与 `fetchCheckinStatus` 都改用它** ——
+   后者也要改，否则面板显示「今日已领取」而 1024 其实没领（自相矛盾）。
+3. `claimOnePlan`：领取成功/已领取后发一次 `confirm`。
+
+⚠ **`confirm` 的门控是「只在成功时发」**：失败时发等于告诉服务端「别再给我看了」，
+用户**白丢一次机会**（`cancel` 语义更明确，本实现**从不**发送）。
+⚠ **`confirm` 必须 `await` 而不是 fire-and-forget**：它只有一跳，而领取流程结束后
+宿主可能很快关掉浏览器/进程，「发出去但没到」等于没发。
+⚠ `confirm` **不参与** `noteZcodeRequest*` 埋点：那套统计的是推理/领取端点的
+风控画像，营销端点不是风控对象，混进去会污染画像。
+
+### 六、回归与反向验证（`tests/unit/zcode-marketing-touch.spec.ts`，26 条）
+
+六个变异逐条实跑（每个都先打印「变异已注入 ✓」自证，跑完自动还原）：
+
+| 变异 | 结果 |
+|---|---|
+| 删掉 `fetchAllClaimablePlans` 里的 marketing 那一行 | **红 7 条**（含接线、confirm、状态灯） |
+| `buildZcodeHeaders` 的 `appVersion` 覆盖失效 | **红 1 条**（版本门控那条） |
+| 去掉 `confirm` 的 `outcome.ok` 门控 | **红 1 条**（「失败绝不发 confirm」） |
+| 去掉 `action.type !== 'claim_zcode_plan'` 判据 | 第一版**全绿（无牙！）** → 见下 |
+| `units += value` → 只取第一条 | **红 2 条**（5 亿那条 + 单位不混加那条） |
+| **claim 的版本覆盖失效**（改成 `credential.app_version`） | **红 1 条**（「claim 也必须带门控版本」） |
+
+⚠⚠ **「无牙」的那一条值得单独记**：第一版用例里 `close` 按钮的 `args` 是 `null`
+（实测原样），于是它**碰巧**被「`args.plan_id` 必须是非空字符串」那条腿挡住了 ——
+把 `type` 判据整行删掉，用例**仍然全绿**。
+⇒ 修法是**补一条独立用例**：构造「非领取动作**也带了** `plan_id`」的畸形投放
+（服务端数据不可信，将来完全可能），断言 `[]`。
+补后该变异**变红**。
+⇒ 可推广：**「某条判据」的用例，必须让其它腿都不足以挡住它** ——
+否则你测的是「另一条腿」，而这条判据可以整条消失。
+
+#### 6.1 ★★ 真机验收（走生产路径，非另写等价实现）
+
+`scripts/verify-zcode-marketing-claim-live.mjs` —— 用**插件自己的凭据** +
+`lib/` 里的**生产代码**（`ZcodeAuth.claimDailyFor` + `ZcodeAuth.mintCaptcha`）：
+
+```
+账号 zcode-7314e232  app_version=3.14.3（凭据里的）
+① marketing plans = 1
+   {"planId":"zcode-v3-start-plan-1024","priority":101,"name":"ZCode 1024 Dev Day",
+    "grantUnits":500000000,"unitType":"token","marketingCampaignId":"2113475573403824128"}
+② preview plans = 0                    ← 1024 活动**不在** preview（本改动的全部理由）
+③ 真实领取（生产路径）
+   {"kind":"claimed","credit":500000000,"streakDays":0,"isStreakDay":false,"unit":"token"}  ★★
+```
+
+⇒ **`credit: 500000000` + `unit: "token"` = 用户截图里的「5 亿 TOKENS」，领取成功。**
+
+⚠ 领取后 `balance` 仍显示 0 —— **不是失败**：活动的 `effective_at`
+（`1792767600` = 2026-10-23 23:00 UTC+8）**尚未到**，官方 `success_popup`
+的文案也是「将于 … 生效」。判据要看 claim 的 `code 0` / 本行的 `claimed`。
+
+⚠ 另一个账号（`zcode-eb16e1cd`）在**第一次领取成功后再查投放**得到
+`deliveries = []` ⇒ **服务端在用户领过之后会自己撤下该 campaign**。
+这也意味着：**「领取后再查为 0」不能当成 `confirm` 生效的证据**
+（两者在这一格上同形，见 §七）。
+
+### 七、仍未做 / 已知边界
+
+- **面板的「可领」展示（`fetchZcodeBalance` 的 `claimablePlans`）不含营销投放** ——
+  它只读 preview。即：签到能领到，但余额徽标里的「可领」条目看不到它。
+  要接需在 `fetchZcodeBalance` 里也并一次营销查询（多一跳只读请求），
+  **本次刻意不做**（用户诉求是「签到一并领取」；改动面越小越好）。
+- **活动结束后**：`deliveries` 自然变空，签到回到原状（无需清理逻辑）。
+- **国际版（`zai`）**：用户说「国际版好像没有」。本次**不做渠道特判** ——
+  投放由服务端按账号/渠道决定，国际账号自然拿不到（与「不猜上游」的既有纪律一致）。
+- **`confirm` 的实际效果未做对照实验**（是否真的让服务端停止重复投放）。
+  依据是官方 renderer 的行为与「已领过的 plan 会被反复投放」这一实测现象；
+  若将来发现仍重复投放，这里是第一嫌疑人。
+  ⚠ **别拿「领取后投放变 0」当证据**：服务端在用户领过之后**自己**也会撤下该
+  campaign（本机两个账号都观察到），两者在这一格上**同形**（见 §6.1 末）。
+- **`data.plan` 未被解析利用**：claim 成功响应里有权威的
+  `user_plan_id` / `status` / `starts_at` / `ends_at` / `entitlements[].effective_at`
+  （官方 `claimManualPlan` 正是读它做「领取成功」弹窗）。我们只用
+  `plan.grantUnits`（来自投放里的镜像元数据）做展示 —— 够用，但少了一份
+  「上游回执」的交叉校验。
+- **`seq` 参数**固定传 `0`（官方是自增计数）。实测 `0` 能拿到投放；
+  未验证自增值是否改变投放集合。
+
+### 八、可复现的探针（都在 `scripts/`，只读或「一次性写」且写明副作用）
+
+```bash
+# ① 只读：投放 + preview + balance（版本/头集矩阵写在脚本里）
+node scripts/probe-zcode-marketing-touch.mjs          # 只扫 enabled 账号
+node scripts/probe-zcode-marketing-touch.mjs --all    # 含停用账号（本机 4 个 zcode 账号全停用）
+
+# ② 一次性**写**：claim 的版本门控（默认官方头集；--ours-version 只改版本）
+node scripts/probe-zcode-claim-version-gate.mjs [账号id] [--ours-version]
+
+# ③ 端到端**写**：走生产路径真实领取（领取成功后打 confirm）
+node scripts/verify-zcode-marketing-claim-live.mjs [账号id]
+```
+
+⚠ 三者与既有探针同规矩：**不循环、不重试、不对真实凭据做续期**
+（zcode 无 refresh 端点）。②③ 会真实领取额度，且每发消耗一个**设备级**
+captcha 配额 —— 别当只读工具反复跑。
+
+---
+
+## ⚠️⚠️ 领取后「额度仍是 0」的真相：**已领但还没到生效时刻**（2026-10-23 21:19）
+
+**用户报障原文**：
+
+> 「我重启后用 zcode 领取显示 2 个成功 2 个已领取，**但是我查询额度后还是 0**」
+
+截图里 ZCode 两行都是「**+500.00MToken 领取成功**」，而额度查询是 0。
+
+### 一、结论：**不是缺陷**，是上游的 `effective_at`
+
+上游 `billing/balance` 对「已领未生效」的账号返回（**实测原文**）：
+
+```json
+{ "balances": [],                                  ← 桶是空的 ⇒ 「剩余 0」
+  "plans": [{ "plan_id": "zcode-v3-start-plan-1024", "status": "active",
+              "entitlements": [
+                { "show_name": "GLM-5.3-Flash", "unit_type": "token",
+                  "grant_units": 300000000, "effective_at": 1792767600 },
+                { "show_name": "GLM-5.3",       "unit_type": "token",
+                  "grant_units": 200000000, "effective_at": 1792767600 } ] }] }
+```
+
+`1792767600` = **2026-10-23 23:00 UTC+8**（报障时是 21:19 ⇒ 还差 83 分钟）。
+
+⇒ 额度**已锁定在 `plans` 里**，但 `balances` 桶**要等 23:00 才建**。
+官方成功弹窗的文案也正是「**将于 … 生效**」（实测 `description` 里是
+「… 将于 … 生效」）。
+
+⚠ **判据**：上游 `data.plan.status === 'active'` + `entitlements[].effective_at`
+**晚于现在** ⇒ 就是「已领未生效」。**这不是「领取失败」**，更不是「白领了」。
+
+### 二、⚠️⚠️ 由此暴露的**真缺口**：插件**没有把这个中间态显示出来**
+
+用户只能看到「领取成功」+「额度 0」⇒ **看起来像白领了**。
+
+⇒ 修法（**两个字段，两个入口**）：
+
+| 位置 | 改动 | 为什么 |
+|---|---|---|
+| `src/zcode-upstream.ts` | `ZcodeBalanceResult` 新增 `pendingPlans`；`fetchZcodeBalance` 用 `pendingPlansOf(data.plans)` 填充 | 「已领、等生效」是**独立于桶**的一态 |
+| `src/provider-credits.ts` | `buildZcodeBalance` 把它做成**独立包**，`remaining/total` 都给 **0**，`cycleStartTime` 携带**生效时刻**，`active: false` | 见下 |
+
+⚠⚠ **绝不能把它并进 `remaining` / `total`**（`total` 是折算层的判据）：
+
+`aggregate-expiry.ts` 的 `zcodeExpiry` 判据是 **`balance.remaining > 0`**
+（`aggregate-expiry.ts` 的注释明写「判据是 `remaining`（**已拥有**的余额）」）
+⇒ 并进去 ⇒ 折算判成「有额度」⇒ **在 23:00 之前就把 zcode 派发出去**
+（必然失败：额度还不存在）。
+⇒ 故：**桶 = 现在能用；`pendingPlans` = 已领、等生效**；`zcodeExpiry` **不读**它
+（实测 `zcodeExpiry` 源码里 `pendingPlans` 命中 **0** 处）。
+
+### 三、⚠️⚠️ 国际版（`zai`）**同样能领**——「只有中国版有」是**界面/入口**差异
+
+**用户追问**：「2 个旅行者账号应该是国际版账号，但我看有个旅行者账号也领取成功了，
+应该只有中国版才有」。
+
+**实测（`scripts/probe-zcode-account-channel.mjs` + `probe-zcode-intl-vs-cn-activity.mjs`）**：
+
+| 账号 | 渠道（凭据字段） | `billing/balance` 的 1024 plan |
+|---|---|---|
+| sysenxde / xrbwohf3 | 中国版 `bigmodel`（`user_channel=WECHAT_OPEN`） | `status: active` |
+| **旅行者9665 / 旅行者6665** | **国际版 `zai`**（只有 `zai_access_token`） | **`status: active`** ★ |
+
+⇒ **服务端在额度层面完全不按 OAuth 渠道区分**：两个国际版账号拿到的是**同一个**
+`zcode-v3-start-plan-1024`（3 亿 + 2 亿）。
+
+⚠ 补一条**反直觉**的实测：用**渠道专属 token**（`zai_access_token` /
+`bigmodel_access_token`）当 Bearer 查 `billing/balance` ⇒ **HTTP 401**；
+只有 `zcode_jwt` 能用 ⇒ 该端点**只认 `zcode_jwt`**，与渠道无关。
+
+⚠ `X-Client-Language` 取 `zh-CN` / `en-US` **不影响**投放（两组都是 `code 0`、
+`deliveries` 相同）。
+
+⇒ 「只有中国版有」的观感来自**官方客户端的界面**：
+官方「奖励中心」页是**分站**的 —— `isTrustedRewardsUrl` 的判据是
+`/^\/(cn|en)\/rewards\/?$/`（`app.asar` → `out/main/chunk-XYX2CJ3H.js`），
+且 marketing touch 的 `baseUrl` **恒为 `zcode.z.ai`**（中国版域）。
+⇒ **国际版用户看不到那个入口，但额度本身拿得到**（实测两个旅行者账号都拿到了）。
+
+⚠ **本仓库不做渠道特判**：投放由服务端决定，我们只按实测拿到的 plan 领取
+（与「不猜上游」的既有纪律一致）。
+
+### 四、回归与反向验证（`tests/unit/zcode-pending-effective.spec.ts`，11 条）
+
+三个变异逐条实跑（`scripts/mutate-zcode-guard.mjs`，每个都自证「变异已注入 ✓」、
+跑完自动还原）：
+
+| 变异 | 结果 |
+|---|---|
+| 把待生效额度**并进 `total`** | **红 1 条**（「总量不含待生效」那格） |
+| pending 包的 `active` 改成 `true` | **红 1 条** |
+| 「已到生效时刻」的也计入 `pendingPlans` | **红 2 条** |
+
+⚠ 其中「总量不含待生效」那一格是**最关键的**：它是「23:00 之前不派发 zcode」
+这条不变式的**唯一**守卫（折算层只读 `total`/`remaining`）。
+
+### 五、可复现的探针（本轮新增）
+
+```bash
+# 只读：领取后上游到底返回什么（桶 / 计划 / 生效时刻）
+node scripts/probe-zcode-post-claim-balance.mjs
+
+# 只读：每个账号是中国版（bigmodel）还是国际版（zai）
+node scripts/probe-zcode-account-channel.mjs
+
+# 只读：同一端点用「渠道 token」与「zcode_jwt」的差异 + 语言变量
+node scripts/probe-zcode-intl-vs-cn-activity.mjs
+```
 
 
 
@@ -2256,3 +2592,272 @@ for (const account of accounts) {              ← jet-hub-rpc.ts 的逐账号�
 
 
 
+
+
+## ⚠️⚠️ 405 的判据是「system 恰好 3 块」，而这条不变式曾**零守卫**（2026-10-25 合并审计）
+
+`!151` 用三轮对照证明：**第 4 个 `system` 块会让请求必然 405 + 3012**，与它多长无关
+（2 062 字符照样 405）；把调用方 system 挪进首轮 user 消息后同一请求 200，且模型照样
+遵守那段约定。落地方向完全正确。
+
+**但审计实测**：把这处修复**原样放回去**（适配器里 `system.push({type:'text',text:options.system})`
++ 删掉 `withCallerSystem`）后，**871 条 zcode 用例 + 双 tsc 全绿**。原因：当时的用例只测
+`buildZcodeSystemBlocks()` 的返回值（它已经没有 caller 形参，断言近乎恒真），**从不过适配器**；
+全仓只有 `zcode-throttle.spec.ts:439` 读过真实请求体，且只断言 `tools` 的断点。
+
+⇒ 现有守卫：`tests/unit/zcode-wire-invariants.spec.ts` —— 让 `ZcodeAdapter.stream()` 真跑一次、
+截 `fetchImpl` 收到的 `init.body`，断言 `system.length===3` / caller 零次在 system / 恰好一次在
+messages 且排在日期块之后。**改 zcode 适配器装配时它必须绿。**
+
+⚠️ 同一轮审计还挖出「同姓」的四处自相矛盾（都已修，但结论要记）：
+① `X-Platform`/`X-Os-Category` 硬编码 windows 而 `X-Os-Version` 取真实 `os.release()`
+⇒ 非 Windows 宿主上「windows 类别 + Darwin 内核号」，任何官方客户端都不会发；
+② 头走门控版（3.16.3）而 query/body 走凭据版（3.14.3）⇒ 同一请求两个版本号；
+③ `X-Session-Id` 是**模块级常量** ⇒ 池里所有账号共用一个 session id（真实客户端是每会话一个）；
+④ `app_version` 不做格式校验 ⇒ `3.16.3-beta.1` / `3.016.3` 会被 `compareZcodeAppVersion`
+当成「更大」而**绕过**门控，`\r\n` 注入会让 `Headers()` 抛 `TypeError`。
+⇒ 判据：`zcodeClientPlatform()` 三值同源且**平台与内核版本都可入参**（本机 `os.release()`
+恰好等于伪装值 `10.0.26100`，不注入就永远测不出①）；带 query `app_version` 的站点必须把
+同一个值显式传给 `buildZcodeHeaders`。
+
+⚠️ 另：`buildZcodeHeaders` 被 `zcode-transport.ts` 复用，所以 `coding-plan` 腿（`api.z.ai`）
+现在也从 10 头变 18 头 —— 作者只在 `/v1/messages` 上实测过，`api.z.ai` 未实测（已登记）。
+
+⚠️ 方法论：`zcode-identity.ts` 头注释原写「判据是身份块是否存在，**不是**块数多少」，
+与现行不变式**正面冲突**。这类过期注释就是下一次回归的引信（谁按它把第 4 块加回来，
+测试不会红）。改代码时**必须连注释一起改**，否则等于留下一个静默的骗局。
+
+## ⚠️⚠️⚠️ **405 恒不可重试**：白重试 5 轮会加重冷却惩罚（issue IKQ4B4，2026-10-25）
+
+`405` 在 ZCode **从不是**「HTTP 方法不允许」的通用语义 —— 它是**风控拦截的专属状态码**
+（上面「3012」节的消融矩阵：裸请求 / 无身份块都是「**405 + 3012**」）。而
+`3012` 有账号冷却惩罚（30 分钟起，反复触发升级到 24 小时乃至停用）
+⇒ **对 405 重试不只是无用，是有害的**。
+
+### 缺陷形态（用户报障 + 本机复现）
+
+上游有时把拦截包成**边缘 HTML 页**（`<title>405</title>`，无业务码、无风控语义）
+⇒ `looksLikeZcodeHtmlPage` 命中 ⇒ 走 HTML 短路 ⇒ 归 `SERVER` ⇒
+**在 harness 的 `DEFAULT_RETRYABLE_CODES` 里** ⇒ 白重试 5 轮。
+
+本机实测（会话 `3acf2ebd` turn 16 的 `llm/retry` 事件，逐字）：
+
+```
+policyKey: ["normal",5,["EMPTY_RESPONSE","RATE_LIMIT","SERVER","TIMEOUT","TRANSPORT"],500,10000,0.1]
+retry 1/5 code SERVER delay 476ms   status 405
+retry 2/5 code SERVER delay 950ms
+retry 3/5 code SERVER delay 1928ms
+retry 4/5 code SERVER delay 4107ms
+retry 5/5 code SERVER delay 7237ms
+```
+
+⇒ 用户原话「405 html 重试了 3 个 5 次都没用」。
+
+### 与 2026-10-07 那次修复的关系：**不冲突，各管一段**
+
+那次把「HTML 页一律 `SERVER`」是为了修「**5xx 瞬断**被误判成不可重试」
+（`500` + 含 `1005` 的边缘页原来报 `QUOTA_EXCEEDED`，只失败一次）。
+它**顺带**把 405 也变成了可重试 —— 而它自己的注释已承认 405 从未被真正锁住：
+
+> `405`：去掉短路后会走末尾 `return 'SERVER'`……仍相同 ⇒ 改用能被业务码劫持的断言
+
+⇒ 两件事方向相反：那次是「瞬断不该不可重试」，本次是「风控不该可重试」。
+
+### 修法的三个邻位（缺一个就红，全部实测过）
+
+| 邻位 | 错放的后果 |
+|---|---|
+| 必须在 HTML 短路**之前** | 405 最常见的形态就是 HTML 页 ⇒ 放后面永不可达 |
+| 必须在「有权威业务码」**之后** | `{"code":1005}` + 405 被吞成 `PERMISSION_DENIED`，本该是 `QUOTA_EXCEEDED`（真实回归，1 条红） |
+| 码**不能取 `PERMISSION`** | 等价守卫钉住「`PERMISSION` ⟺ `hasZcodeUnusualActivity`」，而 405 页没有风控语义 ⇒ 冒名且让守卫红 |
+
+⇒ 取 **`PERMISSION_DENIED`**（与 `cline-adapter` 的地域限制、`buddy-adapter` 的渠道校验
+同口径）：不可重试、但不冒充具体某一种上游错误。
+
+### 文案必须同轴（`describeUpstreamError`）
+
+归类改成不重试后，文案若仍说「建议稍后重试」就是**骗人**（用户等了、重试了，什么都不会发生）。
+这是 `IKLBSH`（`AUTH` 吞 message）/ `!IKIZNK`（思考死循环复用 `max-tokens`）的同族形态：
+**文案本身就是出路**的错误，码与文案必须同时改。
+
+⇒ 405 分支的文案要说「**不会自动重试**」+ 冷却惩罚后果 + 「**更换账号无效**」，
+且**不得**含「额度」「凭据失效」（那是方向相反的指引）。
+
+⚠️ **ESA 页让位**：`formatZcodeEdgePageHint` 里的「边缘CDN」是 ESA 专属词，
+守卫「ESA 分支与通用分支必须可区分」钉住「普通 405 页不得含边缘CDN」
+⇒ 405 分支判据要加 `!looksLikeZcodeEsaPage(...)`。
+ESA 判据已从 `formatZcodeEdgePageHint` 内联抽成导出 `looksLikeZcodeEsaPage`
+（**判据只留一份**，否则 `describeUpstreamError` 再抄一份正则就是「一文件两套同义判据」）。
+
+### 守卫
+
+`tests/unit/zcode-claim-3012.spec.ts` 的「★★ 405 恒不可重试」一节（8 条），
+变异验证：删掉 405 那一格 ⇒ **5 条红**（3 条新增 + 2 条既有）。
+
+### ⚠️ 真机验证（2026-10-25，真实账号 + 真实凭据，只发 1 发）
+
+`GLM-5.3-Flash` + 3 块 system + 调用方 system 进 messages ⇒ **HTTP 200**
+（1347ms），模型正文正确回复 `OK`，且 thinking 里复述了那段约定
+⇒ `9893e91` 的修复在真机上确认有效，本次改动**没有把正常路径改坏**。
+
+并发 5 发同形态 ⇒ **5/5 个 200，零 429、零 405**。
+
+## ⚠️⚠️⚠️ **`glm-5.3-flash` 的 gap 从 0 改成 500ms**：并发下 Flash 也会撞 3009（issue IKQ4B4，2026-10-25）
+
+`model-gate.ts` 的闸门保证「串行（不重叠）+ 按模型间隔」。而
+`zcode-product.ts` 原配 `'glm-5.3-flash': 0`，注释理由是「Flash 从未撞过限流」。
+
+### 那条理由已被实测证伪
+
+依据是 `dsh-free-glm` 的分模型实测：
+
+```
+GLM-5.3-Flash  605 次 200    0 次限流      ← 该窗口内 Flash 配额够用
+GLM-5.3         74 次 200   21 次重试     6 次最终 429
+```
+
+⚠ 其成立前提是**串行单发**（605 次里没有并发）。一旦开并发
+（多个 subagent / 多轮并行），`gap=0` ⇒ 闸门只保证不重叠、**不保证间隔**
+⇒ N 个请求首尾相接密集连发 ⇒ 只要该模型的并发窗口 < N 就撞
+`429 + 3009 model concurrency limit exceeded`。
+
+本机实测（会话 `3acf2ebd` turn 15）：模型正是 `GLM-5.3-Flash`，撞了 429+3009，
+随后 turn 16 **升级成 405 风控拦截** ——「并发开多就全废」的起点。
+用户原话：「1.5 亿 token 并发多了以后碰到，是 glm-5.3-flash，普通的 glm-5.3
+没有碰到（可能是因为我用 5.3 都是单线程的）」。
+
+### 为什么两个缺陷是**串联**的
+
+```
+gap=0 ⇒ 撞 429+3009
+  ⇒ 适配器②层退避 2 轮 × harness⑤层 5 轮 = 单请求最多 10+ 发
+  ⇒ 并发放大（4-5 个 subagent ⇒ 40-50 发密集打同一模型通道）
+  ⇒ 触发风控 ⇒ 405
+  ⇒ 405 归 SERVER 又再放大 5 轮 ⇒ 越重试越糟
+```
+
+⇒ 修任何一环都能打断这条链，但**两环都修**才能真正解决「并发开多就全废」。
+
+### 修法与参数
+
+`'glm-5.3-flash': 500`（**用户指定值**，比 glm-5.3 的 350ms 略保守 ——
+Flash 首帧通常 <1s ⇒ 单请求耗时短 ⇒ 同样间隔下单位时间内请求数更多）。
+代价可接受：并发 5 个铺开只需 2.5s，相对推理耗时占比很小。
+
+### 一条**已排除**的假设（别再走一遍）
+
+「换 `x-session-id` 能否避免限流」——**不能**：
+
+- 并发配额是**服务端按「模型 + 账号」计量**的（`zcode-product.ts` 明写），
+  session id 不参与；
+- session id 按 `device_mid` 派生，而 `device_mid` 是登录时随机生成的**凭据字段**
+  ⇒ 为规避限流而每请求换 session id，反而造出「同一账号多个会话」的形状，
+  那才是真实客户端不会产出的异常信号（`zcode-upstream.ts:167` 正是这么论证的）。
+
+⇒ 真正该动的是 **gap（客户端自保节流）**，不是 session id（伪装身份）。
+
+### 守卫
+
+`tests/unit/model-gate.spec.ts` 的「ZCODE 产品配置」一节（3 条），
+**逐个模型枚举**而非汇总式「全部 > 0」（汇总式在有一个非零值时恒真，
+将来新增模型漏配 gap 不会红）。变异验证：flash gap 改回 0 ⇒ **2 条红**。
+
+### ⚠️⚠️ 真机验证（2026-10-25，本机 6 账号 + 真实凭据）纠正的一个认知
+
+**「gap 不是加速节流，而是秒回时的下限保护」** —— 这一点初版判断错了，
+是实测打出来的：
+
+| 场景 | gap=500ms | gap=0（缺陷态） |
+|---|---|---|
+| **正常响应**（上游 1-3s） | 5/5 个 200，铺开 | **5/5 个 200，同样铺开** |
+| **秒回**（上游 60-250ms） | 间隔 512/512/510/510ms | 间隔 199/131/224/**60**ms |
+
+⇒ 正常响应下 `serializeUpstream: true` 的**串行模式已天然铺开**
+（后一发要等前一发的上游耗时结束），gap=0 与 gap=500 **看不出差别**
+（实测两者都 5/5 个 200，零 429、零 405）。
+
+⇒ gap 的价值只在**请求快速返回**时显现：上游拒绝（400）、空响应、
+风控拦截（405）都返回得快，那时 gap=0 ⇒ N 个请求在毫秒级首尾相接
+（实测最小间隔塌到 **60ms**，5 发总铺开从 2044ms 压到 615ms）。
+
+⚠️ **这与用户撞 429 的场景完全吻合**：429/405 都是秒回形态。
+⇒ 修 gap 是修「秒回时的密集连发」，不是修「正常流量的节流」。
+
+⚠️ 顺带一条：`GLM-5.3` 的 6 个账号当时**全部**带未过期的
+`modelRateLimits` 标记（解禁 = UTC+8 当日 24:00）⇒ `GLM-5.3` 可选账号 0/6，
+而 `GLM-5.3-Flash` / `GLM-5.2` 均 6/6。**「glm-5.3 用不了」是自然日额度
+烧光 + 既有结算设计，与本次修复无关** —— 报障时先看这个，别误判成新缺陷。
+
+## ⚠️⚠️ 会话亲和的**负载溢出**（`DSH_ZCODE_SESSION_BALANCE_OVERFLOW_REQUESTS`，2026-10-31 审计后定稿）
+
+会话亲和（`accountSelection: 'session-balance'`）下账号负载 ≈ **会话长度**：一个跑整天的
+会话把它哈希到的那个号独自吃满。本机真实账本（`~/.dsh/jet-hub/token-ledger.json`，
+按 `provider=zcode` 按账号聚合 `requests`）实测 `2026-10-31` 六个有量账号为
+`1233 / 459 / 8 / 7 / 7 / 7` —— 单号占当日 **71.6%**，`max/mean = 4.30`。
+
+修法是**软溢出**：`rankAccountsBySessionWithOverflow()`（`src/session-balance.ts`）
+把「今日请求数 ≥ 阈值」的账号整组沉底，其余仍按 rendezvous 哈希序。
+
+### 三个必须记住的判据
+
+1. **它是「上限（cap）」，不是均衡器。** 最终比值上界 ≈ `阈值 ÷ 当日均匀量`。
+   固定 300 在本机实测把 `4.30 → 1.42`；默认曾取 600，**4 天里 3 天峰值 < 600
+   ⇒ 一个号都不会沉底 ⇒ 零效果**（且 PR 正文举证的峰值 322 也 < 600）。
+2. **它做不到「已有会话保持亲和」，而且是靠「中途换号」生效的。** 函数是**无状态
+   纯函数**、调用方**每个请求**都重跑（池里没有 `sessionId → accountId` 记忆）。
+   会话所在账号越阈的那一发就会迁移：实测 8 号池 1300 连跑在第 **601 / 1201** 次
+   各迁移一次；阈值低于均匀量时还会「为 1 次请求换号」并「越过阈值后弹回原号」
+   （全员超载 ⇒ 退回哈希序）。**不要**再在任何地方写「同一会话固定落同一账号」——
+   这句话在 README / 客户端 tooltip / 4 处源码注释里已一并订正。
+3. **阈值是绝对量，不是「当日总量的相对量」。** 相对量实测被否决：阈值随总量上涨
+   会把已超载账号重新变 fresh ⇒ 会话反复弹回。同一场景实测换号次数
+   **固定 300 = 5 次**、`max(200, 1.2×均值) = 204 次`、`1.5×均值 = 428 次`。
+
+### 环境变量
+
+| 变量 | 缺省 | 语义 |
+|---|---|---|
+| `DSH_ZCODE_SESSION_BALANCE_OVERFLOW_REQUESTS` | `300` | 账号今日请求数达到它即沉底；`0` = 关闭溢出（纯哈希亲和） |
+
+⚠️ **只认纯十进制整数**（`/^\d+$/`）。宽松 `Number.parseInt` 的静默失效已实测：
+`'1e3'` → **1**（每个号第一发就算超载 ⇒ 能等于没修）、`'0x10'`/`'0b101'` → **0**
+（把溢出整条关掉）。两者都**无日志**。现在非纯数字串一律回落 300。
+
+### 数据源与代价
+
+负载来自 token-ledger 的**日聚合**（`readTokenLedgerDayMap()`，UTC+8 日键）：
+`backend.load()` 是**纯内存读**、零网络请求，实测真实 8 桶 ≈ 0.9 µs/次、
+最坏 500 桶 ≈ 85 µs/次 —— **不构成性能问题**。口径是「每次 `stream()` 记一行」，
+即**逻辑轮次**（适配器内部换号重发不额外记账；宿主 step 重试会）。
+
+⚠️ 选号处的账本读取**必须包 try/catch 退化为空表**（`sessionLoadIndex()`）：
+记账后端是外部注入点，统计故障绝不能把整条推理链路变成不可用 —— 与
+`src/index.ts` 的「记账绝不反噬推理」同一条纪律。
+
+### 已知边界（别当成缺陷）
+
+- **小池 + 高量**：2 个号各 850 次、阈值 300 ⇒ 两个号长期都超载 ⇒ 退回哈希序
+  ⇒ 不生效（此时不均衡度本身也只有 ≤2.0，可接受）。
+- **大池 + 高量**：20 个号均分 86 ⇒ 单号很难到 300 ⇒ 不生效。5~8 号池最合适。
+- 阈值按 **UTC+8 日界**归零，跨日那一刻所有账号重新变 fresh。
+- **聚合渠道的流量不参与**：`aggregate` 选号不走本函数，且账本里记成
+  `provider='aggregate'` + 空 `accountId` ⇒ 索引看不到那部分负载。
+- **不看模型**：索引按账号跨模型求和。某号在 `GLM-5.3-Flash` 上超载，会让它在
+  `GLM-5.3` 的选号里也被沉底（多半是想要的，但要知道这是合并口径）。
+
+### 守卫（2026-10-31 对抗审计补齐后）
+
+`tests/unit/session-balance.spec.ts` 的「× 溢出均衡接线」那一组用**真实
+`attachTokenLedgerStore`** 挂假账本，从 `AccountPool` 层端到端验证。补齐前**整条生产
+接线零守卫**：把 `account-pool.ts` 的调用换回 `rankAccountsBySession(...)`（= 修法
+完全失效）**全仓 11654 条测试仍全绿**；把日键写成 `'1970-01-01'` 同样全绿。
+现在这两条变异都变红（连同 try/catch、NaN 归一、默认 300、env 严格解析）。
+
+⚠️ 同组里那两条**等价变异**（删「`fresh`/`overflowed` 任一侧为空就早退」、删
+`threshold <= 0` 早退）**删掉后行为逐字节相同**（5632 格穷举实测）⇒ 它们是**不可观测
+的防御性代码**，**不要**为它们编用例声称覆盖。同理「全员超载退回哈希序」这条
+**语义**值得锁，但它锁不住那段代码。
+
+⚠️ 该 spec 现在**已列进 `tsconfig.tests.json` 的 `include`**：初版不在，于是
+`typecheck:tests` 对它恒为「0 错」，而它正是「把日聚合表当账号负载表传」这种
+**形状错误**的唯一现场（纳入后立刻暴露 3 处 `TS2345`，那两条用例当时是假绿）。

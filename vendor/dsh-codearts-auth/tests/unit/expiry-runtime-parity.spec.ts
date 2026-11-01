@@ -36,6 +36,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { NEVER, UNUSABLE } from '../../src/aggregate-core.js'
 import { WIRED_EXPIRY_PROVIDERS, createExpiryProbe } from '../../src/aggregate-expiry.js'
+import { createProviderExpiry } from '../../src/provider-expiry.js'
 import { apply } from '../../src/index.js'
 import { clearProviderRuntimes, registerProviderRuntime, registeredRuntimeIds, runtimeOf } from '../../src/provider-runtime.js'
 import { descriptorOf } from '../../src/provider-registry.js'
@@ -62,7 +63,31 @@ import { readFileSync } from 'node:fs'
 //    真正的防线是「`AGGREGATE_CHANNELS` 的 channel 成员必须在清单里」那条，
 //    见本文件末尾的 ★★ 显式豁免表守卫。
 const EXPECTED_WIRED = [
-  'accio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts', 'lobsterai', 'loomy', 'modelscope', 'officeace', 'trae', 'workbuddy', 'zcode',
+  // ⚠️ qoder / qodercn 2026-10-20 加入（**第 7 次复发**，同上成因）：
+  //    `usage.expiresAt` 是永久哨兵 `253402214400000`（`9999-12-31`）时
+  //    `qoder-credits.ts` **不写** `deductionEndTime` ⇒ 落永久桶 ⇒ 可分档。
+  //    ⚠️ 两站域名不同（`openapi.qoder.sh` / `openapi.qoder.com.cn`），
+  //    共用一个 `QoderAuth` 但**是两个渠道 id**，故必须各占一项。
+  // ⚠️ astudio 2026-10-20 加入：`/points/balance` 三池各带 `*NextExpireTime`，
+  //    由 `astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到 `deductionEndTime`。
+  //    这是「只加 AGGREGATE_CHANNELS 而漏本清单」的第 5 次复发。
+  // ⚠️ minimax / minimaxintl 2026-10-20 加入（**第 6 次复发**，同上成因）：
+  //    `/minimax-cloud/api/v1/credit/details` 的每条 `details[]` 带
+  //    `expire_at_ms`（毫秒时间戳），由 `minimax-credits.ts` 直接写进
+  //    `deductionEndTime`。⚠️ 国际站另有**地理分流**（307 到中国站且不认
+  //    国际站 token）⇒ 折算原语必须透传 `xff`，否则「面板能刷新、聚合候选
+  //    却恒折算失败」。两家共用一个 `MinimaxAuth`，但**是两个渠道 id**，
+  //    故必须各占一项。
+  // ⚠️ magicrew 2026-10-29 加入（**第 8 次复发**，同上成因）：
+  //    `/api/v1/quota/points/total` 的 `expiring_quota_details[].expires_at`
+  //    （无时区，按 UTC+8 解释）由 `magicrew-credits.ts` 写进 `deductionEndTime`，
+  //    折算原语 `magicrewExpiry`；无到期批次 ⇒ `NEVER`、余额为 0 / 取数失败 ⇒ `UNUSABLE`。
+  //    ⚠️ 本清单必须与本 PR 的 `WIRED_EXPIRY_PROVIDERS` / `createProviderExpiry()`
+  //    三处同步 —— 且本文件末尾另有**逐 id 点名**用例（`★ magicrew 三处同时接线`），
+  //    漏加时报告里能直接看到「magicrew」而不是一条集合差。
+  'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts',
+  'lobsterai', 'loomy', 'magicrew', 'minimax', 'minimaxintl', 'modelscope',
+  'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy', 'zcode',
 ]
 
 class FakeCredentials {
@@ -148,8 +173,10 @@ describe('★ 不变式一：清单 == runtime 里挂了 expiry 域的渠道（�
 
   it('⚠️ 未接入的渠道（清单外）在 runtime 里也**没有** expiry 域', () => {
     applyOnce()
-    // raccoon / cline 是真实渠道但未接入折算；aggregate / auto 是虚拟 provider。
-    for (const id of ['raccoon', 'cline', 'minimax', 'qoder', 'gemini']) {
+    // raccoon / cline / gemini 是真实渠道但未接入折算；aggregate / auto 是虚拟 provider。
+    // ⚠️ qoder / qodercn **已于 2026-10-20 移出本名单**（它们接入后必须有
+    //    expiry 域）—— 留着会与不变式一互相矛盾。本名单只列**当前确实未接入**的。
+    for (const id of ['raccoon', 'cline', 'gemini']) {
       expect(runtimeOf(id)?.expiry, `${id} 不该有 expiry 域`).toBeUndefined()
     }
     // 清单本身不得含未接入渠道（否则 aggregate-adapter 会广告恒不可用的候选）。
@@ -213,14 +240,36 @@ describe('★★ 不变式三：AGGREGATE_CHANNELS 的真渠道都已接入临�
  * ⚠️ 若将来真接入了某一家，**从本表删掉它**并补上清单 + 原语 + runtime 三处。
  */
 const NOT_EXPIRY_WIRED = new Map<string, string>([
-  ['qoder', '余额原语只吃 QoderCredential、与共享骨架泛型不兼容；aggregate-expiry.ts:82 登记为未接入'],
-  ['qodercn', '同 qoder（两者复用同一个 QoderAuth，余额原语同形）'],
+  // ⚠️ qoder / qodercn **已于 2026-10-20 从本表移除**（用户要求补齐三档分档 +
+  //    永久锁）：它们已接上 `WIRED_EXPIRY_PROVIDERS` + `createProviderExpiry()`
+  //    的 `qoderFamilyExpiry`（走 `cachedBalance`）。留在本表会与「豁免表本身
+  //    不得与清单重叠」那条用例直接冲突（重叠 = 豁免是假的）。
+  //    移除本表才是这条红线的正确走法 —— 不许用「改断言」绕过。
   ['cline', '余额报文无跨账号到期口径；aggregate-expiry.ts:82 登记为未接入'],
   ['raccoon', '同上（aggregate-expiry.ts:82）'],
-  ['minimax', '同上（aggregate-expiry.ts:82）'],
-  ['minimaxintl', '同 minimax（共用同一个 MinimaxAuth 类，余额原语同形）'],
+  // ⚠️ minimax / minimaxintl **已于 2026-10-20 从本表移除**（用户报障：「MiniMax
+  //    Code 积分也有到期时间，也应当有相同功能」）。它们已接上
+  //    `WIRED_EXPIRY_PROVIDERS` + `createProviderExpiry()` 的 `minimaxExpiry`
+  //    原语 ⇒ 留在本表会与「豁免表不得与清单重叠」那条用例直接冲突（重叠 =
+  //    豁免是假的）。移除本表才是这条红线的正确走法 —— 不许用「改断言」绕过。
   ['gemini', '同上（aggregate-expiry.ts:82）'],
   ['opencode', '「余额」是本地派生的通道可用性、零网络，套折算骨架会发不存在的请求'],
+  // ⚠️⚠️ **Codely**（Unity，2026-10-22 A6）：豁免理由与上面各家**都不同** ——
+  //    它的余额端点「能读、且能归一到一个数」，**但上游根本不下发到期时间**。
+  //    可核对：`src/codely-credits.ts` 的 `fetchCodelyBalanceDetailed` 把
+  //    `/api/user/usage/summary` 抽象成 `CreditPackage` 时，`expiredTime` /
+  //    `cycleEndTime` 都写死为**空串**（上游报文只有 `remaining_points` /
+  //    `is_exhausted`）。⇒ 缺的是**数据源**，不是接线：强行加进清单只能编一个
+  //    假临期档。⚠️ 上游一旦开始下发到期时间，从本表删掉它并补
+  //    三处（清单 + `createProviderExpiry()` + 折算原语）。
+  ['codely', '上游余额报文**不下发任何到期时间**（codely-credits.ts 的 expiredTime/cycleEndTime 写死空串）⇒ 无临期档可折算'],
+  // ⚠️ **本 fork 独有**（qiniu，2026-10-29）：七牛云 AI **没有余额/额度查询
+  //    端点**（用量与计费只在控制台可见）⇒ `credits.balance: false` ⇒ 折算层
+  //    连「剩多少」都读不到，更谈不上临期档。缺的是**数据源**，不是接线：
+  //    强行加进清单只能编一个假数字（本仓库红线「绝不编造数字」）。
+  //    ⚠️ 上游一旦开放额度端点，从本表删掉它并补三处（清单 +
+  //    `createProviderExpiry()` + 折算原语）—— 走法与 codely 那条相同。
+  ['qiniu', '无余额端点（七牛云用量只在控制台可见）⇒ credits.balance: false，折算层读不到任何额度 ⇒ 无临期档可折算'],
 ])
 
   it('每个进了 AGGREGATE_CHANNELS 的真渠道都在 WIRED_EXPIRY_PROVIDERS 里（或已显式豁免）', () => {
@@ -268,6 +317,48 @@ const NOT_EXPIRY_WIRED = new Map<string, string>([
     for (const id of NOT_EXPIRY_WIRED.keys()) {
       expect(WIRED_EXPIRY_PROVIDERS, `${id} 同时在清单与豁免表里，语义矛盾`).not.toContain(id)
     }
+  })
+
+  /**
+   * ★ **逐 id 点名**（2026-10-29，Magicrew）。
+   *
+   * ## 为什么在「不变式三」之外还要这一条
+   *
+   * 上面那条是**结构性**判据（`AGGREGATE_CHANNELS ∩ runtime` 派生），它**抓得到**
+   * 漏接线，但报错形态是「一条集合差」—— 读报告的人看不到具体渠道名，
+   * 而本陷阱已复发 8 次、每次的教训都是「红得不够显眼 ⇒ 被当成 flaky 放过」。
+   * ⇒ 把三处**逐名字**钉死：漏任一处都在这个 id 上报红。
+   *
+   * ## ⚠️ `AGGREGATE_CHANNELS` 的可见性实情（本次核实，未改动）
+   *
+   * 它是 `AggregateAdapter` 的 `private static readonly`
+   * （`src/aggregate-adapter.ts`），**没有**导出。本用例**不**为测试把它改成
+   * public —— 生产可见性是设计约束（对外只有经存活路由过滤的那个访问器）。
+   * 改用本文件不变式三**已有**的取法：读源码字面量。理由同那里 ——
+   * 本守卫要判的是「作者有没有把它写进那张表」（编译期事实），
+   * 用运行时会退化成「宿主当前恰好装载了谁」。
+   *
+   * ⚠️ 抽不到字面量时**必须报红**（fail-closed）：改名/重构会让本守卫恒真。
+   */
+  it('★ magicrew 三处同时接线（漏任一处 ⇒ 聚合里静默看不到它）', () => {
+    // ① `AGGREGATE_CHANNELS`（模型层归并 —— 只加它不够，但缺了它连目录都进不来）
+    const source = readFileSync(
+      new URL('../../src/aggregate-adapter.ts', import.meta.url),
+      'utf8',
+    )
+    const start = source.indexOf('private static readonly AGGREGATE_CHANNELS')
+    expect(start, '抽不到 AGGREGATE_CHANNELS 定义（改名/重构会让本守卫恒真）').toBeGreaterThan(-1)
+    const block = source.slice(start, source.indexOf('])', start))
+    const channels = [...block.matchAll(/'([a-z][a-z0-9]*)'/gi)].map((m) => m[1]!)
+    expect(channels, '① aggregate-adapter.ts 的 AGGREGATE_CHANNELS 缺 magicrew').toContain('magicrew')
+    // ② 决定**候选表可见性**的那张表（只加 ① 而漏它就是本陷阱的形态）
+    expect(WIRED_EXPIRY_PROVIDERS, '② aggregate-expiry.ts 的 WIRED_EXPIRY_PROVIDERS 缺 magicrew')
+      .toContain('magicrew')
+    // ③ 折算原语真的挂进了表（`createProviderExpiry()` 是纯表，拿不到 service 实例）
+    expect(
+      Object.hasOwn(createProviderExpiry(), 'magicrew'),
+      '③ provider-expiry.ts 的 createProviderExpiry() 缺 magicrew',
+    ).toBe(true)
   })
 })
 

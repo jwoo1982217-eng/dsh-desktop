@@ -1,0 +1,52 @@
+# ⚠️ 测试 fixture 必须保持 **LF**（`text eol=lf`）。
+#
+# 背景（真实踩坑，2026-09-23）：
+# 本机 `git config core.autocrlf=true`，checkout 时会把仓库里的 LF 转成 CRLF。
+# 而 `tests/fixtures/reasoning-*.txt` 是**真实会话文本提取**，其字符偏移被测试
+# 精确断言（如 `reasoning-loop.spec.ts` 的 `cutAt === 1536/1600`）。
+# 一旦被转成 CRLF，会凭空多出 3082 个 `\r` 字符 ⇒ `cutAt` 变成 1792 ⇒
+# **两个断言失败**，且失败与任何代码改动无关（在纯基线上同样失败），
+# 极易被误判成「刚改的代码坏了」。
+#
+# ⚠️ **必须是 `text eol=lf`，不能写成 `-text`**（控制方第一版写错，经审查实测纠正）：
+#   - `-text`（不做规范化）只挡得住**检出**期的转换，**挡不住入库污染** ——
+#     实测：工作区已是 CRLF 时 `git add` 会把 48338 字节（含 617 个 `\r`）写入
+#     索引（HEAD 本为 47721），此后 `checkout` 把这些 `\r` 发给所有人，
+#     **偏移断言对全仓库永久失败且无法靠重新检出恢复**；
+#   - `text eol=lf` 同时具备两项能力：检出时写 LF，**入库时把 CRLF 规范化回 LF**
+#     （实测同样操作后索引仍为 47721 字节 / CR=0）。
+#
+# `**` 而非 `*`：gitattributes 的单星**不跨目录**（实测
+# `tests/fixtures/sub/nested.txt` 在单星规则下为 `unspecified`），
+# 用 `**` 才能覆盖将来可能出现的子目录。
+#
+# 新增依赖字符偏移的 fixture 时，放在 `tests/fixtures/` 下的任意层级即自动受保护。
+tests/fixtures/** text eol=lf
+
+# 自动检测文本文件，并强制在仓库中统一使用 LF 换行
+* text=auto eol=lf
+
+# ⚠️⚠️ **`#` 只能在行首当注释，行内注释会让整条规则失效**（2026-10-23 实测）：
+# 本文件初版写成 `*.bat text eol=crlf  # Windows 批处理…`，git 每次都报
+#     `# is not a valid attribute name: .gitattributes:31`
+# 且 `git check-attr eol -- dev.bat` 返回 **`lf`**（不是 `crlf`）——
+# 即「`*.bat` 保持 CRLF」这条规则**根本没生效**，Windows 脚本会被转成 LF。
+# ⇒ 注释一律**独立成行**，规则行只留 pattern 与属性。
+
+# 针对特定文件类型的特殊处理
+
+# Shell 脚本必须用 LF，否则在 Linux 上会因 \r 报错
+*.sh      text eol=lf
+# Windows 批处理文件必须用 CRLF（cmd.exe 的 goto/标签/^ 续行在纯 LF 下可能异常）
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+# 二进制文件不做任何换行转换，避免损坏
+*.png     binary
+
+# ⚠️ Markdown 文档**显式**声明为文本（2026-10-23 实测）：
+# 仅靠 `* text=auto` 时，`text=auto` 的**内容检测**会把
+# `docs/agent-notes/providers-trae.md` 判成非文本（`git ls-files --eol` 报
+# `i/-text w/-text`）⇒ 它那 660 个 CRLF 行尾**一直被跳过**、不会被规范化，
+# 而该文件实测**不含 NUL、无异常控制字符**（= 纯文本，只是行尾混杂）。
+# ⇒ 对「本该是文本」的一类文件给出显式规则，不要依赖 auto 检测。
+*.md      text eol=lf

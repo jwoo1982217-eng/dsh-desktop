@@ -36,7 +36,10 @@
   <script>
     (() => {
       const $ = id => document.getElementById(id);
-      const panel = new URL(location.href).searchParams.get('panel') || 'default';
+      const params = new URL(location.href).searchParams;
+      const panel = params.get('panel') || 'default';
+      const managed = params.get('managed') === '1' && /^mcp_[a-f0-9]{40}$/.test(panel);
+      document.documentElement.setAttribute('data-dsh-browser-managed', '');
       const endpoint = location.pathname.replace(/\/$/, '') + '/manage';
       const surface = $('surface'), image = $('screen'), keyboard = $('keyboard');
       let active = null, tabs = [], revision = 0, frameWidth = 1024, frameHeight = 768, busy = false, stopped = false, composing = false, visible = true;
@@ -135,7 +138,7 @@
       });
       window.addEventListener('pagehide',() => {
         stopped=true;controller.abort();clearTimeout(resizeTimer);
-        fetch(endpoint,{method:'POST',credentials:'same-origin',keepalive:true,headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:crypto.randomUUID(),method:'manage',payload:{panel,method:'release'}})}).catch(() => {});
+        fetch(endpoint,{method:'POST',credentials:'same-origin',keepalive:true,headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:crypto.randomUUID(),method:'manage',payload:{panel,method:managed?'pause':'release'}})}).catch(() => {});
       });
       async function poll() {
         if(stopped)return;

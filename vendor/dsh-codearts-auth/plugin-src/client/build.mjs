@@ -47,7 +47,13 @@ const result = await build({
   // 且使「用 includes 校验产物文案」的做法天然失效。改用 utf8 后产物保留原文，
   // 加载器按 utf8 读取 bundle（dsh-client-modules 用 "utf8" 解码），故安全。
   charset: 'utf8',
-  external: ['react', 'react-dom'],
+  // ⚠️ `@deepseek-ai/dsh-client-ui-primitives` 在宿主 `PLATFORM_MODULES` 里
+  //    （`packages/client/web/src/platform.ts`），属**隐式** external 基座 ——
+  //    这里必须 external 化（否则整棵 UI 库被打进产物，与平台模块表冲突），
+  //    但**不要**写进 package.json 的 `dsh.client.external`：
+  //    那份清单只放「基座之外」的精确请求（见 `packages/client/AGENTS.md`）。
+  //    `react` / `react-dom` 同理，一直是这个写法。
+  external: ['react', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives'],
   write: false,
   minify: process.env.NODE_ENV === 'production',
   legalComments: 'none',

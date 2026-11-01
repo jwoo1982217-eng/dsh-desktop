@@ -4,12 +4,24 @@
  * 这些产品同源：共用同一 CLI 内核、同一认证协议（cli-external-link）与同一套
  * ProductProvider 机制，差异全部收敛到这里，使多个 provider 共用一套实现。
  *
- * 实测依据（2026-09-14，逆向各产品 cli/product.json + 真实请求）：
+ * 配置依据（国内版 2026-10-27 本机 5.9.2 随包 product.json；国际版沿用原配置）：
  *
  * | 产品              | endpoint                    | platform       | genieVersion |
  * |-------------------|-----------------------------|----------------|--------------|
- * | CodeBuddy（中国） | https://copilot.tencent.com | ide            | —            |
- * | WorkBuddy（国际） | https://www.workbuddy.ai    | workbuddy-ai   | 5.5.2        |
+ * | WorkBuddy（中国） | https://www.workbuddy.cn    | workbuddy      | 5.9.2        |
+ * | WorkBuddy（国际） | https://www.workbuddy.ai    | workbuddy-ai   | 5.9.4        |
+ *
+ * ⚠️⚠️ **`genieVersion` 是本表最关键的一列**：客户端发出去的 `X-IDE-Version` 与
+ * `User-Agent` 里的版本**都取它**（反编译实证见 `CODEBUDDY.clientVersion` 的注释）。
+ * 它来自客户端 `product.json` 的 `genieVersion`，**不是**同文件的 `version`
+ * （后者是 VS Code 基底版本，只在 `genieVersion` 缺失时兜底）。
+ * 实测值来源（2026-10-30）：
+ * - CodeBuddy：`CodeBuddy CN/resources/app/product.json` → `version=1.106.1`、`genieVersion=4.12.2`
+ * - WorkBuddy：`WorkBuddyAI/resources/app.asar.unpacked/cli/product.json` → `genieVersion=5.9.4`
+ *
+ * ⚠️ **本仓仍缺一个客户端会发的头：`X-Product-Version`**（= 客户端的
+ * `productVersion`，与 `platformVersion` 是两个量）。官方拦截器会发它，我们没发。
+ * 当前不发也能 200（实测），故先登记为缺口、不擅自新增未验证的信号。
  *
  * 关于「模型列表为何不能共用」：两者的**路径与响应解析完全相同**
  * （`GET /v3/config` → `data.data.models` / `data.data.agents`），
@@ -67,8 +79,8 @@ export interface BuddyUserAgentRule {
  * 虽在国际版池中也可见，但仍沿用国内客户端形态（`WorkBuddy/<ver> WorkBuddy/...`），
  * 与 realm 无关。
  */
-const WORKBUDDY_UA_INTL = 'WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2'
-const WORKBUDDY_UA_CN = 'WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2'
+const WORKBUDDY_UA_INTL = 'WorkBuddy/5.9.4 WorkBuddy AI/5.9.4 CLI/5.9.4'
+const WORKBUDDY_UA_CN = 'WorkBuddy/5.9.4 WorkBuddy/5.9.4 CLI/5.9.4'
 
 /** 一个 CodeBuddy 系产品的全部差异配置。 */
 export interface BuddyProduct {
@@ -76,6 +88,8 @@ export interface BuddyProduct {
   id: 'buddy' | 'workbuddy'
   /** auth/state 的 platform 查询参数 */
   platform: string
+  /** 国内新版使用当前账号协议；国际版仍保留旧的 state 账户查询。 */
+  accountProtocol?: 'account-scoped'
   /**
    * API endpoint（含协议），所有 `/v2/plugin/*`、`/v3/config` 与 chat 请求
    * 都以此为基址。**这是不同区域产品之间最关键的差异**：模型池由它决定。
@@ -212,7 +226,7 @@ export interface BuddyProduct {
  * `src/buddy.ts` / `src/buddy-auth.ts` 改为从本模块取值后即可删除）：
  * - `platform: 'ide'`          ↔ `src/buddy.ts`  `PLATFORM`
  * - `productCode: 'codebuddy'` ↔ `src/buddy.ts`  `BUDDY_PRODUCT_CODE`
- * - `userAgent: 'CodeBuddyIDE/1.106.1'` ↔ `src/buddy.ts`  `BUDDY_USER_AGENT`
+ * - `userAgent: 'CodeBuddyIDE/4.12.2'` ↔ `src/buddy.ts`  `BUDDY_USER_AGENT`
  * - `defaultCredentialRef: 'BUDDY_ACCESS_TOKEN'` ↔ `src/buddy-auth.ts`  `BUDDY_CREDENTIAL_REF`
  * - `endpoint`/`apiDomain`     ↔ `src/buddy.ts`  `API_ENDPOINT` / `API_DOMAIN`
  *
@@ -325,42 +339,34 @@ const CODEBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
 
 export const CODEBUDDY: BuddyProduct = {
   id: 'buddy',
-  platform: 'ide',
-  endpoint: 'https://copilot.tencent.com',
-  apiDomain: 'copilot.tencent.com',
+  platform: 'workbuddy',
+  accountProtocol: 'account-scoped',
+  endpoint: 'https://www.workbuddy.cn',
+  apiDomain: 'www.workbuddy.cn',
   claimBase: 'https://www.workbuddy.cn',
   webBase: 'https://www.workbuddy.cn',
-  displayName: 'CodeBuddy (腾讯)',
-  productCode: 'codebuddy',
-  userAgent: 'CodeBuddyIDE/1.106.1',
-  // 中国版只有一条产品线，无需按模型分档：全部模型沿用 IDE UA。
+  // ⚠️ **版本字段的权威来源（上游 2026-10-30 反编译实证，与我们的取值互相印证）**：
+  //    `clientVersion` 必须等于客户端 `product.json` 的 `genieVersion`，
+  //    **不是**同文件的 `version`（那是 VS Code 基底，只在 `genieVersion` 缺失时兜底）。
+  //    客户端的 `getPlatformVersion()` 优先取 `genieVersion`，而
+  //    `X-IDE-Version` 与 `User-Agent` **同源**（都取它）⇒ 取错字段会让两者互相矛盾。
+  //    上游实测：CodeBuddy 的 `version=1.106.1` 而 `genieVersion=4.12.2`；
+  //    WorkBuddy 国际版 `genieVersion=5.9.4`（与「关于」里显示的 5.9.4 一致）。
+  //    ⚠️ 我们走 workbuddy.cn（WorkBuddy 国内版），故取 WorkBuddy 自己的版本线。
+  displayName: 'WorkBuddy (国内版)',
+  productCode: 'workbuddy',
+  userAgent: 'WorkBuddy/5.9.2 WorkBuddy/5.9.2 CLI/5.8.3',
+  // 对齐本机 WorkBuddy 5.9.2 随包的 CLI 5.8.3；保留 buddy 路由与账号引用。
   userAgentByModelFamily: [],
-  attributionName: 'CodeBuddy',
-  clientVersion: '1.106.1',
-  cliVersion: '2.137.1',
+  attributionName: 'WorkBuddy',
+  clientVersion: '5.9.2',
+  cliVersion: '5.8.3',
   defaultCredentialRef: 'BUDDY_ACCESS_TOKEN',
-  appendSessionParams: false,
-  // 合法登录站 / API 域：中国版登录站在 www.codebuddy.cn（`buddy.ts` 的
-  // WEBSITE_HOME），API 域是 copilot.tencent.com。两者都在本机真实凭据里出现过
-  // （12 条 `www.codebuddy.cn` + 8 条 `copilot.tencent.com`）。
-  //
-  // ⚠️⚠️ **`www.workbuddy.cn` 刻意不在这里**（虽然它是本产品的 `claimBase`）：
-  // 本字段的语义是「凭据里 `domain` 的合法值集合」，而 `domain` = token 的 `iss`
-  // 主机 = **登录站 / 认证 realm**。`www.workbuddy.cn` 是**成长中心网页站**
-  // （`claimBase` / `webBase`），**不签发 token**，因此永远不会作为 `iss` 出现在
-  // 凭据里 —— 把它登记进来属于**语义错位**。
-  //
-  // ⚠️ 更关键：`providerFromIssuer`（`plugin-src/client/backup-convert.js`）按
-  // 「host 含子串 `workbuddy`」分派，会把该域分派给 **workbuddy**；若这里也登记它，
-  // 两套判据对同一域给出**矛盾归属**（域表说 buddy、分派说 workbuddy）。
-  // 实测核对：登记它会让「knownDomains 归属 vs providerFromIssuer 归属」出现 1 处矛盾。
-  // ⇒ 两套判据必须同构：**只登记真正的 realm 主机**。
-  //
-  // ⚠️ 那「中国区旧 workbuddy 账号清不掉」怎么办？见 `knownDomains` 的注释：
-  // 未知域**保守保留**是刻意取舍（误留的代价远小于误删），且该域作为 realm
-  // **无任何实证**（本机 5 条 workbuddy 凭据的 `iss` 全是 `www.workbuddy.ai`）。
-  // 若将来拿到实证，正确修法是**同时**改分派判据与域表，不要只改一处。
-  knownDomains: ['copilot.tencent.com', 'www.codebuddy.cn', 'codebuddy.cn'],
+  appendSessionParams: true,
+  pluginVersion: '5.8.3',
+  // 国内 API 已迁往 WorkBuddy；本机新版账号的 token 仍由 codebuddy.cn realm 签发。
+  // 同时保留旧签发域，现有账号无须迁移、重命名或删除。
+  knownDomains: ['copilot.tencent.com', 'www.codebuddy.cn', 'codebuddy.cn', 'www.workbuddy.cn', 'workbuddy.cn'],
   fallbackModels: CODEBUDDY_FALLBACK_MODELS,
 }
 
@@ -480,7 +486,7 @@ const WORKBUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
 /**
  * WorkBuddy 国际版（腾讯 WorkBuddy AI），platform = workbuddy-ai。
  *
- * 逆向自 `C:\Users\Jet\AppData\Local\Programs\WorkBuddyAI`（5.5.2）的 cli/product.json：
+ * 逆向自 `C:\Users\Jet\AppData\Local\Programs\WorkBuddyAI`（5.9.4）的 cli/product.json：
  * - `applicationName` = "workbuddy-ai"
  * - `endpoint` = "https://www.workbuddy.ai"（**与中国版不同**，模型池随区域变化）
  * - `authentication.attributes.platform` = "workbuddy-ai"
@@ -533,11 +539,11 @@ export const WORKBUDDY: BuddyProduct = {
     { match: 'minimax-', ua: WORKBUDDY_UA_CN },
   ],
   attributionName: 'WorkBuddy',
-  clientVersion: '5.5.2',
-  cliVersion: '5.5.2',
+  clientVersion: '5.9.4',
+  cliVersion: '5.9.4',
   defaultCredentialRef: 'WORKBUDDY_ACCESS_TOKEN',
   appendSessionParams: true,
-  pluginVersion: '5.5.2',
+  pluginVersion: '5.9.4',
   // 国际版登录站与 API 域都是 www.workbuddy.ai（本机 5 条真实凭据的 iss 全是此值，
   // 且本产品的 `apiDomain` 自引入起就从未是 `.cn`）。
   // ⚠️ 这里列的是 `.ai` 的各 realm 主机形态。**没有 `.cn` 条目**：本机与 git 历史

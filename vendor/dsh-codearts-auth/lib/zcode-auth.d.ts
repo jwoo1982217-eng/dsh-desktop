@@ -618,6 +618,26 @@ export declare class ZcodeAuth extends Service {
      */
     fetchRemoteModelsOnly(): Promise<ZcodeRemoteModelLike[]>;
     /**
+     * 取「当前可领的全部 plan」—— **两个来源合并**（2026-10-23）。
+     *
+     * ## 为什么要两个来源（用户报障：1024 活动领不到）
+     *
+     * | 来源 | 端点 | 实测（本机 4 账号） |
+     * |---|---|---|
+     * | 每日赠送 | `GET /zcode-plan/billing/preview` | `plans` 里有 `…start-plan-trust-…` |
+     * | **营销投放** | `GET /marketing/touch` | **1024 活动只在这里**（preview 恒为空） |
+     *
+     * ⇒ 只查 preview 时，1024 那 5 亿 token 与「今天没有活动」在 wire 上**同形**
+     * （都是 `plans: []`），签到永远不会去领它。
+     *
+     * ⚠ **顺序与失败隔离**：preview 先（主路径），marketing 后（补充）；
+     *   marketing 失败一律降级为空数组（`fetchZcodeMarketingPlans` 自己兜住），
+     *   **绝不影响** preview 那条既有路径。
+     * ⚠ 串行而非并发：与本文件既有的「一步步发」风格一致（zcode 有反风控纪律，
+     *   见 `model-gate.ts`），且这里只多一跳只读请求。
+     */
+    private fetchAllClaimablePlans;
+    /**
      * 查签到状态。
      *
      * ## ⚠ 判据是「有没有可领的 plan」，**不是**「列表是否为空」

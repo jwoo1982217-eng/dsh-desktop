@@ -38,6 +38,15 @@ function adapters(): string[] {
 describe('工具定义下发（防回归：15 个适配器，只有 officeace 曾漏）', () => {
   it('① 除聚合/路由类外，每个适配器都必须处理 tools', () => {
     // aggregate / auto 是路由层（转发给别的适配器），自身不需要 tools。
+    // ⚠️⚠️ **codely 已从豁免中撤销**（2026-10-22 对抗审计 M-5）。
+    //    旧豁免理由写的是「推理网关要求 HMAC 签名、密钥未取得 ⇒ 不发请求」，
+    //    而那条**已被同一个 PR 自己证伪**：`codely-sign.ts` 已把 SECRET 硬编码、
+    //    与官方 npm 包逐字节对拍通过，端到端实测 200。它**确实发推理请求**
+    //    （且会带 tools）⇒ 豁免已失效，必须撤销。
+    //    ⚠️ 这正是本仓库记过的豁免腐坏形态：「写了一个豁免 + 一句当时真、
+    //    后来假的理由」⇒ 它会静默地一直豁免下去（同时实测：把
+    //    `codely-adapter.ts` 的 tools 下发真删掉，本文件 7 条仍全绿）。
+    //    ⚠️ 保留的两个豁免是**路由层**（它们转发给别的适配器，自身不组装 tools）。
     const exempt = new Set(['aggregate-adapter.ts', 'auto-adapter.ts', 'opencode-hybrid-adapter.ts'])
     const missing = adapters().filter((f) => {
       if (exempt.has(f)) return false
@@ -101,5 +110,58 @@ describe('DSML 协议常量（必须与解析器一致）', () => {
     expect(needsDsmlToolMode('deepseek-v4-pro', [])).toBe(true)
     // 非 v4 不该被误伤
     expect(needsDsmlToolMode('kimi-k2.6', [])).toBe(false)
+  })
+  /**
+   * ★★ **codely 必须真的把 `tools` 放进请求体**（2026-10-22 对抗审计 M-15）。
+   *
+   * ## 为什么上面那条（源码文本判据）不够
+   *
+   * 上面用 `readFileSync(...).includes('tools')` —— 实测：把 `codely-adapter.ts` 里
+   * **真正下发 tools 的那段** 整体删掉（改成恒不发），本文件 7 条
+   * **仍然全绿** —— 因为 `tools` 这个词还在别的地方出现（注释、
+   * `options.tools?.length` 判据、`forceToolChoice` 分支…）。本仓库已将这种
+   * 「源码文本断言」列为红线（`if (false)` 短路就能骗过）。
+   *
+   * ## 判据
+   *
+   * 真跑一次 `stream()`，**拉下真实请求体**看 `tools` / `tool_choice` 在不在。
+   * 反向对照：不传 `tools` 的纯聊天请求不得带这两个字段（否则上游可能因空工具集报错）。
+   */
+  it('★★ codely：带工具时请求体必须真有 tools；纯聊天时不得有', async () => {
+    const { CodelyAdapter } = await import('../../src/codely-adapter.js')
+    const bodies: Array<Record<string, unknown>> = []
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('/api/api-token/cli-api-key')) {
+        return new Response(JSON.stringify({ cli_api_key: 'sk-x' }), { status: 200 })
+      }
+      bodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: 'hi' }, finish_reason: 'stop' }] })}\n\n`
+        + 'data: [DONE]\n\n',
+        { status: 200 },
+      )
+    }) as never
+    const make = () => new CodelyAdapter({
+      credentialProvider: async () => ({ access_token: 't', refresh_token: 'r' } as never),
+      fetchImpl,
+    } as never)
+    const drain = async (opts: Record<string, unknown>) => {
+      bodies.length = 0
+      for await (const _c of make().stream(opts as never)) { /* drain */ }
+      return bodies[0]
+    }
+
+    const WITH_TOOLS = [{ name: 'write_file', description: 'w', parameters: { type: 'object', properties: {} } }]
+    const withTools = await drain({ model: 'codely-flash', messages: [{ role: 'user', content: 'go' }], tools: WITH_TOOLS })
+    // ① 决定性断言：`tools` 必须真的在请求体里
+    expect(withTools?.tools, 'codely 带工具时必须下发 tools（否则模型只能把调用写进正文）')
+      .toBeDefined()
+    expect(Array.isArray(withTools!.tools), 'tools 必须是数组').toBe(true)
+    expect((withTools!.tools as unknown[]).length, '下发的工具数必须与传入一致').toBe(1)
+
+    // ② 反向对照：纯聊天不得带 tools / tool_choice
+    const chatOnly = await drain({ model: 'codely-flash', messages: [{ role: 'user', content: 'hi' }] })
+    expect('tools' in (chatOnly ?? {}), '纯聊天不得发 tools').toBe(false)
+    expect('tool_choice' in (chatOnly ?? {}), '纯聊天不得发 tool_choice').toBe(false)
   })
 })

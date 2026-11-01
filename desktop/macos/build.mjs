@@ -6,6 +6,7 @@ import {fileURLToPath, pathToFileURL} from 'node:url';
 import path from 'node:path';
 import {rebaseReleaseLinks} from './release-links.mjs';
 import {JETHUB_PACKAGE, JETHUB_LEGACY_PACKAGE} from '../../scripts/jethub-package.mjs';
+import {resolveOfmSource, verifyPackagedOfm, resolveJetHubSource, verifyPackagedJetHub} from '../plugin-sources.mjs';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(directory, '../..');
@@ -26,6 +27,8 @@ while (args.length) {
   else throw Error('Usage: node desktop/macos/build.mjs [--out DIR] [--our-free-model SOURCE]');
 }
 if (process.platform !== 'darwin' || process.arch !== 'arm64') throw Error('此安装包需在 Mac arm64 上构建。');
+const ofmSource = await resolveOfmSource(root, ourFree);
+const jetHubSource = await resolveJetHubSource(root);
 const work = path.join(output, 'work');
 await mkdir(output, {recursive: true});
 if (!reuseRuntime) await rm(work, {recursive: true, force: true});
@@ -37,12 +40,12 @@ await cp(path.join(root, 'desktop-runtime/node_modules'), modules, {recursive: t
   filter: from => !['.cache', '.install-lock', '.DS_Store'].includes(path.basename(from))});
 
 const sources = {
-  [JETHUB_PACKAGE]: 'vendor/dsh-codearts-auth', '@zseven-w/dsh-noema': 'vendor/dsh-noema',
+  [JETHUB_PACKAGE]: jetHubSource.directory, '@zseven-w/dsh-noema': 'vendor/dsh-noema',
   'dsh-peer': 'peer', 'dsh-local-knowledge': 'knowledge', 'dsh-desktop-browser': 'desktop-browser', 'dsh-team': 'team',
   'dsh-desktop-chatgpt': 'desktop-chatgpt', 'dsh-appearance-center': 'appearance',
   'dsh-model-routing': 'model-routing', 'dsh-knowledge-workbench': 'knowledge-workbench',
 };
-if (ourFree) sources['dsh-our-free-model'] = ourFree;
+sources['dsh-our-free-model'] = ofmSource.directory;
 const rejected = new Set(['node_modules', '.git', 'build-delivery', '.env', '.DS_Store', 'credentials', 'sessions']);
 for (const [name, relative] of Object.entries(sources)) {
   const source = path.resolve(root, relative), target = path.join(modules, name);
@@ -96,6 +99,8 @@ await writeFile(path.join(work, 'bin/NODE-LICENSE.txt'), await nodeLicense.text(
 await writeFile(path.join(runtime, 'THIRD-PARTY-NOTICES.txt'), `DSH desktop ${appInfo.version}\nDSH core: @deepseek-ai/dsh 0.2.1-alpha.4\nElectron: 44.7.2 (MIT), Chromium notices are in the application Resources.\nNode.js: ${process.versions.node}; see ../bin/NODE-LICENSE.txt\nDependency license files are retained alongside each package.\nThis package contains program files only. No account, cookie, API key, chat or skill data is included.\n`);
 await writeFile(path.join(work, 'runtime-receipt.json'), JSON.stringify({files, links}));
 }
+await verifyPackagedOfm(modules, ofmSource);
+await verifyPackagedJetHub(modules, jetHubSource);
 // OpenCode CLI 与 Node 同目录交付，依赖内容由固定哈希核验。
 execFileSync('python3', [path.join(root, 'scripts/prepare-opencode-native.py'), '--target', 'darwin-arm64'], {stdio: 'inherit'});
 await mkdir(path.join(work, 'bin'), {recursive: true});

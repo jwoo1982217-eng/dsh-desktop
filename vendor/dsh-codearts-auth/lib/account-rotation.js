@@ -5,6 +5,10 @@ export function rotationRequest(provider) {
     const request = requests.getStore();
     return request?.provider === provider ? request : undefined;
 }
+/** 目录与控制面读取不继承推理请求的选号锁、余额资格或失败换号上下文。 */
+export function withoutAccountRotation(read) {
+    return requests.exit(read);
+}
 /** 在迭代器的每一步恢复上下文，覆盖准备后的 stream、异常与取消清理。 */
 export function rotatingStream(provider, model, create, signal) {
     return {

@@ -88,6 +88,7 @@ export {
   buildLinuxSkipTaskbarArgs,
   buildMacosMiniaturizeArgs,
   findBrowserExecutable,
+  isBrowserDeploymentError,
   isEdgeExecutable,
   parseWmctrlList,
 } from './chromium-session.js'

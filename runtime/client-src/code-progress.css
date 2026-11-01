@@ -1,0 +1,22 @@
+.dsh-code-progress{min-width:0;margin:8px 0 16px;border:1px solid var(--dsw-alias-border-l1,#ffffff28);border-radius:12px;overflow:hidden;background:var(--dsw-alias-bg-module-platform,#17212b)}
+.dsh-code-progress-heading{display:flex;align-items:center;gap:9px;box-sizing:border-box;width:100%;min-height:42px;padding:10px 14px;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer;font:inherit}
+.dsh-code-progress-heading:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary,#5d9cff);outline-offset:-3px}
+.dsh-code-progress-path{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;flex:1}
+.dsh-code-progress-state{font-size:12px;flex-shrink:0;opacity:.85}
+.dsh-code-progress[data-state=error] .dsh-code-progress-state{color:#ef7272}
+.dsh-code-progress-content{min-width:0;max-height:520px;overflow:auto;overscroll-behavior:contain;border-top:1px solid var(--dsw-alias-border-l1,#ffffff28)}
+.dsh-code-progress .md-code-block{margin:0!important;border:0;border-radius:0}
+.dsh-code-progress .md-code-block pre{font-size:13px;line-height:1.65}
+/* 保留主题提供的语法色；主题缺少 Shiki 变量时仍有可见的分类颜色。 */
+.dsh-code-progress code span[style*="--shiki-token-keyword"]{color:var(--shiki-token-keyword,#9f4fd0)!important}
+.dsh-code-progress code span[style*="--shiki-token-function"]{color:var(--shiki-token-function,#3478c2)!important}
+.dsh-code-progress code span[style*="--shiki-token-string-expression"]{color:var(--shiki-token-string-expression,#229579)!important}
+.dsh-code-progress code span[style*="--shiki-token-constant"]{color:var(--shiki-token-constant,#ce5b31)!important}
+.dsh-code-progress code span[style*="--shiki-token-parameter"]{color:var(--shiki-token-parameter,#9c6a3c)!important}
+.dsh-code-progress code span[style*="--shiki-token-comment"]{color:var(--shiki-token-comment,#768390)!important}
+.dsh-code-progress code span[style*="--shiki-token-punctuation"]{color:var(--shiki-token-punctuation,var(--dsw-alias-label-secondary,#475467))!important}
+.dsh-code-progress code span[style*="--shiki-foreground"]{color:var(--shiki-foreground,var(--dsw-alias-label-primary,#182230))!important}
+.dsh-code-progress-result{padding:12px 14px;border-top:1px solid var(--dsw-alias-border-l1,#ffffff28);font-size:12px}
+.dsh-code-progress-result pre{white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--ds-font-family-code,monospace);font-size:12px;line-height:1.6;margin:7px 0 0}
+.dsh-code-progress-note{padding:8px 14px;font-size:12px;opacity:.75}
+@media(max-width:600px){.dsh-code-progress-heading{flex-wrap:wrap;gap:6px}.dsh-code-progress-state{width:100%;padding-left:20px}.dsh-code-progress-content{max-height:400px}}

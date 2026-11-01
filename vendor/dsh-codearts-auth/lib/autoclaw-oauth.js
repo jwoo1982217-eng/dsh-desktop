@@ -5,9 +5,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import http from 'node:http';
+import os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { resolveAutoclawAppData, readMacAutoclawCredential, AutoclawLocalStorageError } from './autoclaw-local-storage.js';
+import { desktopCredentialImportAvailable } from './login-platform.js';
 import { AUTOCLAW, AUTOCLAW_SOURCE_ID, AUTOCLAW_CLIENT_VERSION, } from './autoclaw-product.js';
 import { AUTOCLAW_REFRESH_PATH, AUTOCLAW_REFRESH_FALLBACK_PATH, AUTOCLAW_MODEL_CONFIG_PATH, AUTOCLAW_REQUEST_TIMEOUT_MS, calculateAutoclawSign, cleanBearerToken, readUserIdFromJwt, autoclawExpiresAtMs, autoclawAccessTokenExpiresAtMs, } from './autoclaw.js';
+import { isDefinitiveRefreshRejection, refreshFailureFromResponse } from './refresh-failure.js';
 export const AUTOCLAW_SEND_CODE_PATH = '/userapi/v1/agent-send-code';
 export const AUTOCLAW_LOGIN_PATH = '/userapi/v1/agent-login';
 // ── Z.ai OAuth（**仅国际版**，2026-10-20 逆向+实测） ─────────────────────
@@ -171,7 +175,7 @@ export async function exchangeAutoclawZaiCode(code, state, navigateUri, options)
 /** 手机号格式正则（中国大陆11位手机号）。 */
 export const PHONE_NUMBER_RE = /^1[3-9]\d{9}$/;
 /**
- * 从本地 Windows DPAPI 及 AES-256-GCM 探测 AutoClaw 桌面端保存的有效凭据（一键导入模式）。
+ * 读取本机 AutoClaw 登录凭据：Mac 钥匙串/CBC，Windows DPAPI/GCM。
  *
  * ## ⚠️⚠️ 凭据来源是**用户真实凭据**，故必须可隔离（2026-10-17 审计 P0 修复）
  *
@@ -189,16 +193,14 @@ export const PHONE_NUMBER_RE = /^1[3-9]\d{9}$/;
  */
 export async function probeAutoclawLocalCredential(options) {
     try {
-        const appData = options?.customAppData
-            // ⚠️ 测试隔离口必须**排在 `APPDATA` 之前**，否则隔离形同虚设。
-            ?? process.env.DSH_AUTOCLAW_APPDATA
-            ?? process.env.APPDATA
-            ?? (process.env.USERPROFILE ? path.join(process.env.USERPROFILE, 'AppData', 'Roaming') : undefined);
+        const appData = resolveAutoclawAppData(options?.customAppData);
         if (!appData)
             return undefined;
         const appDirName = options?.product?.userDataDirName
             ?? options?.appDirName
             ?? AUTOCLAW.userDataDirName;
+        if (os.platform() === 'darwin')
+            return await readMacAutoclawCredential(path.join(appData, appDirName));
         const localStatePath = path.join(appData, appDirName, 'Local State');
         if (!fs.existsSync(localStatePath))
             return undefined;
@@ -304,7 +306,9 @@ export async function probeAutoclawLocalCredential(options) {
         }
         return undefined;
     }
-    catch {
+    catch (error) {
+        if (error instanceof AutoclawLocalStorageError)
+            throw error;
         return undefined;
     }
 }
@@ -316,6 +320,7 @@ export async function refreshAutoclawToken(refreshToken, options) {
     const fetcher = options?.fetchImpl ?? fetch;
     const cleanRefresh = cleanBearerToken(refreshToken);
     const deviceId = options?.deviceId ?? 'dsh-autoclaw-device-001';
+    const timeoutMs = options?.timeoutMs ?? AUTOCLAW_REQUEST_TIMEOUT_MS;
     const endpoints = [AUTOCLAW_REFRESH_PATH, AUTOCLAW_REFRESH_FALLBACK_PATH];
     let lastError;
     for (const ep of endpoints) {
@@ -336,15 +341,58 @@ export async function refreshAutoclawToken(refreshToken, options) {
                     source_id: AUTOCLAW_SOURCE_ID,
                     device_id: deviceId,
                 }),
-                signal: AbortSignal.timeout(AUTOCLAW_REQUEST_TIMEOUT_MS),
+                signal: AbortSignal.timeout(timeoutMs),
             });
             if (!resp.ok) {
                 const text = await resp.text().catch(() => '');
-                throw new Error(`AutoClaw token refresh failed with status ${resp.status}: ${text}`);
+                /**
+                 * ⚠️⚠️ **必须抛结构化错误**（2026-10-27 审计修）。
+                 *
+                 * 修前是裸 `new Error('... failed with status N: <body>')` —— 状态码只在
+                 * 文案里，而 `autoclaw-auth.ts` 的终态判据只能 `msg.includes(...)` 捞词，
+                 * 于是 `503` 报文里出现 `expired` / `Invalid token` / `401` 三个字符就
+                 * 把健康账号判死（`refreshable:false` 是**单向门**，永不自愈）。
+                 *
+                 * ⇒ 现在把 `status` 与上游 OAuth `error` 一起带出来，判据读结构化字段。
+                 * ⚠️ 响应体可能不是 JSON（网关 HTML 页）⇒ 解析失败时只带状态码。
+                 */
+                let parsed;
+                try {
+                    parsed = JSON.parse(text);
+                }
+                catch {
+                    parsed = undefined;
+                }
+                /**
+                 * ⚠️⚠️ **必须按业务码信封的键读 `msg`**（2026-10-27 第二轮审计打穿）。
+                 *
+                 * 本家的「token 无效」有两种载体：OAuth 的 `{error}` 与**业务码信封**
+                 * 的 `{code, msg}`。修前这里用默认键 `'error'` ⇒ 遇到
+                 * `HTTP 400 {code:401,msg:"Invalid token"}` 时 `oauthError` 是
+                 * `undefined` ⇒ 终态判据拿不到结构化信息，只能退回文案启发式（而文案里
+                 * 那句 `msg` 还会被整段拼进 message ⇒ 既可能漏判、又丢失原文）。
+                 *
+                 * ⇒ `refreshFailureFromResponse` 现在**两把键都读**（见其 doc），
+                 *   这里不必再改调用点形态。
+                 */
+                throw refreshFailureFromResponse(`AutoClaw token refresh failed`, resp.status, parsed);
             }
             const json = (await resp.json());
             if (json.code !== 0 || !json.data?.access_token) {
-                throw new Error(`AutoClaw token refresh returned code ${json.code}: ${json.msg ?? 'unknown'}`);
+                /**
+                 * ⚠️⚠️ 业务码信封（HTTP 200 + `{code, msg}`）也必须**结构化**。
+                 *
+                 * AutoClaw 用它自己的词汇表达「token 无效」—— 实测是 `msg: "Invalid token"`，
+                 * **不是** OAuth 的 `invalid_grant`。所以这里把 `msg` 作为 `oauthError` 带出，
+                 * 并由调用点（`autoclaw-auth.ts`）在
+                 * `isTerminalRefreshFailure(err, AUTOCLAW_TERMINAL_OAUTH_ERRORS)` 里
+                 * **显式声明**自己的词表 —— 而不是把宽词塞回共享模块（那样又会退化成一个
+                 * 大正则管所有家，正是本模块存在的理由）。
+                 *
+                 * ⚠️ 状态码用 `200`（信封在 HTTP 200 里）：`isTerminalRefreshFailure`
+                 * 只对 `400` / `200` 两种「确定性拒绝」判定终态，5xx 一律非终态。
+                 */
+                throw refreshFailureFromResponse('AutoClaw token refresh returned non-zero code', 200, json, 'msg');
             }
             const newAccess = cleanBearerToken(json.data.access_token);
             const newRefresh = json.data.refresh_token ? cleanBearerToken(json.data.refresh_token) : cleanRefresh;
@@ -381,7 +429,20 @@ export async function refreshAutoclawToken(refreshToken, options) {
             };
         }
         catch (err) {
-            lastError = err instanceof Error ? err : new Error(String(err));
+            const error = err instanceof Error ? err : new Error(String(err));
+            /**
+             * ⚠️⚠️ **别让瞬时的端点错误掩盖确定性拒绝**（2026-10-27 第二轮审计打穿）。
+             *
+             * 本函数**依次试两个端点**。修前无条件覆盖：
+             * 端点1 回 `400 invalid_grant`（上游明确说这把 RT 死了）、端点2 回 `503`
+             * （网关瞬时抖动）⇒ 最终抛的是 **503** ⇒ 上层判据看不到那次确定性拒绝
+             * ⇒ 真死号不标死、退化成每轮白撞。
+             *
+             * ⇒ 一旦拿到「确定性拒绝」，就**锁定它**（后续端点的错误不再覆盖）。
+             */
+            if (lastError === undefined || !isDefinitiveRefreshRejection(lastError)) {
+                lastError = error;
+            }
         }
     }
     throw lastError ?? new Error('AutoClaw token refresh failed on all endpoints');
@@ -430,9 +491,10 @@ function resolveDeviceId(product, explicitId) {
         //   桌面端设备号。测试里读到它会让断言依赖开发机状态（本仓库 `QODER_RUNTIME_INFO`
         //   隔离的正是同款问题），而设备号会进登录/签到请求体 ⇒ 结果不可复现。
         //   ⚠️ 隔离口优先级必须与 `probeAutoclawLocalCredential` **一致**。
-        const p = path.join(process.env.DSH_AUTOCLAW_APPDATA
-            ?? process.env.APPDATA
-            ?? path.join(process.env.USERPROFILE ?? '', 'AppData', 'Roaming'), product.userDataDirName, 'device', 'device-id.json');
+        const root = resolveAutoclawAppData();
+        if (!root)
+            return crypto.randomUUID();
+        const p = path.join(root, product.userDataDirName, 'device', 'device-id.json');
         if (fs.existsSync(p)) {
             const data = JSON.parse(fs.readFileSync(p, 'utf8'));
             if (typeof data.deviceId === 'string' && data.deviceId.trim()) {
@@ -598,12 +660,102 @@ export async function loginAutoclawWithCode(phone, code, options) {
         return { ok: false, error: msg };
     }
 }
+/** 国际版复用官方 Z.ai 授权及换 token 协议；浏览器与回调均在当前设备。 */
+export async function startAutoclawZaiLoginFlow(options) {
+    const product = options.product;
+    if (product?.id !== 'autoclawintl')
+        throw new Error('Z.ai 登录仅适用于 AutoClaw 国际版');
+    let resolve;
+    let reject;
+    let finished = false;
+    let exchanging = false;
+    const abort = new AbortController();
+    const result = new Promise((yes, no) => { resolve = yes; reject = no; });
+    const fail = (error) => { if (!finished) {
+        finished = true;
+        reject(error);
+    } };
+    let redirectUri = '';
+    const server = http.createServer(async (req, res) => {
+        const url = new URL(req.url ?? '/', redirectUri);
+        if (req.method !== 'GET' || url.pathname !== AUTOCLAW_OAUTH_CALLBACK_PATH) {
+            res.writeHead(404).end('Not Found');
+            return;
+        }
+        if (finished || exchanging) {
+            res.writeHead(409).end('Login already handled');
+            return;
+        }
+        const code = url.searchParams.get('code') ?? '';
+        const state = url.searchParams.get('state') ?? '';
+        if (!code || !state || code.length > 8192 || state.length > 8192) {
+            res.writeHead(400).end('Authorization code and state required');
+            return;
+        }
+        exchanging = true;
+        try {
+            const fetcher = (input, init) => (options.fetchImpl ?? fetch)(input, {
+                ...init, signal: init?.signal ? AbortSignal.any([abort.signal, init.signal]) : abort.signal,
+            });
+            const exchanged = await exchangeAutoclawZaiCode(code, state, redirectUri, { ...options, fetchImpl: fetcher });
+            if (finished) {
+                res.writeHead(410).end('Login cancelled');
+                return;
+            }
+            if (!exchanged.ok || !exchanged.credential)
+                throw new Error('AutoClaw 国际版授权失败，请重新登录。');
+            res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }).end('授权成功，请返回 DSH。');
+            finished = true;
+            resolve({ credential: exchanged.credential, phone: '' });
+        }
+        catch (error) {
+            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }).end('授权未完成，请返回 DSH 重试。');
+            fail(error);
+        }
+    });
+    // 官方客户端候选端口保持不变；只绑定回环，不启动桌面浏览器进程。
+    let listening = false;
+    for (const port of options.callbackPorts ?? AUTOCLAW_OAUTH_CALLBACK_PORTS) {
+        try {
+            await new Promise((yes, no) => {
+                server.once('error', no);
+                server.listen(port, '127.0.0.1', () => { server.removeListener('error', no); yes(); });
+            });
+            listening = true;
+            break;
+        }
+        catch (error) {
+            if (error.code !== 'EADDRINUSE')
+                throw error;
+        }
+    }
+    if (!listening)
+        throw new Error('AutoClaw 登录回调端口被占用，请结束其他登录后重试。');
+    const address = server.address();
+    if (!address || typeof address === 'string')
+        throw new Error('AutoClaw 登录回调端口不可用');
+    redirectUri = `http://localhost:${address.port}${AUTOCLAW_OAUTH_CALLBACK_PATH}`;
+    let closed = false;
+    const close = async () => {
+        if (closed)
+            return;
+        closed = true;
+        fail(new Error('AutoClaw 登录已取消'));
+        abort.abort();
+        await new Promise((yes) => server.close(() => yes()));
+    };
+    const timer = setTimeout(() => fail(new Error('AutoClaw 国际版登录超时，请重试。')), options.timeoutMs ?? 180_000);
+    timer.unref?.();
+    void result.catch(() => { }).finally(() => { clearTimeout(timer); void close(); });
+    return { loginUrl: buildAutoclawZaiAuthUrl(redirectUri), result, close };
+}
 /**
  * 启动本地独立服务器承载 AutoClaw 登录授权页（支持一键读取本地凭据或手机验证码登录）。
  */
 export async function startAutoclawSmsLoginFlow(options) {
     const product = options?.product ?? AUTOCLAW;
     const timeoutMs = options?.timeoutMs ?? 180_000;
+    const allowLocalImport = desktopCredentialImportAvailable();
     let settleOk;
     let settleErr;
     const result = new Promise((resolve, reject) => {
@@ -650,9 +802,8 @@ export async function startAutoclawSmsLoginFlow(options) {
 <body>
   <div class="card">
     <h2>AutoClaw 账号登录</h2>
-    <p class="desc">支持一键读取本机桌面端凭据，或通过手机验证码快速登录。</p>
-    <button type="button" class="btn-secondary" id="btnLocal">⚡ 一键读取本机 AutoClaw 桌面端凭据</button>
-    <div class="divider">或者使用手机验证码登录</div>
+    <p class="desc">${allowLocalImport ? '支持读取本机桌面端凭据，或通过手机验证码登录。' : '使用 AutoClaw 国内账号的手机验证码登录，凭据保存在本机 DSH。'}</p>
+    ${allowLocalImport ? '<button type="button" class="btn-secondary" id="btnLocal">⚡ 一键读取本机 AutoClaw 桌面端凭据</button><div class="divider">或者使用手机验证码登录</div>' : ''}
     <div class="input-group">
       <label for="phone">手机号</label>
       <input type="tel" id="phone" placeholder="请输入 11 位手机号" maxlength="11" />
@@ -675,7 +826,7 @@ export async function startAutoclawSmsLoginFlow(options) {
     const btnLogin = document.getElementById('btnLogin');
     const msgBox = document.getElementById('msgBox');
     function showMsg(type, text) { msgBox.className = 'msg ' + type; msgBox.textContent = text; msgBox.style.display = 'block'; }
-    btnLocal.addEventListener('click', async () => {
+    btnLocal?.addEventListener('click', async () => {
       btnLocal.disabled = true;
       btnLocal.textContent = '正在检测本地凭据...';
       try {
@@ -791,6 +942,11 @@ export async function startAutoclawSmsLoginFlow(options) {
                     return;
                 }
                 if (url.pathname === '/autoclaw/import-local') {
+                    if (!allowLocalImport) {
+                        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+                        res.end(JSON.stringify({ ok: false, error: '手机端不读取桌面客户端，请使用短信登录。' }));
+                        return;
+                    }
                     /**
                      * ⚠️⚠️ **必须传 `product`**（2026-10-20 审计 P0 实测复现）。
                      *

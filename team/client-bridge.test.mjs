@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFileSync} from 'node:fs';
+import {adaptClient} from './build-client.mjs';
+import {renderToStaticMarkup} from 'react-dom/server';
 const source=readFileSync(new URL('./client-bridge.js',import.meta.url),'utf8');
 function fixture(){
  const listeners=new Set(),timers=new Map(),cleanup=[],opened=[];let mode='bot',next=0,rows={};
@@ -29,4 +31,14 @@ test('completed turns stay clear while failed compaction gets one explicit statu
  assert.equal(outcome({turn:{end:{data:{reason:{kind:'completed'}}}}}),null);
  const node=outcome({turn:{end:{data:{reason:{kind:'error',error:{code:'COMPACTION_FAILED'}}}}}});
  assert.match(node.props.children,/停止重复尝试/);assert.equal(node.props.role,'status');
+});
+test('built client renders failed and interrupted turns as React elements',()=>{
+ const upstream=readFileSync(new URL('./vendor/ds-bot/client.js',import.meta.url),'utf8').replaceAll('\r\n','\n');
+ const output=adaptClient(upstream,source),start=output.indexOf('function DshTurnOutcome('),end=output.indexOf('function installTeamBridge(',start);
+ const outcome=vm.runInNewContext(output.slice(start,end)+'\nDshTurnOutcome',{Symbol});
+ for(const reason of [{kind:'interrupted'},{kind:'error',error:{code:'COMPACTION_FAILED'}}]){
+  const markup=renderToStaticMarkup(outcome({turn:{end:{data:{reason}}}}));
+  assert.match(markup,/role="status"/);assert.match(markup,/本轮未完成|本轮已中断/);
+ }
+ assert.equal(outcome({turn:{end:{data:{reason:{kind:'completed'}}}}}),null);
 });

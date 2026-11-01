@@ -3,15 +3,15 @@ import { CODEBUDDY, WORKBUDDY, productById } from '../../src/product.js'
 import { isKnownReasoningEffort } from '../../src/reasoning-ladder.js'
 
 describe('产品配置', () => {
-  it('CodeBuddy 使用 ide platform、codebuddy 产品码与中国区端点', () => {
+  it('国内入口使用 WorkBuddy 当前账号协议，保留 buddy 路由', () => {
     expect(CODEBUDDY).toMatchObject({
       id: 'buddy',
-      platform: 'ide',
-      endpoint: 'https://copilot.tencent.com',
-      apiDomain: 'copilot.tencent.com',
-      productCode: 'codebuddy',
+      platform: 'workbuddy',
+      endpoint: 'https://www.workbuddy.cn',
+      apiDomain: 'www.workbuddy.cn',
+      productCode: 'workbuddy',
       defaultCredentialRef: 'BUDDY_ACCESS_TOKEN',
-      appendSessionParams: false,
+      appendSessionParams: true,
     })
   })
 
@@ -43,14 +43,14 @@ describe('产品配置', () => {
   })
 
   it('WorkBuddy 携带 pluginVersion 且 appendSessionParams 为 true', () => {
-    // 逆向自 WorkBuddyAI 5.5.2 的 cli/product.json
-    expect(WORKBUDDY.pluginVersion).toBe('5.5.2')
+    // 逆向自 WorkBuddyAI 5.9.4 的 cli/product.json
+    expect(WORKBUDDY.pluginVersion).toBe('5.9.4')
     expect(WORKBUDDY.appendSessionParams).toBe(true)
   })
 
-  it('CodeBuddy 不需要追加会话参数', () => {
-    expect(CODEBUDDY.appendSessionParams).toBe(false)
-    expect(CODEBUDDY.pluginVersion).toBeUndefined()
+  it('国内 WorkBuddy 携带随包 CLI 版本参数', () => {
+    expect(CODEBUDDY.appendSessionParams).toBe(true)
+    expect(CODEBUDDY.pluginVersion).toBe('5.8.3')
   })
 
   it('两个产品的 endpoint 都是 HTTPS', () => {

@@ -939,6 +939,113 @@ describe('MinimaxAdapter 请求级账号轮换（余额耗尽无感切号）', (
     expect(picks).toHaveLength(0)
   })
 
+  /**
+   * ★★ **请求前临期预判**：剩余不足 60s ⇒ 先续期再发（PR 从
+   * `isMinimaxExpired` 收紧过来的那条腿）。
+   *
+   * ## 为什么必须新增（2026-10-27 审计）
+   *
+   * 下面那条 401 用例的注释写着「临期路径有专门用例守」—— **但它并不存在**：
+   * 子审计员实测 `grep isMinimaxExpiringWithin tests/` **零命中**，于是
+   * `MINIMAX_ONDEMAND_MIN_VALIDITY_MS` 从 `60_000` 改成 `0`（= 退回旧判据）
+   * 与把 adapter 改回 `isMinimaxExpired`，**全量测试都是绿的**。
+   *
+   * 这一格的真实后果：token 会在「临死前」不被换新 ⇒ 用户的请求撞在正在
+   * 死掉的 token 上 ⇒ 401 白打一轮（PR 描述的原始缺陷）。
+   */
+  it('★★ 临期预判：剩余 30 秒 ⇒ 请求前先续期，且**只发一次**上游请求', async () => {
+    let refreshCalls = 0
+    let upstreamCalls = 0
+    const adapter = makeRotateAdapter({
+      // 剩余 30s：新判据说「该续」，旧判据（isMinimaxExpired）说「不用续」
+      resolveCredential: async () => ({ ...CRED_A, expires_at: String(Date.now() + 30_000) }),
+      refresh: async () => { refreshCalls += 1 },
+    })
+    const fetcher = (async () => {
+      upstreamCalls += 1
+      return sseOk()
+    }) as typeof fetch
+    const { chunks } = await withFetch(fetcher, () => collect(adapter))
+    expect(refreshCalls, '★ 剩余 30s 却没有预判续期 ⇒ 撞在正在死掉的 token 上（PR 要修的缺陷回来了）')
+      .toBe(1)
+    // ⚠️ 续期发生在**发请求之前**，故上游只被调一次（不是"先发一次失败的再续"）
+    expect(upstreamCalls, '预判续期后不应再多打一轮上游').toBe(1)
+    expect(textDelta(chunks)).toBe(true)
+  })
+
+  it('★ 对照：剩余 5 分钟（远大于 60s 窗口）⇒ **不**预判续期', async () => {
+    let refreshCalls = 0
+    const adapter = makeRotateAdapter({
+      resolveCredential: async () => ({ ...CRED_A, expires_at: String(Date.now() + 5 * 60_000) }),
+      refresh: async () => { refreshCalls += 1 },
+    })
+    await withFetch((async () => sseOk()) as typeof fetch, () => collect(adapter))
+    expect(refreshCalls, '★ 60s 窗口被放大 ⇒ 每个请求都会续期（轮换次数暴涨）').toBe(0)
+  })
+
+  it('★★ 预判续期**失败**时降级为「用现有凭据继续发」（不得让请求直接死掉）', async () => {
+    /**
+     * ⚠️ 修前这里是裸 `await refresh()` ⇒ 抛错就整个请求失败、**上游一次都不发**。
+     * 而 `isMinimaxExpiringWithin` 是 fail-open 的（读不到 `expires_at` 即"该续"）
+     * ⇒ 「凭据缺/非法 expires_at」的账号会**每个请求都撞一次**。
+     * 旧判据（`isMinimaxExpired`）则会正常放行 —— 即这是一次真实的行为回归。
+     *
+     * 判据：① 上游**真的被调用**；② 有一条 warn 留痕（降级不得静默）。
+     */
+    const warnings: string[] = []
+    let upstreamCalls = 0
+    const adapter = new MinimaxAdapter({
+      credentialRef: 'MINIMAX_ACCESS_TOKEN' as never,
+      // ⚠️ 无 `expires_at` 且 access_token 非 JWT ⇒ 预判恒为「该续」
+      resolveCredential: async () => ({
+        access_token: 'mmoat_' + 'a'.repeat(54), refresh_token: 'r'.repeat(60),
+        token_type: 'Bearer', scope: 'agent.default',
+      }),
+      refresh: async () => { throw new Error('invalid_grant: refresh token dead') },
+      fetchRemoteModels: async () => [M31, M3, HS, M27],
+      product: MINIMAX,
+      warn: (message: string) => { warnings.push(message) },
+    } as never)
+    const { chunks } = await withFetch((async () => {
+      upstreamCalls += 1
+      return sseOk()
+    }) as typeof fetch, () => collect(adapter))
+    expect(upstreamCalls, '★ 续期失败把请求整个吞掉了（上游一次都没发）').toBe(1)
+    expect(textDelta(chunks), '请求应当正常产出内容').toBe(true)
+    expect(warnings.length, '★ 降级必须留痕（否则用户不知道凭据没续上）').toBeGreaterThan(0)
+    expect(warnings[0]).toContain('续期失败')
+  })
+
+  it('★★ 401 且续期抛「RT 已死」⇒ 必须报可诊断文案，**不得**吞成 `AUTH`', async () => {
+    /**
+     * ⚠️⚠️ 修前这一格是裸 `await this.options.refresh()` + 统一抛
+     * `new LlmError('…refresh failed', 'AUTH')` —— 而 `AUTH` 会被客户端
+     * **替换成固定文案「API 密钥无效」并丢掉原文**（本仓库既有纪律 `IKLBSH`：
+     * 凡「文案本身就是出路」的错误一律避开 `AUTH`）。
+     *
+     * 后果：用户只看到「API 密钥无效」，而真正该看到的是**「请重新登录」**。
+     */
+    const adapter = makeRotateAdapter({
+      resolveCredential: async () => ({ ...CRED_A, expires_at: String(Date.now() + 3_600_000) }),
+      refresh: async () => {
+        const error = new Error('refresh_token 已失效，请重新登录')
+        error.name = 'MinimaxRefreshTokenExpiredError'
+        throw error
+      },
+    })
+    const fetcher = (async () => new Response('{"code":401,"message":"auth failed"}', { status: 401 })) as typeof fetch
+    const { error } = await withFetch(fetcher, () => collect(adapter))
+    expect(error, '401 + RT 已死应当抛出可诊断错误').toBeDefined()
+    expect(
+      (error as { code?: string }).code,
+      '★ 用了 `AUTH` ⇒ 客户端会把 message 整个换成「API 密钥无效」，用户看不到「请重新登录」',
+    ).not.toBe('AUTH')
+    expect(
+      String((error as Error).message),
+      '★ 指路文案（请重新登录）必须留在 message 里',
+    ).toContain('重新登录')
+  })
+
   it('★ 401 授权失败：先续期一次、再换号，且**绝不写冷却标记**', async () => {
     const { pool, marks, picks } = makePoolStub()
     let refreshCalls = 0
@@ -953,7 +1060,11 @@ describe('MinimaxAdapter 请求级账号轮换（余额耗尽无感切号）', (
     }) as typeof fetch
 
     const adapter = makeRotateAdapter({
-      resolveCredential: async () => CRED_A,
+      // ⚠️ 2026-10-24 本地试验版：请求前预判从「已过期」收紧为「剩余 <60s」，
+      //    且**读不到过期时间视为该续**（与 shouldRefreshNow 同口径）——
+      //    故本用例的凭据必须给一个**远在未来**的 `expires_at`，
+      //    让预判不触发，单独守 401 路径（临期路径有专门用例守）。
+      resolveCredential: async () => ({ ...CRED_A, expires_at: String(Date.now() + 3_600_000) }),
       accountPool: pool,
       refresh: async () => { refreshCalls += 1 },
     })

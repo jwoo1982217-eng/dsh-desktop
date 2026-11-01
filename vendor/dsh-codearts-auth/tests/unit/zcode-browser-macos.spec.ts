@@ -90,14 +90,35 @@ describe('ZCode 浏览器探测 · macOS（issue IKJKNT）', () => {
     expect(list[0]).toBe('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
   })
 
-  it('★★ win32 候选链逐字不变（本仓库 Windows 用户远多于 Mac，改 Mac 不能动 Windows）', () => {
-    expect(browserCandidates({ platform: 'win32', env: WIN_ENV, home: 'C:\\Users\\me' })).toEqual([
+  /**
+   * ## ⚠️ 这条用例的原意与本次变更（2026-10-24，Gitee issue IKQ4JN）
+   *
+   * 原标题是「**改 Mac 不能动 Windows**」——它守的是「重构 darwin 分支时
+   * 别顺手改了 win32 链」（本仓库 Windows 用户远多于 Mac）。
+   *
+   * 而 IKQ4JN 是**专门修 Windows 的**：补了 Brave（候选链里 mac/linux 早就有）
+   * 与「从 PATH 反推 scoop 根」一档。⇒ 期望值必须同步更新，否则严格断言
+   * 会把**有意的修复**判成回归。
+   *
+   * ⚠️ 更新时**只加 Brave 三条**（并经 `exists: () => false` 关掉 PATH 反推档 ——
+   * 那档依赖真实文件系统，在本用例的纯字符串语境里不可控）。
+   * 其余顺序与内容**逐字保持**，这样这条用例仍然守得住它原本要守的东西：
+   * 「darwin 的改动不得波及 win32」。
+   */
+  it('★★ win32 候选链：darwin 改动不得波及它（顺序与内容逐字锁定）', () => {
+    expect(browserCandidates({
+      platform: 'win32', env: WIN_ENV, home: 'C:\\Users\\me', exists: () => false,
+    })).toEqual([
       join('C:\\Users\\me', 'scoop', 'apps', 'chromium', 'current', 'chrome.exe'),
       join('C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
       join('C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
       join('C:\\Users\\me\\AppData\\Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
       join('C:\\Users\\me\\AppData\\Local', 'Chromium', 'Application', 'chrome.exe'),
       join('C:\\Program Files', 'Chromium', 'Application', 'chrome.exe'),
+      // ⚠️ Brave 三条（IKQ4JN 附带建议 4）：补齐 Windows，位置在 Edge 之前。
+      join('C:\\Program Files', 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+      join('C:\\Program Files (x86)', 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
+      join('C:\\Users\\me\\AppData\\Local', 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
       join('C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
       join('C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
       join('C:\\Users\\me\\AppData\\Local', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),

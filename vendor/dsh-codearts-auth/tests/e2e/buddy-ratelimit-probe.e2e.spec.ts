@@ -141,7 +141,7 @@ async function directProbe(credential: BuddyCredential, model: string): Promise<
       'X-Domain': credential.domain || 'www.codebuddy.cn',
       'X-Product': 'SaaS',
       'X-Product-Code': 'codebuddy',
-      'User-Agent': 'CodeBuddyIDE/1.106.1',
+      'User-Agent': 'CodeBuddyIDE/4.12.2',
       Accept: 'text/event-stream',
       'Content-Type': 'application/json',
     },

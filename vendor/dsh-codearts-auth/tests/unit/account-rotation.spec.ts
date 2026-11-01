@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool } from '../../src/account-pool.js'
+import { createCredentialResolver } from '../../src/credential-resolver.js'
 import { rotatingStream } from '../../src/account-rotation.js'
 import { registerAdapterIdempotent } from '../../src/llm-register-compat.js'
 import { BuddyBalanceSelector } from '../../src/buddy-balance-selector.js'
@@ -209,5 +210,29 @@ describe('Jet Hub 账号耗尽接续', () => {
     expect(await collect(adapter.stream({ model: 'big-pickle' } as any))).toEqual(['A'])
     expect(await collect(adapter.stream({ model: 'big-pickle' } as any))).toEqual(['A'])
     expect(await collect(adapter.stream({ model: 'paid-model' } as any))).toEqual(['A'])
+  })
+})
+
+
+describe('最新目录探测与本机选号锁组合', () => {
+  it('isFreeModel 经池读取凭据时不嵌套等待同一选号锁', async () => {
+    const f = await fixture('buddy')
+    const resolve = createCredentialResolver({ pool: f.pool }, {
+      product: {id: 'buddy'},
+      readCredential: async ref => JSON.parse(f.values.get(JSON.stringify(credentialRef(ref)))!),
+      balance: {
+        kind: 'buddy',
+        isFreeModel: async () => { await f.pool.getAvailableAccount('buddy', 'model'); return true },
+        selector: {select: async () => { throw Error('免费模型不能查询余额') }},
+        lockedError: () => Error('locked'),
+      },
+      fallback: {kind: 'custom', resolve: async () => undefined},
+    } as any)
+    const call = collect(rotatingStream('buddy', 'model', async function* () { yield await resolve('model') }))
+    let timeout: ReturnType<typeof setTimeout>
+    try {
+      const result = await Promise.race([call, new Promise((_, reject) => { timeout = setTimeout(() => reject(Error('nested selection deadlock')), 1000) })])
+      expect(result).toEqual([{access_token: 'token-A'}])
+    } finally { clearTimeout(timeout!) }
   })
 })

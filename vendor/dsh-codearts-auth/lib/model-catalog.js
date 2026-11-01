@@ -384,7 +384,13 @@ export function createModelCatalog(deps, config) {
             },
         },
         async resolveModel(provider, model, _signal) {
-            const all = await config.loadCatalog();
+            _signal?.throwIfAborted();
+            // 宿主会逐条解析刚列出的模型；复用同一份元数据，避免每条都等待远端刷新。
+            // 未见过的 id 仍走原来的目录读取，刷新成功后也继续更新这份缓存。
+            const all = cached?.some((entry) => entry.id === model)
+                ? cached
+                : await config.loadCatalog();
+            _signal?.throwIfAborted();
             cached = all;
             const entry = all.find((item) => item.id === model);
             // ⚠️ name 三级回退，**绝不空**（空名会让选择器出现空白项）：
@@ -422,13 +428,34 @@ export function createModelCatalog(deps, config) {
                 // ⇒ 家数**只在上面那个接口字段的表格里维护**，这里**刻意不抄数字**
                 // （原先抄了个「10 家」并写成只有 `buddy` 省略，与那张表**互相矛盾**，
                 // 正是「同一事实写多处 ⇒ 必有一处先腐坏」）。
-                const unknownModalities = config.unknownModelInputModalities?.();
+                // ⚠️ **必须把 `model` 传进去**：`codearts` 的 VL 模型刻意不在目录里，
+                //    却仍要按 id 声明 `image`（见该回调的注释）。
+                const unknownModalities = config.unknownModelInputModalities?.(model);
                 if (unknownModalities !== undefined)
                     resolved.inputModalities = unknownModalities;
             }
-            // ⚠️ 未知模型**不编造** context（宁可让 DSH 用默认值，也不报一个假窗口）。
-            if (entry?.contextWindow !== undefined && entry.contextWindow > 0) {
-                resolved.context = { contextWindow: entry.contextWindow };
+            // ⚠️ 未知模型**默认不编造** context（宁可让 DSH 用默认值，也不报一个假窗口）。
+            //
+            // ⚠️ 但**声明了 `unknownModelContextWindow` 的家**（当前只有 `codearts`）例外：
+            //    它的窗口本就全部来自本地静态表、且缺窗口的后果是「占用条整条消失 +
+            //    自动压缩阈值失去唯一输入」⇒ 用**具名兜底**而不是省略。
+            //    判据与理由见该回调的注释；**不得**把它推广到其余各家。
+            const knownContextWindow = entry?.contextWindow;
+            if (knownContextWindow !== undefined && knownContextWindow > 0) {
+                resolved.context = { contextWindow: knownContextWindow };
+            }
+            else if (entry === undefined) {
+                // ⚠️ **必须把 `model` 传进去** —— 实现方要能「表内优先、查不到才兜底」。
+                //    不传会让「静态窗口表里有、但静态兜底目录里没有」的 id（如 `glm-5.3`）
+                //    在离线路径上拿到常数兜底，与目录内路径的取值分叉（实测过）。
+                const fallbackContextWindow = config.unknownModelContextWindow?.(model);
+                // ⚠️ 同样要过「正整数」闸门：0/负数/NaN 会让 DSH 抛
+                //    `INVALID_MODEL_CONTEXT`，**整轮对话起不来**（不是降级，是崩）。
+                if (fallbackContextWindow !== undefined
+                    && Number.isInteger(fallbackContextWindow)
+                    && fallbackContextWindow > 0) {
+                    resolved.context = { contextWindow: fallbackContextWindow };
+                }
             }
             // ⚠️ 非法值必须过滤：0/负数/NaN 会让 DSH 抛 INVALID_MODEL_MAX_TOKENS，
             // **整轮对话起不来**（不是降级，是崩）。

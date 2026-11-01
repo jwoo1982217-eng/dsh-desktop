@@ -9,6 +9,7 @@ import {
 } from '../../src/buddy-adapter.js'
 import type { BuddyCredential, BuddyRemoteModel } from '../../src/buddy.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from '../../src/product.js'
+import { nextUtc8DayStartMs } from '../../src/model-queue.js'
 
 const CREDENTIAL_REF = credentialRef('BUDDY_ACCESS_TOKEN')
 
@@ -1725,6 +1726,69 @@ describe('BuddyAdapter credential handling', () => {
     expect(message).not.toContain('requestId')
   })
 
+  /**
+   * 守卫：`displayTips.zh`（**第五族**报文唯一的本地化文案）必须到达用户眼前
+   * （2026-10-31 实测，见 `docs/agent-notes/providers-buddy.md` 的「第五族」小节）。
+   *
+   * ⚠️⚠️ 真实报文**只有 `displayTips`、没有 `displayMsg`**：
+   * ```
+   * {"code":11140,"msg":"request illegal",
+   *  "displayTips":{"zh":"账号存在异常行为，已被限制使用"}}
+   * ```
+   * 旧 `errorDetail` 只认 `displayMsg` ⇒ 提不出任何本地化文案 ⇒ 用户只看到
+   * `request illegal`，上游唯一说清原因的字段被白白埋掉 —— 与 2026-09-27 那条
+   * `displayMsg` 事故**同型**（上一条用例守的就是它）。
+   *
+   * ⚠️ 优先级锁死：`displayMsg` 在前、`displayTips` 在后 —— 两者都在时以
+   * `displayMsg` 为准（第二条断言）。
+   */
+  it('★★ 第五族报文（只有 displayTips）的中文文案必须到达用户眼前', async () => {
+    const raw = JSON.stringify({
+      code: 11140,
+      msg: 'request illegal',
+      displayTips: { en: 'The account has been restricted.', zh: '账号存在异常行为，已被限制使用' },
+    })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async () => new Response(raw, { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    const message = (error as LlmError).message
+    // ⚠️ 上游唯一说清原因的文案必须**出现**（修复前用户只看到 `request illegal`）。
+    expect(message, `用户应当看到被限制的原因，实际：${message}`).toContain('账号存在异常行为，已被限制使用')
+    expect(message).toContain('request illegal')
+    // ⚠️ 噪声字段不得倾倒。
+    expect(message).not.toContain('displayTips')
+    expect(message).not.toContain('The account has been restricted')
+  })
+
+  it('★★ displayMsg 与 displayTips 都在时，以 displayMsg 为准（优先级锁死）', async () => {
+    const raw = JSON.stringify({
+      code: 11140,
+      msg: 'request illegal',
+      displayMsg: { zh: '请求被安全策略拦截，请稍后重试' },
+      displayTips: { zh: '账号存在异常行为，已被限制使用' },
+    })
+    const adapter = makeAdapter({
+      credential: makeCredential({ access_token: 'AT1' }),
+      refresh: async () => { throw new Error('refresh failed') },
+      accountPool: makePool([
+        { id: 'acc-1', credential: makeCredential({ access_token: 'AT1' }) },
+        { id: 'acc-2', credential: makeCredential({ access_token: 'AT2' }) },
+      ]),
+      fetchImpl: async () => new Response(raw, { status: 403 }),
+    })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    const message = (error as LlmError).message
+    expect(message).toContain('请求被安全策略拦截')
+    expect(message).not.toContain('账号存在异常行为')
+  })
+
   it('401 换号不会无限循环：每个账号最多试一次', async () => {
     let calls = 0
     const adapter = makeAdapter({
@@ -1881,9 +1945,9 @@ describe('BuddyAdapter credential handling', () => {
     })
     await collectChunks(adapter, streamOptions)
     expect(seen!.get('Authorization')).toBe('Bearer AT')
-    expect(seen!.get('X-Domain')).toBe('copilot.tencent.com')
-    expect(seen!.get('X-Product-Code')).toBe('codebuddy')
-    expect(seen!.get('User-Agent')).toBe('CodeBuddyIDE/1.106.1')
+    expect(seen!.get('X-Domain')).toBe('www.workbuddy.cn')
+    expect(seen!.get('X-Product-Code')).toBe('workbuddy')
+    expect(seen!.get('User-Agent')).toBe('WorkBuddy/5.9.2 WorkBuddy/5.9.2 CLI/5.8.3')
   })
 
   /**
@@ -2065,7 +2129,7 @@ describe('BuddyAdapter credential handling', () => {
       },
     })
     await collectChunks(adapter, streamOptions)
-    expect(seen!.get('X-Domain')).toBe('copilot.tencent.com')
+    expect(seen!.get('X-Domain')).toBe('www.workbuddy.cn')
   })
 
   /**
@@ -3325,7 +3389,7 @@ export { CHAT_API_BASE }
 describe('产品参数化', () => {
   it('默认构造时 providerInfo 返回 buddy', () => {
     expect(makeAdapter().providerInfo('buddy')).toMatchObject({
-      id: 'buddy', name: 'CodeBuddy (腾讯)',
+      id: 'buddy', name: 'WorkBuddy (国内版)',
     })
   })
 
@@ -3471,11 +3535,11 @@ describe('产品参数化', () => {
     expect(seen!.get('X-Product-Code')).toBe(CODEBUDDY.productCode)
     expect(seen!.get('User-Agent')).toBe(CODEBUDDY.userAgent)
     // X-Product 是**归属名**（产品名），不是部署类型。
-    expect(seen!.get('X-Product')).toBe('CodeBuddy')
+    expect(seen!.get('X-Product')).toBe('WorkBuddy')
     // 归属头族：后台「使用端」列按这组头归因。
     expect(seen!.get('X-Agent-Purpose')).toBe('conversation')
-    expect(seen!.get('X-IDE-Name')).toBe('CodeBuddy')
-    expect(seen!.get('X-IDE-Type')).toBe('CodeBuddy')
+    expect(seen!.get('X-IDE-Name')).toBe('WorkBuddy')
+    expect(seen!.get('X-IDE-Type')).toBe('WorkBuddy')
     expect(seen!.get('X-IDE-Version')).toBe(CODEBUDDY.clientVersion)
   })
 
@@ -3550,12 +3614,12 @@ describe('产品参数化', () => {
     }
 
     // 国际版独有模型线 → 国际版形态（平台段为 `WorkBuddy AI`）。
-    expect(await uaFor('gpt-5.6-sol')).toBe('WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2')
-    expect(await uaFor('gemini-3.5-flash')).toBe('WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2')
+    expect(await uaFor('gpt-5.6-sol')).toBe('WorkBuddy/5.9.4 WorkBuddy AI/5.9.4 CLI/5.9.4')
+    expect(await uaFor('gemini-3.5-flash')).toBe('WorkBuddy/5.9.4 WorkBuddy AI/5.9.4 CLI/5.9.4')
     // 国内系模型 → 国内客户端形态（平台段为 `WorkBuddy`）。
-    expect(await uaFor('glm-5.2')).toBe('WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2')
-    expect(await uaFor('hy3')).toBe('WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2')
-    expect(await uaFor('kimi-k3')).toBe('WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/5.5.2')
+    expect(await uaFor('glm-5.2')).toBe('WorkBuddy/5.9.4 WorkBuddy/5.9.4 CLI/5.9.4')
+    expect(await uaFor('hy3')).toBe('WorkBuddy/5.9.4 WorkBuddy/5.9.4 CLI/5.9.4')
+    expect(await uaFor('kimi-k3')).toBe('WorkBuddy/5.9.4 WorkBuddy/5.9.4 CLI/5.9.4')
     // 未命中任何模型族规则 → 回落到 product.userAgent（默认国际版形态）。
     expect(await uaFor('deepseek-v4.1-flash')).toBe(WORKBUDDY.userAgent)
   })
@@ -6667,5 +6731,273 @@ describe('BuddyAdapter 直连路径的腾讯风控指纹改写', () => {
       expect(systems).toHaveLength(1)
       expect(String(systems[0]?.content)).toBe('Real system prompt.')
     })
+  })
+})
+
+/**
+ * 额度耗尽（`14018 Credits exhausted`）的冷却终点（Gitee IKQ6HJ）。
+ *
+ * ## 真实缺陷
+ *
+ * `14018` 与频率限流**共用 HTTP 429**，但恢复方式完全不同：上游报文里
+ * **一个时间字段都没有**（实测原文见下），故 `RESET_TIME_PATTERN` 必然不命中 ⇒
+ * 旧实现落进 `RATE_LIMIT_FALLBACK_MS`（1 小时）⇒ **每小时被重新选中一次、
+ * 必然再失败一次**，用户看到「面板说可以用了，一试又不行」。
+ *
+ * ⚠️ 正确终点是 **UTC+8 当日 24:00**（`nextUtc8DayStartMs`），与 loomy
+ * （Gitee IKL80H）/ qoder / zcode / codearts 四家同口径。
+ */
+describe('BuddyAdapter 额度耗尽（14018）的冷却终点', () => {
+  /** 上游逐字报文（`www.workbuddy.ai`，HTTP 429）——注意**没有任何时间字段**。 */
+  const CREDITS_EXHAUSTED_BODY = JSON.stringify({
+    error: {
+      data: {
+        code: 14018,
+        msg: 'Credits exhausted. Please visit the link below to purchase add-on packs '
+          + 'and get more credits: https://www.codebuddy.ai/profile/usage ',
+        requestId: '5f0cfd4f-77d3-406d-b1ab-445090c0a535',
+      },
+    },
+  })
+
+  /** 记录 `updateModelRateLimit` 的单一账号池替身（无候选可换）。 */
+  function singlePool(recorded: Array<{ accountId: string; modelId: string; resetAtMs: number }>) {
+    return {
+      async findAccountIdByCredential() { return 'acct-1' },
+      async updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number) {
+        recorded.push({ accountId, modelId, resetAtMs })
+      },
+      async getAvailableAccount() { return null },
+    }
+  }
+
+  async function resetAtFor(body: string, status: number): Promise<number> {
+    const recorded: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: singlePool(recorded) as never,
+      fetchImpl: async () => new Response(body, { status }),
+    })
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch(() => {})
+    expect(recorded).toHaveLength(1)
+    return recorded[0]!.resetAtMs
+  }
+
+  it('★ 14018 的冷却终点是 UTC+8 当日 24:00，不是「+1 小时」', async () => {
+    const before = Date.now()
+    const resetAt = await resetAtFor(CREDITS_EXHAUSTED_BODY, 429)
+    const after = Date.now()
+    // 判据一：**恰好**等于自然日终点（允许 1 秒抖动，覆盖 before/after 两个边界）。
+    const expectedMin = nextUtc8DayStartMs(before)
+    const expectedMax = nextUtc8DayStartMs(after)
+    expect(resetAt).toBeGreaterThanOrEqual(expectedMin)
+    expect(resetAt).toBeLessThanOrEqual(expectedMax)
+    // 判据二（**不是恒真**的反向对照）：它必须**不等于** 1 小时兜底。
+    // 若只写上一条，在「当天 23:00 之后跑」时会与 +1h 恰好接近而失去判别力，
+    // 故这条独立成立才说明判据真的换了终点。
+    const fallback = before + 3_600_000
+    expect(Math.abs(resetAt - fallback)).toBeGreaterThan(60_000)
+  })
+
+  it('★ 扁平形态的 14018（code 在顶层）同样走自然日', async () => {
+    const body = JSON.stringify({ code: 14018, msg: 'Credits exhausted.' })
+    const before = Date.now()
+    const resetAt = await resetAtFor(body, 429)
+    expect(resetAt).toBeGreaterThanOrEqual(nextUtc8DayStartMs(before))
+  })
+
+  it('★ 中文额度措辞（额度 + 用尽）同样走自然日', async () => {
+    // ⚠️ 状态码必须取 429：中文「额度已用尽」**不命中** RATE_LIMIT_PATTERN
+    //（它只认「频率限制 / 使用量已超出 / 重置 / rate limit / …」），故 400 下根本
+    // 进不了换号记账腿 —— 那是**既有边界**、与本 issue 无关，但会让本用例变成假红。
+    const body = JSON.stringify({ code: 0, msg: '额度已用尽，请明日再试' })
+    const before = Date.now()
+    const resetAt = await resetAtFor(body, 429)
+    expect(resetAt).toBeGreaterThanOrEqual(nextUtc8DayStartMs(before))
+  })
+
+  it('★ 不回归：频率限流（6004）仍用「服务端给的时刻」', async () => {
+    const body = JSON.stringify({
+      code: 6004,
+      msg: "usage exceeds frequency limit, but don't worry, your usage will reset at "
+        + '2099-12-31 23:59:59 UTC+8, alternatively, you can switch to the other models.',
+      requestId: 'ffb5bd97-2036-48a0-baba-a56c6ab13c9c',
+    })
+    const resetAt = await resetAtFor(body, 400)
+    expect(resetAt).toBe(Date.parse('2099-12-31 23:59:59 UTC+8'))
+  })
+
+  it('★ 不回归：频率限流（6004）无时刻时仍是 +1 小时兜底', async () => {
+    const body = JSON.stringify({ code: 6004, msg: '频率限制' })
+    const before = Date.now()
+    const resetAt = await resetAtFor(body, 400)
+    const after = Date.now()
+    // 1 小时兜底（允许执行耗时的抖动）。
+    expect(resetAt).toBeGreaterThanOrEqual(before + 3_600_000)
+    expect(resetAt).toBeLessThanOrEqual(after + 3_600_000)
+  })
+
+  it('★ 不回归：14003 模型饱和仍**不写任何冷却**', async () => {
+    // 饱和分支会**在本账号**退避重试（2s → 4s 共两轮），单测必须短路掉等待，
+    // 否则 5 秒超时会让「守卫是否生效」变成「用例是否够快」。
+    const previousDelay = process.env.DSH_BUDDY_SATURATION_DELAY_MS
+    process.env.DSH_BUDDY_SATURATION_DELAY_MS = '0'
+    try {
+      const recorded: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+      const adapter = new BuddyAdapter({
+        credentialRef: CREDENTIAL_REF,
+        resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+        refresh: async () => {},
+        accountPool: singlePool(recorded) as never,
+        fetchImpl: async () => new Response(
+          JSON.stringify({ code: 14003, msg: 'too many requests' }), { status: 429 },
+        ),
+      })
+      await collectChunks(adapter, {
+        model: 'space-bunny',
+        messages: [{ role: 'user', content: 'hi' }] as never,
+        signal: new AbortController().signal,
+      } as never).catch(() => {})
+      // 饱和是模型级：写冷却会把整池锁 1 小时（既有守卫，本 issue 不得破坏它）。
+      expect(recorded).toEqual([])
+    } finally {
+      if (previousDelay === undefined) delete process.env.DSH_BUDDY_SATURATION_DELAY_MS
+      else process.env.DSH_BUDDY_SATURATION_DELAY_MS = previousDelay
+    }
+  })
+
+  it('★ 不回归：服务端真给了时刻时**以它为准**（自然日只在「没给」时才是正解）', async () => {
+    // 构造一个「既被判额度耗尽、又带时刻」的报文：14018 码值 + reset at 句式。
+    const body = JSON.stringify({
+      code: 14018,
+      msg: 'Credits exhausted. Your quota will reset at 2099-12-31 23:59:59 UTC+8',
+    })
+    const resetAt = await resetAtFor(body, 429)
+    expect(resetAt).toBe(Date.parse('2099-12-31 23:59:59 UTC+8'))
+  })
+})
+
+/**
+ * 工具参数写坏（Gitee IKQ8Y1）：必须报 `TOOL_ARGS_INVALID`，不是 `max-tokens`。
+ *
+ * ⚠️ 三类**不得**被这条新判据抢走的形态（issue 验收标准第 3 条）：
+ * 已有正文 / 另一个参数可解析的调用 / 真截断 —— 前两者报 max-tokens 保住内容，
+ * 后者报 max-tokens 触发重试。
+ */
+describe('BuddyAdapter 工具参数写坏（TOOL_ARGS_INVALID）', () => {
+  /** 逐字真实坏样本（`content` 漏开引号、正文裸文本含真实换行）。 */
+  const REAL_BAD_ARGS =
+    '{"content": 【m00055–m00067 · 撰写 vibe coding 指南与技能库查询】\n'
+    + '- memory_procedure_list 查询「vibe coding 研究 检索 报告」→ 技能库无匹配（共 8 条）。\n'
+    + '- 用 write 写出 `C:\\Users\\<user>\\Desktop\\dsh默认\\vibecoding-实践指南.md`…待用户决定。}'
+
+  function sse(chunks: string[]): Response {
+    const encoder = new TextEncoder()
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    }), { status: 200 })
+  }
+
+  const frame = (delta: unknown, finish: string | null = null): string =>
+    `data: ${JSON.stringify({ choices: [{ delta, finish_reason: finish }] })}\n\n`
+
+  /** 带一个 tool-call 分片的帧。 */
+  const toolFrame = (name: string, args: string, index = 0): string =>
+    frame({ tool_calls: [{ index, id: `call_${index}`, function: { name, arguments: args } }] })
+
+  async function finishFor(chunks: string[]): Promise<Record<string, any>> {
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      fetchImpl: async () => sse(chunks),
+    })
+    const out = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+    // finish 可能出现在流里，也可能是抛出的 LlmError。
+    if (out instanceof LlmError) return { kind: 'error', failure: { code: out.code, message: out.message } }
+    const finish = (out as Array<Record<string, any>>).find(chunk => chunk.type === 'finish')
+    expect(finish, '本步必须产出 finish 事件').toBeDefined()
+    return finish!.reason as Record<string, any>
+  }
+
+  it('★ 坏 JSON + 只有思考（无正文无可用调用）⇒ TOOL_ARGS_INVALID', async () => {
+    const reason = await finishFor([
+      frame({ reasoning_content: '我在想要不要调 compress' }),
+      toolFrame('compress', REAL_BAD_ARGS),
+      frame({}, 'tool_calls'),
+    ])
+    expect(reason.kind).toBe('error')
+    expect(reason.failure.code).toBe('TOOL_ARGS_INVALID')
+    // 文案必须带工具名与字符数（让用户能定位到哪一次调用）。
+    expect(reason.failure.message).toContain('compress')
+    expect(reason.failure.message).toContain(String(REAL_BAD_ARGS.length))
+    // 且**显式否认** token 上限 —— 否则用户会去查额度（实测 2516/128000）。
+    expect(reason.failure.message).not.toContain('已达到输出 token 上限')
+  })
+
+  it('★ 不回归：合法 JSON ⇒ tool-calls', async () => {
+    const reason = await finishFor([
+      toolFrame('compress', '{"content":"x"}'),
+      frame({}, 'tool_calls'),
+    ])
+    expect(reason.kind).toBe('tool-calls')
+  })
+
+  it('★ 不回归：真截断（分片丢失）⇒ max-tokens（不是 TOOL_ARGS_INVALID）', async () => {
+    const reason = await finishFor([
+      toolFrame('read', '{"file_path": "C:\\a\\'),
+      frame({}, 'tool_calls'),
+    ])
+    expect(reason.kind).toBe('max-tokens')
+  })
+
+  it('★ 不回归：坏 JSON **但有正文** ⇒ max-tokens（保住内容，不能丢）', async () => {
+    const reason = await finishFor([
+      frame({ content: '这是一段正文' }),
+      toolFrame('compress', REAL_BAD_ARGS),
+      frame({}, 'tool_calls'),
+    ])
+    expect(reason.kind).toBe('max-tokens')
+  })
+
+  it('★ 不回归：坏 JSON + 另一个参数可解析的调用 ⇒ max-tokens（不一起作废）', async () => {
+    // `error` 路径不落 assistant/message ⇒ 报它会把那个**可用**的调用一起丢掉。
+    const reason = await finishFor([
+      toolFrame('compress', REAL_BAD_ARGS, 0),
+      toolFrame('read', '{"file_path":"a.md"}', 1),
+      frame({}, 'tool_calls'),
+    ])
+    expect(reason.kind).toBe('max-tokens')
+  })
+
+  it('★ 不回归：finish=length 仍报 max-tokens（真烧满额度那一格）', async () => {
+    const reason = await finishFor([
+      toolFrame('compress', '{"content":"x"}'),
+      frame({}, 'length'),
+    ])
+    expect(reason.kind).toBe('max-tokens')
+  })
+
+  it('★ 无名块的坏参数不得被报成 TOOL_ARGS_INVALID（真病因是缺 name）', async () => {
+    // 无名块本来就会被丢弃（`droppedUnnamedCalls`），把它的 JSON 问题报成
+    // 「模型写坏参数」会把「缺 name」这个真实病因盖掉。
+    const reason = await finishFor([
+      frame({ tool_calls: [{ index: 0, id: 'call_x', function: { arguments: REAL_BAD_ARGS } }] }),
+      frame({}, 'tool_calls'),
+    ])
+    expect(reason.kind).toBe('max-tokens')
   })
 })

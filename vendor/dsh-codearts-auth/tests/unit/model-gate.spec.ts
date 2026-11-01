@@ -7,12 +7,27 @@
  * **并发配额**（撞它时 token 还剩 299.4 万）。分模型实测：
  *
  * ```
- * GLM-5.3-Flash  605 次 200    0 次限流      ← 从未撞过
+ * GLM-5.3-Flash  605 次 200    0 次限流      ← 该窗口内 Flash 配额够用
  * GLM-5.3         74 次 200   21 次重试     6 次最终 429
  * ```
  *
  * ⇒ 两条措施：**串行**（不重叠）+ **按模型间隔**（不挨太近）。
  * 加了之后那边 `3009` 从 21 次降到 1 次。
+ *
+ * ⚠⚠ **上面那行「Flash 从未撞过」已在本机被证伪**（2026-10-25）：
+ * 它的成立前提是**串行单发**（605 次里没有并发）。一旦开并发
+ * （多个 subagent / 多轮并行），`gap=0` 意味着闸门只保证不重叠、
+ * **不保证间隔** ⇒ N 个请求首尾相接密集连发 ⇒ 只要该模型的并发
+ * 窗口 < N 就撞 `429 + 3009`。
+ *
+ * 本机实测（会话 `3acf2ebd` turn 15）：模型正是 `GLM-5.3-Flash`，
+ * 撞了 429+3009，随后 turn 16 **升级成 405 风控拦截** ——
+ * 「并发开多就全废」的起点。用户原话：「1.5 亿 token 并发多了以后碰到，
+ * 是 glm-5.3-flash，普通的 glm-5.3 没有碰到（可能是因为我用 5.3 都是
+ * 单线程的）」。
+ *
+ * ⇒ `glm-5.3-flash` 的 gap 从 0 改成 **500ms**（用户指定），
+ *   守卫见本文件末尾「产品配置的 gap 必须非零」。
  *
  * ## ⚠ 用例全部毫秒级
  *
@@ -21,6 +36,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { GateAbortedError, ModelGate } from '../../src/model-gate.js'
+import { ZCODE } from '../../src/zcode-product.js'
 
 const tick = async (ms = 5): Promise<void> => {
   await new Promise((resolve) => setTimeout(resolve, ms))
@@ -162,5 +178,36 @@ describe('ZCode 上游请求闸门', () => {
     expect(gate.queueDepth()).toBe(0)
     // 尾巴已释放：下一个任务能正常执行。
     expect(await gate.run('m', async () => 'ok')).toBe('ok')
+  })
+})
+
+/**
+ * ★★ **产品配置的 gap 必须非零**（2026-10-25，issue IKQ4B4）。
+ *
+ * ## 为什么值得单独立项
+ *
+ * `gap = 0` 时闸门只保证「不重叠」，**不保证间隔** —— 并发 N 个请求会
+ * 首尾相接密集连发。这在串行单发时代看不出来（`dsh-free-glm` 的
+ * 「Flash 605 次 0 限流」正是单发实测），一开并发就撞
+ * `429 + 3009 model concurrency limit exceeded`。
+ *
+ * 本机实测（会话 `3acf2ebd`）：turn 15 撞 429+3009 ⇒ turn 16 升级成
+ * 405 风控拦截 ⇒ 整条渠道不可用。用户原话见本文件头注释。
+ *
+ * ⚠ 断言**逐个模型枚举**而不是「全部 > 0」的汇总式：将来新增模型时
+ *   漏配 gap 会立刻红（汇总式在有一个非零值时恒真）。
+ */
+describe('ZCODE 产品配置：每个模型的 gap 必须非零', () => {
+  it('★★ glm-5.3 与 glm-5.3-flash 都有间隔', () => {
+    expect(ZCODE.modelGapMs['glm-5.3']).toBeGreaterThan(0)
+    expect(ZCODE.modelGapMs['glm-5.3-flash']).toBeGreaterThan(0)
+  })
+
+  it('★★ flash 的 gap 就是 500ms（用户指定值，防被改回 0）', () => {
+    expect(ZCODE.modelGapMs['glm-5.3-flash']).toBe(500)
+  })
+
+  it('★ 串行闸门必须开着（否则 gap 无从生效）', () => {
+    expect(ZCODE.serializeUpstream).toBe(true)
   })
 })

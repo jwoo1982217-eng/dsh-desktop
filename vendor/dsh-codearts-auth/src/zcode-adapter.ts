@@ -82,6 +82,7 @@ import {
 } from './zcode-transport.js'
 import {
   buildZcodeSystemBlocks,
+  withCallerSystem,
   withContextPrefix,
 } from './zcode-identity.js'
 import {
@@ -117,6 +118,7 @@ import {
   formatZcodeEdgePageHint,
   formatZcodeUnusualActivityMessage,
   hasZcodeUnusualActivity,
+  looksLikeZcodeEsaPage,
   looksLikeZcodeHtmlPage,
   noteZcodeRequestFailed,
   noteZcodeRequestOk,
@@ -124,6 +126,7 @@ import {
   readZcodeBusinessCodeFromBody,
 } from './zcode-diagnostics.js'
 import { planSessionTitleThinking } from './session-title.js'
+import { sessionBalanceEnabled } from './session-balance.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `ZCODE.id`）。 */
 export const PROVIDER = 'zcode'
@@ -215,8 +218,12 @@ function resolveRequestTimeoutMs(product: ZcodeProduct): number {
 export interface ZcodeAdapterOptions {
   /** 单凭据回退 ref（无账号池时）。 */
   credentialRef: CredentialRef
-  /** 解析当前可用凭据。 */
-  resolveCredential: (modelId?: string) => Promise<ZcodeCredential | undefined>
+  /** 解析当前可用凭据（第二参是 DSH 会话 id；zcode 用它做账号亲和）。 */
+  resolveCredential: (
+    modelId?: string,
+    sessionId?: string,
+    picked?: { accountId?: string },
+  ) => Promise<ZcodeCredential | undefined>
   /**
    * 凭据失效时的处理。
    *
@@ -913,12 +920,13 @@ export class ZcodeAdapter extends LlmAdapter {
      * 里那次 add + 写进池的 `modelRateLimits`），**单点删除任一处行为断言仍全绿**，
      * 故必须直接断言「首次切号时 `tried` 含失败账号、且标记已写下」。
      */
-    let credential = await this.resolveCredentialOrThrow(options)
+    const resolved = await this.resolveCredentialOrThrow(options)
+    let credential = resolved.credential
+    let activeAccountId = resolved.accountId ?? this.options.currentAccountId?.()
     if (credential.source_selection?.kind === 'organization-flow') {
       yield* streamZcodeOrganization(options, credential, imageUrls ?? new Map(), this.fetchImpl)
       return
     }
-    let activeAccountId = this.options.currentAccountId?.()
     if (activeAccountId !== undefined && activeAccountId.length > 0) tried.add(activeAccountId)
 
     /**
@@ -937,8 +945,17 @@ export class ZcodeAdapter extends LlmAdapter {
      *   - `tools` 是**扁平** `input_schema` 形态（不是 OpenAI 的嵌套 `function`）
      */
     const wire = serializeMessages(options.messages, imageUrls)
-    const messages = withContextPrefix(toAnthropicMessages(wire))
-    const system = buildZcodeSystemBlocks(options.system, {
+    /**
+     * ⚠ **`options.system` 不进 `system`，而是注入首轮 user 消息**
+     * （2026-10-25 实测修复）：追加成 `system[3]` 会让请求**必然**收到
+     * `405 + 3012`，与它多长无关。详见 `zcode-identity.ts` 的
+     * `buildZcodeSystemBlocks` 头注释对照实验表。
+     */
+    const messages = withCallerSystem(
+      withContextPrefix(toAnthropicMessages(wire)),
+      options.system,
+    )
+    const system = buildZcodeSystemBlocks({
       cwd: process.cwd(),
       provider: this.product.id,
       model: options.model,
@@ -1573,11 +1590,15 @@ export class ZcodeAdapter extends LlmAdapter {
    * 抽成方法是因为它现在出现在**切号循环之外**（凭据由循环内的切号逻辑更新），
    * 而「拿不到 → refresh → 再拿」这套顺序必须与既有实现逐字一致。
    */
-  private async resolveCredentialOrThrow(options: GenerateOptions): Promise<ZcodeCredential> {
-    let credential = await this.options.resolveCredential(options.model)
+  private async resolveCredentialOrThrow(
+    options: GenerateOptions,
+  ): Promise<{ credential: ZcodeCredential; accountId: string | undefined }> {
+    /** 本次请求私有的「实际选中账号」出口；不读进程级 Map，避免并发会话串号。 */
+    const picked: { accountId?: string } = {}
+    let credential = await this.options.resolveCredential(options.model, options.sessionId, picked)
     if (credential === undefined) {
       await this.options.refresh()
-      credential = await this.options.resolveCredential(options.model)
+      credential = await this.options.resolveCredential(options.model, options.sessionId, picked)
     }
     if (credential === undefined) {
       throw new LlmError(
@@ -1591,7 +1612,7 @@ export class ZcodeAdapter extends LlmAdapter {
       && !(await this.loadModels()).some(model => model.id.toLowerCase() === options.model.toLowerCase())) {
       throw new LlmError('ZCode 当前所选 Plan 不提供这个普通 API 模型，请从切换后的模型目录重新选择；不会改用其他计费来源', 'INVALID_REQUEST')
     }
-    return credential
+    return { credential, accountId: picked.accountId }
   }
 
   /**
@@ -1702,7 +1723,22 @@ export class ZcodeAdapter extends LlmAdapter {
       tried.add(activeAccountId)
     }
 
-    const next = await pool.getAvailableAccount<ZcodeCredential>(this.product.id, options.model, tried)
+    // ⚠ 生产 `AccountPool` 一定有 `getAvailableAccountForSession`；单测里的
+    //    结构化替身可能只实现 `getAvailableAccount`，故保留同语义的回落。
+    //    ⚠ 总开关 = **池里的面板开关**（Jet Hub 页头，每次现读）；替身没实现
+    //    `sessionBalanceEnabled` 时退回环境变量 `DSH_ZCODE_SESSION_BALANCE`
+    //    （默认开）。与 `credential-resolver.ts` ③ 处同一套判据，不会分叉。
+    const poolSwitch = typeof pool.sessionBalanceEnabled === 'function'
+      ? pool.sessionBalanceEnabled()
+      : sessionBalanceEnabled()
+    const next = poolSwitch && typeof pool.getAvailableAccountForSession === 'function'
+      ? await pool.getAvailableAccountForSession<ZcodeCredential>(
+          this.product.id,
+          options.model,
+          options.sessionId,
+          tried,
+        )
+      : await pool.getAvailableAccount<ZcodeCredential>(this.product.id, options.model, tried)
     if (next === null || next === undefined || tried.has(next.entry.id)) return undefined
     tried.add(next.entry.id)
     return {
@@ -2095,6 +2131,41 @@ export function describeUpstreamError(
     && !hasZcodeUnusualActivity(trimmed)
     && looksLikeZcodeHtmlPage(trimmed)
   ) {
+    /**
+     * ★ **`405` 要说清「不会重试」**（2026-10-25，issue IKQ4B4）。
+     *
+     * 归类侧（{@link httpErrorCodeForZcode}）已把 405 单开成
+     * `PERMISSION_DENIED`（**不在** `DEFAULT_RETRYABLE_CODES` 里）
+     * ⇒ harness **不会**再重试。若文案仍走 {@link formatZcodeEdgePageHint}
+     * 那句「建议稍后重试」，就是**归类与文案分叉** —— 用户按文案等了、
+     * 重试了，什么都不会发生（本机实测「重试了 3 个 5 次都没用」）。
+     *
+     * ⚠ 这正是本仓库记录过的家族形态：`IKLBSH`（`AUTH` 吞 message）、
+     *   `!IKIZNK`（思考死循环复用 `max-tokens`）—— **文案本身就是出路**的
+     *   错误，码与文案必须同轴。
+     *
+     * ⚠⚠ **ESA 专属措辞让位**：`formatZcodeEdgePageHint` 里的「边缘CDN」
+     *   是 ESA 页（带 `data-spm` 特征）的专属词，守卫
+     *   「ESA 分支与通用分支必须可区分」钉住「普通 405 页不得含边缘CDN」。
+     *   故这里**刻意不含**那个词 —— 405 的风控口径是**所有** 405 页共用的，
+     *   把它写成 ESA 专属会让非 ESA 的 405 页退化成通用分支。
+     *   （两条 405 文案守卫的诉求同时满足：既说「未到达 + 更换账号无效」，
+     *     又不冒充 ESA。）
+     *
+     * ⚠ 只覆盖 **405**：其它状态码的边缘页仍是「上游/网络层」口径
+     *   （5xx 瞬断确实该稍后重试，2026-10-07 那次修复的正面价值在这里保留）。
+     */
+    if (status === 405 && !looksLikeZcodeEsaPage(trimmed)) {
+      return (
+        `HTTP 405：上游风控拦截（请求未到达 ZCode 服务端，返回的是 HTML 错误页）——` +
+        `该错误**不会自动重试**：405 在 ZCode 是风控拦截的专属状态码，` +
+        `重试会加重账号冷却惩罚（30 分钟起，反复触发升级到 24 小时乃至停用）。` +
+        `**更换账号无效**（与账号余额、凭据有效性无关），请更换出口网络或稍后再试。` +
+        `${extractZcodeLogId(trimmed, undefined) !== undefined
+          ? ` logid：${extractZcodeLogId(trimmed, undefined)}`
+          : ''}`
+      )
+    }
     return `HTTP ${status}：${formatZcodeEdgePageHint(trimmed, status)}`
   }
 
@@ -2216,6 +2287,42 @@ export function httpErrorCodeForZcode(status: number, body: string): string {
    * 「有权威码 ⇒ 只信码；无码但有风控语义 ⇒ 也不是页面」。
    * ⚠ 这两处条件必须一致 —— 分叉就是又一次「只改了一半」。
    */
+  /**
+   * ★ **`405` 恒不可重试**（2026-10-25，Gitee issue IKQ4B4 + 本机实测）。
+   *
+   * ## 位置：必须在 HTML 短路**之前**，但在「有权威业务码」**之后**
+   *
+   * 两个邻位都不能错：
+   * - 放在 HTML 短路**之后** ⇒ 405 最常见的形态就是边缘 HTML 页
+   *   （`<title>405</title>`，无码无语义），那一格会先返回 `SERVER`
+   *   ⇒ 本格永不可达（初版正是这么放的，5 条用例实测全红）；
+   * - 放在业务码解析**之前** ⇒ `{"code":1005}` + 405 会被误判成
+   *   `PERMISSION`，而它本该是 `QUOTA_EXCEEDED`（真实回归，
+   *   本仓库「只改了一半」陷阱的又一次现身 —— 实测 1 条用例红）。
+   *
+   * ⇒ 判据与 {@link hasZcodeUnusualActivity} 的优先级约定同轴：
+   *   **有权威码 ⇒ 只信码；无码 ⇒ 405 才是风控**。
+   *
+   * ⚠⚠ 第三个邻位：**码不能取 `PERMISSION`**（那会破坏一条仓库铁律）。
+   * `tests/unit/zcode-claim-3012.spec.ts` 有一条等价守卫：
+   * 「`httpErrorCodeForZcode(...) === 'PERMISSION'` ⟺
+   *   `hasZcodeUnusualActivity(...)`」—— 它钉的是「PERMISSION 就是风控」。
+   * 而 405 的边缘页**没有风控语义**（`hasZcodeUnusualActivity` 判 false）
+   * ⇒ 归 `PERMISSION` 会让这条守卫红，且语义上也是冒名
+   *   （用户看到的是风控文案，实际是链路拦截）。
+   *
+   * ⇒ 取 **`PERMISSION_DENIED`**：与 `cline-adapter` 的地域限制、
+   *   `buddy-adapter` 的渠道校验同口径 —— 都是「账号/链路级拦截、
+   *   不可重试、但不冒充具体某一种上游错误」。它**不在**
+   *   harness 的 `DEFAULT_RETRYABLE_CODES` 里 ⇒ 不会白重试，正是目的。
+   */
+  if (
+    readZcodeBusinessCodeFromBody(trimmed) === undefined
+    && !hasZcodeUnusualActivity(trimmed)
+    && status === 405
+  ) {
+    return 'PERMISSION_DENIED'
+  }
   if (
     readZcodeBusinessCodeFromBody(trimmed) === undefined
     && !hasZcodeUnusualActivity(trimmed)
@@ -2234,6 +2341,8 @@ export function httpErrorCodeForZcode(status: number, body: string): string {
   if (status === 429) return 'RATE_LIMIT'
   if (status >= 500) return 'SERVER'
   if (status === 400) return 'INVALID_REQUEST'
+  // ⚠ `405` 已在函数**开头**单开（见那里的长注释）—— 这里不能再放一份，
+  //   否则是「同一语义两处判据」（本仓库红线），且开头那格会让这格永不可达。
   return 'SERVER'
 }
 

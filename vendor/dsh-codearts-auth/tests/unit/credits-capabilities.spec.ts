@@ -27,6 +27,12 @@ import { LOOMY } from '../../src/loomy-product.js'
 import { TRAE } from '../../src/trae-product.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
 import { OFFICEACE } from '../../src/officeace-product.js'
+import { QODER, QODER_CN } from '../../src/qoder-product.js'
+import { ASTUDIO } from '../../src/astudio-product.js'
+import { MINIMAX, MINIMAX_INTL } from '../../src/minimax-product.js'
+// ⚠️ AutoClaw 两站（2026-10-21，用户要求「补锁定开关」）：本家**确实有**永久桶
+//    （活动赠送的永久分不带 `deductionEndTime`）⇒ 两站各占一项。
+import { AUTOCLAW, AUTOCLAW_INTL } from '../../src/autoclaw-product.js'
 
 /**
  * 积分能力矩阵的回归测试。
@@ -302,7 +308,7 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     expect(supportsRateLimit('不存在的 provider')).toBe(true)
   })
 
-  it('登记 false 的都是「按钮语义管辖不到」的渠道（accio 2026-10-18 退出、astudio 加入）', () => {
+  it('登记 false 的都是「按钮语义管辖不到」的渠道（accio 2026-10-18 退出、astudio 加入、codely 2026-10-20 退出）', () => {
     const disabled = Object.entries(RATE_LIMIT_CAPABILITIES)
       .filter(([, caps]) => caps.rateLimit === false)
       // ⚠️⚠️ **必须减去「产品取舍」那一类**（2026-10-17）：`rateLimit: false` 有
@@ -314,29 +320,25 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
       .filter(([id]) => !RATE_LIMIT_OFF_BY_CHOICE.has(id))
       .map(([id]) => id)
       .sort()
-    // 五家 rationale 各不相同（registry 里各有字段注释）：
+    // rationale 各不相同（registry 里各有字段注释）：
     // - astudio（**本 fork**）：**不写 modelRateLimits 且不在 probeById 里**
-    //   ⇒ 两个按钮恒为惰性（点了零请求、零清除，用户会以为按钮坏了）。
-    //   `astudio-adapter.ts` 同款：刻意不进 src/index.ts 的 probeById ——
-    //   那张表被守卫锁成「恰好是会写标记的家」，硬塞进去会让守卫红 ⇒ 恒惰性。
-    //   ⚠️ 将来接上请求级换号 + 冷却时，必须**同时**改回 true 并进
-    //   probeById + WRITES_RATE_LIMIT_PROVIDERS（三处同改，由
-    //   provider-runtime-wiring.spec.ts 双向比对锁死）；
-    // - autoclaw：与 astudio **同族**（刻意不做请求级换号 + 冷却，
-    //   同样不进 `probeById`）⇒ 同样恒为惰性；
+    //   ⇒ 两个按钮恒为惰性（点了零请求、零清除，用户会以为按钮坏了）；
+    // - autoclaw：与 astudio 同族（刻意不做请求级换号 + 冷却，不进 probeById）；
     // - autoclawintl（2026-10-20）：与 autoclaw **同一个适配器类、同一份 registry
     //   字段语义** ⇒ 必然一起为 false（漏登记会让本条理由失真）。
     // - gemini / officeace：限流由服务端配额管理，本地标记清掉 / 重测通过
     //   都恢复不了配额；
     // - loomy：根本不返回限流错误。
     //
-    // ⚠️⚠️ **accio 曾在这条断言里，2026-10-18 因 issue IKM3ZV 退出**：
-    //   它当时的归类是「不写 modelRateLimits 且不在 probeById 里 ⇒ 按钮恒为惰性」
-    //   —— 即第 ① 类「管辖不到」。接上请求级换号 + 冷却（真的会写标记）且
-    //   `probeById` 已登记后，那条理由**不再成立**，故它整体移出
-    //   `rateLimit: false`（既不在①、也不在② 的「产品取舍」表里 ——
-    //   它是**真的可用**，不是「不要这个按钮」）。
-    expect(disabled).toEqual(['astudio', 'autoclaw', 'autoclawintl', 'gemini', 'loomy', 'officeace'])
+    // ⚠️ 2026-10-20：本条期望值曾在合并 remote master 时被写成
+    //    `['accio', …]`（上游口径），与本 fork 的注册表不一致：accio 已于
+    //    2026-10-18 因 issue IKM3ZV **退出**这张表（它接上了换号 + 冷却），
+    //    而 **astudio** 是本 fork 独有、且确实登记了 `rateLimit: false`。
+    //    ⇒ 按**注册表事实**更正（不是改注册表去凑这条断言）。
+    //    ⚠️ codely 同日退出：它的换号 + 探测已接线（见 provider-registry.spec 同源注释）。
+    // - magicrew（2026-10-29）：**与 astudio 同族** —— 零 `updateModelRateLimit`
+    //   写点、不在 `probeById` 里 ⇒ 两个按钮恒为惰性（点了零请求、零清除）。
+    expect(disabled).toEqual(['astudio', 'autoclaw', 'autoclawintl', 'gemini', 'loomy', 'magicrew', 'officeace'])
   })
 
   it('★ 「产品取舍」那一类也必须被点名（不得悄悄混进「管辖不到」里）', () => {
@@ -595,10 +597,25 @@ describe('客户端积分请求门控（源码级回归）', () => {
       '★★ loadCredits 必须把 force 透传给 credits.balances（否则「刷新」是假的）',
     ).toMatch(/rpcCall\('credits\.balances',\s*force\s*\?[^)]*:\s*\{[^}]*\}\)/)
 
-    // ② 「刷新积分」按钮
+    // ② 「刷新积分」按钮（2026-10-26 起是**图标按钮**，文案在 title / aria-label 里）
     const button = /onClick: \(\) => void loadCredits\(([^)]*)\)/.exec(source)
     expect(button, '★ 找不到「刷新积分」按钮的 onClick').not.toBeNull()
     expect(button![1], '★★ 「刷新积分」必须传 force=true').toContain('true')
+
+    // ②b 换图标后**必须**补的两处（否则是净损失，与「删除」那枚图标按钮同源教训）：
+    //     - `title`：原按钮文案「刷新积分」自带动作语义，图标不自解释
+    //     - `aria-label`：svg 标了 aria-hidden，没有它读屏只会念「按钮」
+    const refreshAt = source.indexOf('刷新积分：重新查询本页全部账号的剩余积分')
+    expect(refreshAt, '★ 「刷新积分」按钮的 title 丢了（图标不自解释）').toBeGreaterThan(-1)
+    const refreshBlock = source.slice(Math.max(0, refreshAt - 900), refreshAt + 400)
+    expect(refreshBlock, '★★ 图标按钮必须带 dim-jh-iconBtn（否则 svg 会被当文字挤成一行）')
+      .toMatch(/className: 'dim-jh-btn dim-jh-iconBtn'/)
+    expect(refreshBlock, '★★ 图标按钮必须给 aria-label（svg 是 aria-hidden）')
+      .toMatch(/'aria-label':\s*creditsLoading\s*\?/)
+    // 加载态不再换文案（没有文字可换）⇒ 必须走 data-loading + disabled 双保险
+    expect(refreshBlock, '★ 加载态必须有 data-loading（图标自转的唯一入口）')
+      .toMatch(/'data-loading':\s*creditsLoading\s*\?/)
+    expect(refreshBlock, '★ 加载态必须 disabled（否则能连点）').toMatch(/disabled:\s*creditsLoading/)
 
     // ③ 签到 / 新手任务领取后补读（余额刚变，必须绕过缓存）
     expect(source, '★★ 领取积分后补读必须 force').toContain('await loadCredits(true);')
@@ -633,13 +650,21 @@ describe('客户端积分请求门控（源码级回归）', () => {
   it('「刷新积分」按钮与账号卡片的「积分」行都按能力渲染', () => {
     // 归一化 CRLF：本仓库源码在 Windows 上是 CRLF，直接比对多行字面量会假失败。
     const normalized = source.replace(/\r\n/g, '\n')
-    expect(normalized).toMatch(/canLoadCredits\s*\n\s*\? React\.createElement\('button'/)
+    // ⚠️ 2026-10-26 起「刷新积分」是**图标按钮**，`? React.createElement('button'`
+    //    与它之间隔了 8 行注释 ⇒ 原正则（注释夹在 `?` 与 createElement 之间就匹配不上）
+    //    会假红。改为「canLoadCredits 后面紧跟一个 button 元素」，容忍中间任意注释。
+    expect(normalized).toMatch(/canLoadCredits\s*\n(?:\s*\/\/[^\n]*\n|\s*\n)*\s*\? React\.createElement\('button'/)
     expect(normalized).toContain('showCredits: canLoadCredits')
     // AccountCard 必须真的消费 showCredits，否则传了也没用
-    // ⚠️ 窗口不能只取 4000：账号名 hover（packageTooltip / accountTitle）的
-    // 计算代码插在函数头部与 CreditBalanceRow 渲染之间，把间距撑大了。
+    // ⚠️ 窗口**必须跟随函数体**，不能写死字符数 —— 2026-10-25 又来一次：
+    //    把卡片底部的按钮行提成 `actionsNode` 变量后（它插在 `return` 之前，
+    //    约 150 行），函数头到 `CreditBalanceRow` 的间距再次被撑大，
+    //    原 `cardStart + 8000` 窗口够不到 ⇒ 本条假红。
+    //    ⚠️⚠️ `AccountCard` 是**顶层**函数，函数体内部的大括号都缩进过，
+    //    故「顶格 `}` + 换行」就是它的闭合，与内部长度无关。
     const cardStart = normalized.indexOf('function AccountCard(')
-    const cardBody = normalized.slice(cardStart, cardStart + 8000)
+    const cardEnd = normalized.indexOf('\n}\n', cardStart)
+    const cardBody = normalized.slice(cardStart, cardEnd === -1 ? undefined : cardEnd)
     expect(cardBody).toContain('showCredits')
     expect(cardBody).toMatch(/showCredits\s*\n?\s*\?[\s\S]*CreditBalanceRow/)
   })
@@ -688,10 +713,38 @@ describe('永久积分锁定能力', () => {
    * 归一化到 `deductionEndTime` 后即可用同一个 `splitBuddyCreditsByExpiry` 分桶。
    * ⚠️ 2026-10-12 新增 OfficeAce（华为 MaaS）：creditGroups 自带 expiresAt
    *（订阅套餐包无固定到期 = 永久桶，签到 / 活动包有明确到期），同款判据可分桶。
+   *
+   * ⚠️ 2026-10-20 新增 Qoder 国际版 / 中国版（用户要求补齐三档分档 + 永久锁）：
+   *   `/sash/api/v2/me/usage` 的 `usage.expiresAt` 在个人版下发的恒是**永久哨兵**
+   *   `253402214400000`（`9999-12-31`）—— `qoder-credits.ts` 判定为哨兵时
+   *   **不写** `deductionEndTime`（未知到期 ⇒ 落永久桶），真实时间戳才写。
+   *   ⚠️ 判据是「不写」而非「写一个远期时刻」：后者会让面板渲染出
+   *   `9999-12-31（约 2900000 天后）` 这种荒谬文案（见
+   *   `tests/unit/qoder-lock-wiring.spec.ts` 的 `packageExpiryMs` 断言）。
+   *   ⚠️ **同样必须各占一项**（共用一个 `QoderAuth` 不等于共用一个 id）。
+   *
+   * ⚠️ 2026-10-20 新增 AStudio（讯飞 AstronStudio）：`/points/balance` 三池各带
+   *   `*NextExpireTime`（不带时区的本地时间串），已由 `astudio-credits.ts` 的
+   *   `astudioLocalTimeMs` 归一化到 `deductionEndTime`；且已接上
+   *   `createCredentialResolver` 的 `kind: 'buddy'` 选号（锁定才真能拦）。
+   *
+   * ⚠️ 2026-10-20 新增 MiniMax Code 中国版 / 国际版（用户报障：「MiniMax Code
+   *   积分也有到期时间，也应当有相同功能」）：`/minimax-cloud/api/v1/credit/details`
+   *   的每条 `details[]` 带 `expire_at_ms`（毫秒时间戳，无需换算），已直接写进
+   *   `deductionEndTime`；同日接上同一个 `kind: 'buddy'` 选号。
+   *   ⚠️ **是两个渠道 id，必须各占一项**（共用一个 `MinimaxAuth` 不等于共用一个 id）。
    */
-  const SUPPORTED = [LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id, OFFICEACE.id]
+  const SUPPORTED = [
+    LOOMY.id, CODEBUDDY.id, WORKBUDDY.id, TRAE.id, LOBSTERAI.id, OFFICEACE.id,
+    QODER.id, QODER_CN.id,
+    ASTUDIO.id, MINIMAX.id, MINIMAX_INTL.id,
+    // ⚠️ autoclaw / autoclawintl（2026-10-21 用户要求「补锁定开关」）：
+    //    本家批次映射里「无到期字段的发放（活动赠送的永久分）」⇒ 永久桶存在
+    //    ⇒ 需要锁定能力。两站**各占一项**（账号不互通）。
+    AUTOCLAW.id, AUTOCLAW_INTL.id,
+  ]
   const UNSUPPORTED = [
-    'codearts', 'qoder', 'qodercn', 'cline', 'raccoon',
+    'codearts', 'cline', 'raccoon',
   ]
 
   it('前后端的支持面完全一致（逐个 provider 对账）', () => {
@@ -773,6 +826,30 @@ describe('永久积分锁定能力', () => {
       expect(copy.lockTitle).not.toContain('天内到期')
     })
 
+    /**
+     * ⚠️⚠️ `lockTitle` 与 `lockedTitle` **必须可区分**，且只有**前者**带条件标记。
+     *
+     * 2026-10-28 审计实测：把两者改成**逐字相同**之后，`credits-capabilities` 47 条 +
+     * 两条 permanent-lock 的 31 条**全绿** —— 没有任何判据守这一点。
+     *
+     * 为什么这是缺陷而不是措辞洁癖：`lockTitle` 渲染在**未锁定**状态的按钮上，
+     * 那一刻「永久积分留着不动」是**假的**（永久积分正被消耗）；只有 `lockedTitle`
+     * 才能直陈现状。两者同文 ⇒ 说明与实际计费口径相反。
+     * 另一侧同样要钉住：同面板「刚解锁」的 `unlockedNotice` 说「会继续使用永久积分」，
+     * 若未锁定的 `lockTitle` 也说「留着不动」，两句话在同一屏上自相矛盾。
+     */
+    it('★★ 未锁定的 lockTitle 必须带「锁定后」条件标记，且不得与 lockedTitle 同文', () => {
+      for (const id of [...SUPPORTED, 'codearts']) {
+        const copy = permanentLockCopy(id)
+        expect(copy.lockTitle, `${id}：未锁定的按钮文案丢了「锁定后」⇒ 直陈现状，与体感相反`)
+          .toContain('锁定后')
+        expect(copy.lockTitle, `${id}：lockTitle 与 lockedTitle 同文 ⇒ 锁定/未锁定两种状态分不清`)
+          .not.toBe(copy.lockedTitle)
+        expect(copy.lockedTitle, `${id}：已锁定的文案不该带「锁定后」（那句本来就是现状）`)
+          .not.toContain('锁定后')
+      }
+    })
+
     it('四个文案位都齐（面板直接取用，缺一个就渲染出 undefined）', () => {
       for (const id of [...SUPPORTED, 'codearts']) {
         const copy = permanentLockCopy(id)
@@ -783,8 +860,68 @@ describe('永久积分锁定能力', () => {
       }
     })
 
+    /**
+     * ★ 句式结构守卫（用户 2026-10-27：「改成直白句式，说明『锁住永久积分 →
+     *   只烧 15 天内会作废的 → 这类烧完就没有可用账号了』」，随后「折中一下」）。
+     *
+     * ⚠️ 为什么要单独钉**顺序**：这三件事的因果链是「留着什么 → 烧什么 → 烧完怎样」，
+     *    顺序一乱读者就要自己重新拼接。而旧文案的毛病正是**句式绕** ——
+     *    「只消耗「15 天内到期」的积分包」一句里套三层引号，读起来要拆括号。
+     * ⚠️ 只断言「包含某关键词」是不够的：把三句话倒过来排、或把「无可用账号」
+     *    提到最前面，关键词照样都在、语义却散了。故用 `indexOf` 比较先后。
+     *
+     * ⚠️ 「没有可用账号」的判据必须写成**正则**，不能是固定字面量：
+     *    折中版把措辞收紧成「用完即无可用账号」（书面语），字面量与口语版的
+     *    「用完就没有可用账号了」不同。钉死某一种写法会让**改文案时假红**
+     *    —— 而本用例真正要守的是「说了这件事」+「顺序对」，不是措辞本身。
+     */
+    it('★★ 锁定文案必须按「留着永久 → 只烧临期 → 烧完没号」的顺序说清三件事', () => {
+      for (const id of [...SUPPORTED]) {
+        const copy = permanentLockCopy(id)
+        for (const key of ['lockTitle', 'lockedTitle', 'lockedNotice']) {
+          const text: string = copy[key]
+          const keepIdx = text.indexOf('永久积分留着不动')
+          const burnIdx = text.search(/只消耗 \d+ 天内到期的积分|只消耗每日赠送额度/)
+          // 「没有可用账号」/「无可用账号」两种措辞都认（见上方注释）。
+          const emptyIdx = text.search(/没有可用账号|无可用账号/)
+          expect(keepIdx, `${id}.${key} 没说「永久积分留着不动」`).toBeGreaterThan(-1)
+          expect(burnIdx, `${id}.${key} 没说「只消耗什么」`).toBeGreaterThan(-1)
+          expect(emptyIdx, `${id}.${key} 没说「用完就没有可用账号」`).toBeGreaterThan(-1)
+          // 顺序：留着什么 → 烧什么 → 烧完怎样
+          expect(keepIdx, `${id}.${key} 顺序错了（「留着不动」应在「只消耗」之前）`)
+            .toBeLessThan(burnIdx)
+          expect(burnIdx, `${id}.${key} 顺序错了（「只消耗」应在「无可用账号」之前）`)
+            .toBeLessThan(emptyIdx)
+        }
+      }
+    })
+
+    it('★★ 不再出现嵌套引号的绕口句式（旧文案的形态）', () => {
+      for (const id of [...SUPPORTED]) {
+        const copy = permanentLockCopy(id)
+        for (const key of ['lockTitle', 'lockedTitle', 'lockedNotice']) {
+          // 旧文案：只消耗「15 天内到期」的积分包 —— 引号套在数字外面。
+          expect(copy[key], `${id}.${key} 又变回嵌套引号的绕口句式`)
+            .not.toMatch(/只消耗「/)
+          // 「这类积分用尽后将没有可用账号」——「将」字句比直陈句绕。
+          expect(copy[key], `${id}.${key} 又用回了「用尽后将」句式`)
+            .not.toContain('用尽后将')
+        }
+      }
+    })
+
     it('未登记的 provider 回落到 Loomy 口径而不是崩（面板共用同一段代码）', () => {
-      expect(permanentLockCopy('codearts').lockedNotice).toContain('每日赠送额度')
+      // ⚠️ 2026-10-20：原来这里用 `codearts` 当「未登记」的样本，但 codearts
+      // 现在已有 `usesExpiryWindow: true`（三档分档 + 永久锁）⇒ 它走的是带天数
+      // 那套文案，不再回落。改用一个**确实未登记**的 id，测的才是回落本身。
+      expect(permanentLockCopy('modelscope').lockedNotice).toContain('每日赠送额度')
+      expect(permanentLockCopy('__not_registered__').lockedNotice).toContain('每日赠送额度')
+    })
+
+    it('codearts 现在走带天数的文案，不再回落（三档分档生效后必须如此）', () => {
+      const copy = permanentLockCopy('codearts', 15)
+      expect(copy.lockedNotice).toContain('15 天内到期')
+      expect(copy.lockedNotice).not.toContain('每日赠送额度')
     })
   })
 })

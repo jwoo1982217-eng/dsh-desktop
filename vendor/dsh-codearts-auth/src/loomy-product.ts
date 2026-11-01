@@ -254,7 +254,7 @@ export function loomyContextWindow(modelId: string, declared: number): number {
  * ## 为什么需要（真实缺陷，2026-10-14 用户报障）
  *
  * 用户报障「loomy 的模型输入不能上图？尤其是 qwen3.8max」。根因与 raccoon 那起
- * （`tags.vision` 不是能力契约，见 `RACCOON_IMAGE_CAPABILITY_OVERRIDES`）**同型**，
+ * （`tags.vision` 不是能力契约，见 `RACCOON_TEXT_ONLY_MODELS`）**同型**，
  * 只是这次的「元数据」是 `input_modalities` 而不是 `tags`：
  *
  * 1. 远端 `GET /api/v1/models` 对 `qwen-3.8-max` 下发

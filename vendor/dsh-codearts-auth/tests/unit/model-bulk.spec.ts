@@ -61,84 +61,21 @@ describe('bulkButtonState（批量开关按钮可用性）', () => {
 })
 
 /**
- * 客户端接线守卫（源码级）。
+ * ⚠️ 客户端接线守卫（源码级）已于 2026-10-26 **删除**。
  *
- * 组件无法在本仓库单测里渲染（react 不在依赖内），故与
- * `credits-capabilities.spec.ts` / `jet-hub-rpc.spec.ts` 同法：用源码级断言
- * 锁住「按钮存在、走批量端点、且关闭全部有二次确认」这几件不能退化的事。
+ * 原 `describe('ModelListPanel 批量按钮接线')` 守的是模型列表弹窗顶部的
+ * 「打开全部 / 关闭全部」工具条。该工具条按用户要求移除（它与分组头的
+ * 「本组全开 / 本组全关」在界面上看着像重复），`jet-hub.js` 里的
+ * `setAllDisabled` 与 `bulkButtonState` 调用点随之消失 ⇒ 那些断言已无对象可守。
  *
- * 这些断言各自对应一个真实会犯的错：
- * - 走单条端点循环 → 30 个模型发 30 次请求 + 30 次目录广播（批量端点白加了）；
- * - 关闭全部没有确认 → 一次误点关掉全部模型，且用户不知道发生了什么；
- * - 批量期间不禁用单条开关 → 并发写入互相覆盖（整体写入语义下必然丢改动）。
+ * ⚠️ **`model-bulk.js` 本身没有废**：`model-groups.js` 的 `groupBulkStateFor`
+ * 仍在用它算分组按钮的可用性，上面这组纯逻辑用例继续有效。
+ *
+ * ⚠️ **服务端 `model.setAllDisabled` 也没废**，另有两个入口在调它：
+ * 账号停用/启用流程（`jet-hub.js` 的「账号已停用，但关闭模型失败」那条链）
+ * 与供应商弹窗的「整家全开 / 全关」。删掉的只是这一个 UI 入口。
+ *
+ * ⚠️ 移除的代价（用户知情后仍选择删）：模型列表弹窗里再没有能一键清掉
+ * 「已下线模型的历史关闭项」的入口 —— 分组按钮只删当前列表里本组那些 id，
+ * 死键从此只能靠关闭/启用账号那条链或供应商弹窗去清。
  */
-describe('ModelListPanel 批量按钮接线（源码级回归）', () => {
-  const source = readFileSync(
-    resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/jet-hub.js'),
-    'utf8',
-  )
-  // 归一化 CRLF：本仓库源码在 Windows 上是 CRLF，直接比对多行字面量会假失败。
-  const normalized = source.replace(/\r\n/g, '\n')
-
-  it('引用了纯逻辑模块，而不是在本文件里另写一份判定', () => {
-    expect(source).toContain("from './model-bulk.js'")
-    expect(source).toContain('bulkButtonState')
-  })
-
-  it('两个按钮都存在且文案正确', () => {
-    expect(normalized).toContain('打开全部')
-    expect(normalized).toContain('关闭全部')
-  })
-
-  /**
-   * 必须调用**批量**端点，而不是循环调用单条端点。
-   *
-   * 这是本功能的核心价值：一次落盘、一次广播。若退化成循环，30 个模型会发
-   * 30 次请求并把客户端目录反复刷新 30 次。
-   */
-  it('走批量端点 model.setAllDisabled，而不是循环调用 model.setDisabled', () => {
-    const start = normalized.indexOf('const setAllDisabled')
-    expect(start, '缺少 setAllDisabled 处理函数').toBeGreaterThan(-1)
-    const body = normalized.slice(start, start + 1600)
-    expect(body).toContain("rpcCall('model.setAllDisabled'")
-    // 批量路径里不得出现单条端点调用
-    expect(body).not.toContain("rpcCall('model.setDisabled'")
-  })
-
-  /** 关闭全部必须二次确认：一次误点会关掉全部模型。 */
-  it('关闭全部在执行前要求确认', () => {
-    const start = normalized.indexOf('const setAllDisabled')
-    const body = normalized.slice(start, start + 1600)
-    const confirmIndex = body.indexOf('confirm(')
-    const callIndex = body.indexOf("rpcCall('model.setAllDisabled'")
-    expect(confirmIndex, '关闭全部缺少二次确认').toBeGreaterThan(-1)
-    // 确认必须在请求之前，否则等于没确认
-    expect(confirmIndex).toBeLessThan(callIndex)
-  })
-
-  /** 打开全部**不应**弹确认：它是恢复性操作，弹窗只会碍事。 */
-  it('打开全部不要求确认', () => {
-    const start = normalized.indexOf('const setAllDisabled')
-    const body = normalized.slice(start, start + 1600)
-    // 确认分支必须由 disabled 条件包裹（即只有关闭方向才确认）
-    expect(body).toMatch(/if\s*\(\s*disabled\s*&&\s*!confirm\(/)
-  })
-
-  /** 批量提交期间必须禁用单条开关，避免并发写入互相覆盖。 */
-  it('批量进行中禁用单条开关', () => {
-    const start = normalized.indexOf('const setAllDisabled')
-    const body = normalized.slice(start, start + 1600)
-    expect(body).toContain('setBulkBusy(true)')
-    expect(body).toContain('setBulkBusy(false)')
-    // ModelToggle 的 busy 必须把批量状态也算进去
-    expect(normalized).toMatch(/busy:\s*busyIds\.has\(model\.id\)\s*\|\|\s*bulkBusy/)
-  })
-
-  /** 失败走顶部提示、保留列表，而不是把整张表替换成错误页。 */
-  it('批量失败只提示、不把列表替换成错误页', () => {
-    const start = normalized.indexOf('const setAllDisabled')
-    const body = normalized.slice(start, start + 1600)
-    expect(body).toContain('setToggleError')
-    expect(body).not.toContain("setPhase('error')")
-  })
-})

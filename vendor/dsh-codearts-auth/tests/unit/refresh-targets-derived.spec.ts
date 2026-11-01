@@ -167,6 +167,17 @@ describe('modelAdapters 的键集合守卫（行为断言）', () => {
     //    见 `index.ts` 那段长注释 §5.2）。它进表是为了 `fullCatalogIds` 能拿到
     //    **不套黑名单**的全量目录；漏了它会让「关闭整个聚合 provider」时
     //    只拿到未被关闭的 id。⇒ 它**不该**被当成「多余的键」删掉。
+    //
+    // ⚠️ **`codely` 是第二家**（2026-10-20）：`channel: false` 但**必须**进表
+    //    —— `provider.status` 的「模型数 / 已关闭」读本表的 `listAllModels()`，
+    //    且「关闭整个 provider」靠它拿全量目录写黑名单；缺它 ⇒ 面板恒「模型 0」、
+    //    模型选择器里的 8 个真实模型**关不掉**（矛盾态，同 modelscope 那条注释）。
+    //    与 `aggregate` 的例外**同族**：进表 ≠ 有 auth / 有推理 —— 它的适配器是
+    //    真实的（目录来自实测 200 的 `/api/model-status`，`stream()` 显式报
+    //    「推理通道尚未接通」），而 `channel: true` 会把「应有 auth / 应进聚合 /
+    //    应可续期」三张守卫一起点燃，在推理与续期落地前那才是真要假桩的地方。
+    // ⚠️ 2026-10-22（A6）：codely **已翻 `channel: true`** ⇒ 它由 `channelIds` 覆盖，
+    //    不得再留在例外名单里（下面的反向断言会直接变红）。
     const EXTRA_KEYS = ['aggregate']
     const expected = [...channelIds, ...EXTRA_KEYS].sort()
     expect(
@@ -270,5 +281,77 @@ describe('modelAdapters 的键集合守卫（行为断言）', () => {
       + '⇒ 用户在设置页关闭整个 provider 后它显示为「未关闭」且模型仍可选）：'
       + missing.join(', '),
     ).toEqual([])
+  })
+
+  /**
+   * ⑨ **codely 是 `channel: false` 却进表的例外** —— 用例 ⑧ 遍历的是
+   * `channel` 集合，**覆盖不到它**，而它恰恰出过真实报障：
+   *
+   * > 用户 2026-10-20：「为啥供应商还是没显示有模型？」
+   *
+   * 根因是本表缺 `codely` 键 ⇒ `provider.status` 的 `models.total` 恒 0 ⇒
+   * 设置页显示「模型 0（已关 0）」，且**模型选择器里那 8 个真实模型关不掉**
+   * （「关闭整个 provider」拿不到全量目录去写黑名单）。
+   *
+   * ⚠️ 为什么单独一条而不是并进 ⑧：它俩的**期望集来源不同**（⑧ 是
+   * `channel` 集合、本条是 `EXTRA_KEYS` 例外），塞进同一个数组会把两件
+   * 语义不同的事混成一条断言 —— 失败时无法区分是「channel 漏键」还是
+   * 「例外又漏了」。
+   *
+   * ⚠️ 与 ⑧ 同样**刻意不**断言具体条数（目录会随上游更新腐坏），只断言非空。
+   */
+  it('⑨ codely（channel:false 的进表例外）也要能从 provider.status 取到目录', async () => {
+    clearProviderRuntimes()
+    const ctx = new Context()
+    ctx.provide('credentials', {
+      resolve: async () => undefined,
+      describe: async () => ({ configured: false, writable: true }),
+      set: async () => {},
+      unset: async () => {},
+    } as never)
+    ctx.provide('commands', { register: () => () => {}, definitions: [] } as never)
+    ctx.provide('llm', {
+      registerConfigurableProviders: () => ({ replace() {} }),
+      registerAdapter: () => ({ replace() {} }),
+      listModels: async () => [],
+    } as never)
+    const state = { value: { accounts: [], disabledModels: {} } }
+    ctx.provide('settings', {
+      register() { return { get: () => state.value, replace: (v: unknown) => { state.value = v } } },
+      describe() { return [] },
+    } as never)
+    let handler: ((req: Request) => Promise<Response>) | undefined
+    ctx.provide('connection', {
+      fetch: {
+        register: (spec: { path: string; fetch: (req: Request) => Promise<Response> }) => {
+          if (spec.path === JET_HUB_API_PATH) handler = spec.fetch
+        },
+      },
+    } as never)
+
+    apply(ctx)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(handler, 'jet-hub RPC 端点未注册').toBeDefined()
+
+    const res = await handler!(new Request('http://localhost/api/jet-hub', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: 'r-status-codely',
+        method: 'jet-hub',
+        payload: { method: 'provider.status', payload: { providers: ['codely'] } },
+      }),
+    }))
+    const body = await res.json() as {
+      result: { ok: boolean; value: { statuses: Record<string, { models: { total: number } }> } }
+    }
+    expect(body.result.ok, `provider.status 失败：${JSON.stringify(body.result)}`).toBe(true)
+    // ⚠️ 无凭据桩（`credentials.resolve` 恒 undefined）⇒ 适配器走**兜底表**
+    //    （远端 `/api/model-status` 读不到时那份 8 条静态目录）⇒ 总数仍应 > 0。
+    expect(
+      body.result.value.statuses.codely?.models.total ?? 0,
+      'modelAdapters 缺 codely 键 ⇒ 设置页「模型 0（已关 0）」且模型关不掉',
+    ).toBeGreaterThan(0)
   })
 })

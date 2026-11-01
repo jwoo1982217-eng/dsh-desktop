@@ -59,7 +59,7 @@ export declare function exchangeAutoclawZaiCode(code: string, state: string, nav
 /** 手机号格式正则（中国大陆11位手机号）。 */
 export declare const PHONE_NUMBER_RE: RegExp;
 /**
- * 从本地 Windows DPAPI 及 AES-256-GCM 探测 AutoClaw 桌面端保存的有效凭据（一键导入模式）。
+ * 读取本机 AutoClaw 登录凭据：Mac 钥匙串/CBC，Windows DPAPI/GCM。
  *
  * ## ⚠️⚠️ 凭据来源是**用户真实凭据**，故必须可隔离（2026-10-17 审计 P0 修复）
  *
@@ -107,6 +107,18 @@ export declare function refreshAutoclawToken(refreshToken: string, options?: {
     product?: AutoclawProduct;
     fetchImpl?: typeof fetch;
     deviceId?: string;
+    /**
+     * **单次请求**超时（毫秒）；缺省 {@link AUTOCLAW_REQUEST_TIMEOUT_MS}（60s）。
+     *
+     * ⚠️ 存在的理由（2026-10-27 审计 P2-2）：本函数**依次试两个端点**
+     * （`/userapi/v1/refresh` 与 `/agent-refresh`），各用 60s ⇒ 调用方光等刷新
+     * 就可能 **120s**。签到那条腿若用它，用户点「一键领取」最坏要等
+     * `2×60 + 15 = 135s`（实测真实挂钟 **120,015ms** 只差 claim 那段），
+     * 而修复前上界是 15s ⇒ 9 倍。
+     *
+     * ⇒ 让调用方按自己的预算覆盖它（签到腿用 {@link AUTOCLAW_CLAIM_REFRESH_TIMEOUT_MS}）。
+     */
+    timeoutMs?: number;
 }): Promise<AutoclawCredential>;
 /**
  * 校验 AutoClaw 凭据是否连通可用。
@@ -157,6 +169,10 @@ export interface AutoclawSmsLoginFlowOptions {
     fetchImpl?: typeof fetch;
     deviceId?: string;
 }
+/** 国际版复用官方 Z.ai 授权及换 token 协议；浏览器与回调均在当前设备。 */
+export declare function startAutoclawZaiLoginFlow(options: AutoclawSmsLoginFlowOptions & {
+    callbackPorts?: readonly number[];
+}): Promise<StartedAutoclawSmsLoginFlow>;
 /**
  * 启动本地独立服务器承载 AutoClaw 登录授权页（支持一键读取本地凭据或手机验证码登录）。
  */

@@ -74,6 +74,12 @@ import { fetchRaccoonCreditBalance } from './raccoon-credits.js'
 import { fetchModelscopeBalanceDetailed } from './modelscope-credits.js'
 import type { ModelscopeCredential } from './modelscope.js'
 import { MODELSCOPE } from './modelscope-product.js'
+// ⚠️ **本 fork 独有**（超级麦吉 Magicrew，2026-10-29）：积分余额原语。
+import { fetchMagicrewBalance } from './magicrew-credits.js'
+// ⚠️ **本 fork 独有**（Codely/Unity，2026-10-19）：积分余额原语。
+// 2026-10-20 起接每日签到（`/api/points/check-in`，实测 200）。
+import { claimCodelyDailyCheckIn, fetchCodelyBalanceDetailed } from './codely-credits.js'
+import type { CodelyCredential } from './codely-auth.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
 import { fetchAstudioBalanceDetailed, claimDaily } from './astudio-credits.js'
 import { fetchAutoclawBalanceDetailed, claimAutoclawDailyQuota } from './autoclaw-credits.js'
@@ -114,6 +120,9 @@ import type { ZcodeCredential } from './zcode.js'
  * 单测使用。结构化类型同时让单测可以传**只带一个方法的替身**。
  */
 export interface ProviderCreditsDeps {
+  /** 当前插件实例的签名传输，避免跨实例出口与凭据错配。 */
+  readonly codeartsFetch?: typeof fetch
+
   readonly zcodeSourceInfo?: (accountId: string) => ReturnType<ZcodeSources['list']>
 
   /** Loomy auth 实例（省略时回退到自由函数 + 全局 fetch）。 */
@@ -157,6 +166,27 @@ export interface ProviderCreditsDeps {
    * 固化成一份 fetcher —— 账号可能随时在面板里改代理。
    */
   readonly geminiFetchFor?: (accountId: string) => typeof fetch
+  /**
+   * MiniMax **国际站**的按账号 fetcher（PR !145 审计 P0 修法）。
+   *
+   * ## ⚠️⚠️ 为什么必须有它（真实缺陷，本 PR 自己声称要修却没修）
+   *
+   * PR !145 的提交说明与 `index.ts` 注释都写「登录 / 续期 / 目录 / 身份 / 推理 /
+   * **积分**六条链路都走 `minimaxIntlFetchForAccount`」，但本文件（三个积分入口
+   * 的所在处）**一行都没改** —— 三个原语的第二参仍是 `undefined`（⇒ 默认参数
+   * = 全局 `fetch`）。而 `agent.minimax.io` 按出口 IP 国别分流，大陆出口直连
+   * 恒 307 到中国站，中国站不认国际站 token ⇒ 401。
+   *
+   * ⇒ **用户配好代理后，对话能用了，积分行却仍报「余额查询失败」、一键签到仍
+   * 失败** —— 症状与 issue IKMEVG 逐字相同，只是从「全部链路」缩到「积分」这一面。
+   *
+   * ⚠️ 与 {@link geminiFetchFor} **刻意分成两个字段**：两家语义与主机都不同
+   *（Gemini 是「墙外连不上」，国际站是「连得上却被分流」），共用会让
+   *「清掉一家的代理」连带清掉另一家的出口配置。
+   *
+   * ⚠️ 同样必须**惰性**调用（按 `accountId` 现取）：账号可能随时在面板里改代理。
+   */
+  readonly minimaxIntlFetchFor?: (accountId: string) => typeof fetch
 }
 
 /**
@@ -209,6 +239,45 @@ export function buildZcodeBalance(result: ZcodeBalanceResult): CreditBalance {
       cycleEndTime: '',
       expiredTime: result.expiresAt !== undefined
         ? new Date(result.expiresAt * 1000).toISOString()
+        : '',
+    })
+  }
+  /**
+   * ★★ 「**已领、但还没到生效时刻**」的计划 —— 单独成一个包（2026-10-23 实测）。
+   *
+   * ## 为什么必须显示（用户报障）
+   *
+   * 领完 1024 活动后签到显示「+500.00MToken 领取成功」，**但额度查询仍是 0**
+   * ⇒ 用户以为白领了（实测上游：`balances` 桶为空、`plans[]` 里 `status: active`
+   * 且 `effective_at` = 23:00 ⇒ 额度**已锁定**、只是还没建桶）。
+   *
+   * ## 为什么不并进 `remaining`
+   *
+   * `remaining` 是「**现在就能用**」的额度；并进去会让折算层
+   * （`aggregate-expiry.ts` 的 `zcodeExpiry`）判成「有额度」⇒
+   * **在生效前就把渠道派发出去**（必然失败：额度还不存在）。
+   * ⇒ 独立成包，且 `remaining/total` 都给 0（此刻确实不能用），
+   *   只用 `expiredTime` 之外的 `cycleStartTime` 携带**生效时刻**。
+   *
+   * ⚠ `active: false` —— 它**不是**当前可用额度（前端据此不计入可用合计）。
+   */
+  for (const pending of result.pendingPlans ?? []) {
+    packages.push({
+      name: pending.name ?? 'ZCode 活动额度（待生效）',
+      unit: pending.unitType ?? 'token',
+      remaining: 0,
+      total: pending.grantUnits ?? 0,
+      used: 0,
+      active: false,
+      // ⚠ **生效时刻**放在 cycleStartTime（前端「待生效/生效倒计时」读它）。
+      cycleStartTime: pending.effectiveAt !== undefined
+        ? new Date(pending.effectiveAt * 1000).toISOString()
+        : '',
+      cycleEndTime: pending.endsAt !== undefined
+        ? new Date(pending.endsAt * 1000).toISOString()
+        : '',
+      expiredTime: pending.endsAt !== undefined
+        ? new Date(pending.endsAt * 1000).toISOString()
         : '',
     })
   }
@@ -276,6 +345,33 @@ async function runTraeLotteryForUi(credential: TraeCredential): Promise<string |
 export function createProviderCredits(
   deps: ProviderCreditsDeps = {},
 ): Readonly<Record<string, ProviderCredits>> {
+  /**
+   * MiniMax 国际站该用哪个 fetcher（**三个入口共用这一份判据**）。
+   *
+   * ## ⚠️⚠️ 为什么抽成一处（PR !145 审计 P0 的修法）
+   *
+   * 三个入口（余额 / 签到状态 / 领取）都要按账号取出口，而它们的**取法完全相同**。
+   * 写成三份内联三元就是本仓库反复记录的「同义判据两份实现必然漂移」——
+   * 漏改一份的症状是「余额走了代理、签到没走」，而这种半通状态比全不通更难归因。
+   *
+   * ## 判据
+   *
+   * - 没注入 `minimaxIntlFetchFor`（单测 / 旧接线）⇒ **全局 `fetch`**，
+   *   与修复前**逐字节等价**；
+   * - 注入但拿不到账号 id（`undefined` / 空串）⇒ **全局 `fetch`**：
+   *   不知道是谁就不该猜一个账号去用它的出口（那会把请求发到错误的出口上）；
+   * - 都拿到 ⇒ 按账号现取（`fetchFor` 内部会读池里的 `minimaxIntlProxy`）。
+   *
+   * ⚠️ `fetchFor` 在代理串非法时**会抛错**（见 `minimax-proxy.ts` 的模块头：
+   * 「归一可能失败，那必须抛错让用户看见，而不是静默退回直连」）。本函数
+   * **不吞**它 —— 吞掉就退化成静默直连，那正是这次要消灭的形态。
+   */
+  const minimaxIntlFetcher = (accountId: string | undefined): typeof fetch => {
+    if (deps.minimaxIntlFetchFor === undefined) return fetch
+    if (accountId === undefined || accountId === '') return fetch
+    return deps.minimaxIntlFetchFor(accountId)
+  }
+
   return {
     /**
      * CodeArts（华为云）：余额搭 `statistics/plugin` 的账户类型检测回来，
@@ -290,7 +386,7 @@ export function createProviderCredits(
         // 「AK 限流」「签名失败」「凭据过期」压成同一句笼统文案，
         // 用户与排查者都拿不到线索（本端点就因此把一次 401 显示成了
         // 无信息量的「账户信息查询失败」）。
-        const result = await fetchCodeArtsAccountInfoDetailed(credential as CodeArtsCredential)
+        const result = await fetchCodeArtsAccountInfoDetailed(credential as CodeArtsCredential, deps.codeartsFetch)
         if (!result.ok) return fail(`账户信息查询失败：${result.message}`)
         const info = result.info
         if (!info.isCreditPackage) {
@@ -311,7 +407,7 @@ export function createProviderCredits(
        * 故 `precheckStatus: false` 跳过外部那次 CodeBuddy 式的状态查询 ——
        * 用 `fetchCheckinStatus` 打华为端点既发错请求又必然失败。
        */
-      claim: (credential) => claimCodeArtsDailyCheckin(credential as CodeArtsCredential),
+      claim: (credential) => claimCodeArtsDailyCheckin(credential as CodeArtsCredential, deps.codeartsFetch),
       precheckStatus: false,
     },
 
@@ -400,6 +496,39 @@ export function createProviderCredits(
     modelscope: {
       fetchBalanceDetailed: async (credential) =>
         fetchModelscopeBalanceDetailed(credential as ModelscopeCredential, MODELSCOPE),
+    },
+
+    /**
+     * Codely（Unity 团结引擎）：**本 fork 独有**（2026-10-19 接入积分余额）。
+     *
+     * 真端点 `GET /api/user/usage/summary`（Bearer + X-User-Agent），实测 200
+     * 返回 `remaining_points:"2400"` —— ⚠️ 数字是**字符串**，解析在
+     * `fetchCodelyBalanceDetailed` 内（string | number 双形态）。
+     *
+     * ⚠️ registry 里 `channel:false` 但 `balance:true` —— 这是全仓第一例
+     * 「有余额能力、无 auth 服务」的组合：登录走设备码纯函数（无 XxxAuth）、
+     * 余额原语是自由函数，二者都不需要 auth 实例。它**不**违反
+     * `provider-runtime-wiring.spec.ts` 那条「balance ⇒ runtime.credits」守卫 ——
+     * 该守卫只检查**已注册 runtime** 的渠道，codely 没有 runtime（无 adapter）
+     * 而被跳过；端点侧的表（`jet-hub-rpc.ts` 的 `createProviderCredits`）
+     * 不依赖 runtime。
+     */
+    codely: {
+      fetchBalanceDetailed: async (credential) =>
+        fetchCodelyBalanceDetailed(credential as CodelyCredential),
+      /**
+       * 每日签到（2026-10-20 实测接通）：两步端点
+       * `POST /api/points/check-in/init` → `POST /api/points/check-in`，
+       * 幂等判据在 `init` 的 `can_check_in`，**内部自带状态预检** ⇒
+       * `precheckStatus: false`（与 autoclaw / codearts 同因：外部再查一次
+       * 属于重复请求，且骨架默认的 buddy 式 `fetchCheckinStatus` 打它的端点
+       * 必然失败 —— 那是一次发错端点的真实上游请求）。
+       *
+       * ⚠️ 网页 dashboard 同款流程；官方 CLI 二进制里没有签到调用（它只管
+       * 推理/余额），端点来源是网页 SPA bundle —— 见 `codely-credits.ts`。
+       */
+      claim: (credential) => claimCodelyDailyCheckIn(credential as CodelyCredential),
+      precheckStatus: false,
     },
 
     /**
@@ -502,8 +631,30 @@ export function createProviderCredits(
     autoclaw: {
       fetchBalanceDetailed: async (credential) =>
         await fetchAutoclawBalanceDetailed(credential as AutoclawCredential),
-      claim: async (credential) =>
-        await claimAutoclawDailyQuota(credential as AutoclawCredential),
+      /**
+       * ⚠️ **必须把 `call.warn` 与 `call.persistCredential` 透传下去**
+       * （2026-10-27 Gitee PR #153 审计 P0/P1-3）：
+       * - `warn`：刷新失败原先被裸 `catch` 吞掉，`outcome` 与成功逐字相同 ⇒
+       *   用户永远不知道「活动奖励其实没发」；
+       * - `persistCredential`：刷新**可能轮换** `refresh_token`，新值若没人接住，
+       *   旧值立即作废 ⇒ 账号续期能力被**逐日烧掉**（详见
+       *   `ProviderCallContext.persistCredential` 的长注释）。
+       *   ⚠️ 这里用 `entry.credentialRef` 绑 ref —— 与 `resolve` 那条腿**同一个
+       *   ref 约定**（`credentialRef(entry.credentialRef)`），不要自己拼。
+       */
+      claim: (credential, entry, call) =>
+        claimAutoclawDailyQuota(credential as AutoclawCredential, {
+          warn: (message) => call?.warn(message),
+          ...call?.persistCredential === undefined
+            ? {}
+            : {
+                persist: (next: AutoclawCredential) =>
+                  call.persistCredential!(
+                    entry?.credentialRef as unknown as string,
+                    JSON.stringify(next),
+                  ),
+              },
+        }),
       precheckStatus: false,
     },
     /**
@@ -523,11 +674,21 @@ export function createProviderCredits(
           credential as AutoclawCredential,
           { product: AUTOCLAW_INTL },
         ),
-      claim: async (credential) =>
-        await claimAutoclawDailyQuota(
-          credential as AutoclawCredential,
-          { product: AUTOCLAW_INTL },
-        ),
+      /** 与 `autoclaw` 同形（含 `warn` / `persistCredential` 透传），只差产品基址。 */
+      claim: (credential, entry, call) =>
+        claimAutoclawDailyQuota(credential as AutoclawCredential, {
+          product: AUTOCLAW_INTL,
+          warn: (message) => call?.warn(message),
+          ...call?.persistCredential === undefined
+            ? {}
+            : {
+                persist: (next: AutoclawCredential) =>
+                  call.persistCredential!(
+                    entry?.credentialRef as unknown as string,
+                    JSON.stringify(next),
+                  ),
+              },
+        }),
       precheckStatus: false,
     },
     accio: {
@@ -671,24 +832,67 @@ export function createProviderCredits(
      * 不填则行为与修复前完全一致（不附该头）。
      *
      * ⚠️ 每次调用**现读** `deps.minimaxXff()`（用户随时可能改设置）。
+     *
+     * ⚠️⚠️ **三个入口都必须走该账号的出口**（PR !145 审计 P0 修法，真实缺陷）：
+     * PR !145 只把按账号 fetcher 接进了 `BuddyBalanceSelector`（**选号器**），
+     * 而**积分面板**走的是本文件的三个入口 —— 它们当时仍传 `undefined`
+     *（= 全局 `fetch`）⇒ 配好代理后对话能用、积分行却仍报「余额查询失败」、
+     * 一键签到仍失败。症状与 issue IKMEVG 逐字相同。
+     *
+     * ⚠️ **三个入口的「账号 id 从哪来」并不相同**（实测三个调用点的签名，
+     * 别按「看起来统一」去改）：
+     *
+     * | 入口 | 第二参 | 账号 id 来源 |
+     * |---|---|---|
+     * | `fetchBalanceDetailed` | `call: ProviderCallContext` | `call?.accountId` |
+     * | `fetchStatus` | `product`（**不是** call） | 拿不到 ⇒ 直连（见下） |
+     * | `claim` | `entry: ProviderAccountEntry` | `entry.id` |
+     *
+     * ⇒ `fetchStatus` 那条**结构上拿不到账号 id**（骨架 `collectCreditsStatus` /
+     * `collectClaimResults` 传的第二参都是 `product`），故它只能直连。这是
+     * **如实登记的限制**，不是漏改：要修它得先改两个骨架的签名（波及十家
+     * provider 的 `fetchStatus` 实现），超出本次修复范围。
+     * ⚠️ 后果：**签到状态预检**在国际站上仍走直连 ⇒ 大陆出口下 `credits.status`
+     * 与「一键签到」的预检那一步仍可能失败。`claim` 本身已走代理。
      */
     minimaxintl: {
       // ⚠️ 走 Detailed（理由同中国版）：否则「地理分流 / 凭据失效 / 网关签名」
       //    这些**唯一能指路**的原因会被压成一句「余额查询失败」。
-      fetchBalanceDetailed: async (credential) => {
+      fetchBalanceDetailed: async (credential, call) => {
         const { balance, error } = await fetchMinimaxCreditBalanceDetailed(
-          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+          credential as MinimaxCredential,
+          minimaxIntlFetcher(call?.accountId),
+          MINIMAX_INTL,
+          deps.minimaxXff?.(),
         )
         return { balance, ...error === undefined ? {} : { error } }
       },
+      // ⚠️ **第二参是 `product` 不是 `call`**（`ProviderCredits.fetchStatus` 的
+      //    签名是 `(credential, call)`，但两个骨架调用点传的都是 `product` ——
+      //    见上表的限制说明）。这里**刻意显式忽略**该参并直连：
+      //    硬写 `(credential, call) => ... call?.accountId` 会得到一个恒
+      //    `undefined` 的 `accountId`（因为传进来的是 product），
+      //    症状是「看起来接了代理、实际永远直连」—— 比不接更难查。
       fetchStatus: (credential) =>
         fetchMinimaxSigninStatus(
-          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+          credential as MinimaxCredential,
+          undefined,
+          MINIMAX_INTL,
+          deps.minimaxXff?.(),
         ),
       // 预检与幂等理由同中国版（见上）。
-      claim: (credential) =>
+      //
+      // ⚠️ **第二参是 `entry` 不是 `call`**（`ProviderCredits.claim` 的签名是
+      //    `(credential, entry, call)` —— 收 `entry` 是为了 TRAE 的指纹代次）。
+      //    账号 id 从 `entry.id` 取。
+      //    ⚠️ 写成 `call?.accountId` 会**编译不过**（`entry` 上没有该字段），
+      //    这正是它比运行时静默更安全的地方 —— 别为了「看起来统一」而改签名。
+      claim: (credential, entry) =>
         claimMinimaxDailyCheckin(
-          credential as MinimaxCredential, undefined, MINIMAX_INTL, deps.minimaxXff?.(),
+          credential as MinimaxCredential,
+          minimaxIntlFetcher(entry.id),
+          MINIMAX_INTL,
+          deps.minimaxXff?.(),
         ),
     },
 
@@ -771,6 +975,30 @@ export function createProviderCredits(
        * 它就会真去发一轮必然失败的请求。
        */
       claimUnavailableReason: 'WorkBuddy 国际版不支持每日签到（其后端没有签到接口）',
+    },
+
+    /**
+     * 超级麦吉（Magicrew，2026-10-29）。
+     *
+     * ⚠️ 用 `fetchBalance` 而不是 `fetchBalanceDetailed`：本家的失败面只有「读不到」
+     * 一种（网络 / 业务码非 1000 / 缺 `total_points`），没有需要让用户做**不同动作**
+     * 的子原因 —— 而 `fetchBalanceDetailed` 的存在理由正是「三种失败的出路不同」
+     * （见 {@link ProviderCredits.fetchBalanceDetailed} 的注释）。
+     * ⚠️ `?? null`：原语用 `undefined` 表达「读不到」，而本接口契约是 `null`
+     * —— 两者**同义**，但 `undefined` 会被上层当成「没实现」。
+     * ⚠️ 没有 `claim`：本家**有**签到端点，但刻意不接（会消耗真实积分，用户未要求）。
+     */
+    magicrew: {
+      fetchBalance: async (credential) => {
+        const parsed = credential as { jwt?: unknown, organizationCode?: unknown } | null | undefined
+        if (typeof parsed?.jwt !== 'string' || parsed.jwt.length === 0) return null
+        return await fetchMagicrewBalance({
+          jwt: parsed.jwt,
+          organizationCode: typeof parsed.organizationCode === 'string' ? parsed.organizationCode : '',
+        }) ?? null
+      },
+      precheckStatus: false,
+      claimUnavailableReason: '超级麦吉暂不支持每日签到（本插件未接该端点）',
     },
   }
 }

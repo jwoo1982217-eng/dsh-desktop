@@ -98,6 +98,11 @@ const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   //    派生 ⇒ `modelscopeAuth`。同款坑：本表由**真跑 apply() 的探针**验证过，
   //    不凭注释推断。
   ['modelscope', 'modelscopeAuth'],
+  // ⚠️ **本 fork 独有**（qiniu，2026-10-29）。服务名由 `${product.id}Auth` 派生
+  //    ⇒ `qiniuAuth`。同款坑：本表由**真跑 apply() 的探针**验证过，不凭注释推断。
+  ['qiniu', 'qiniuAuth'],
+  // ⚠️ 超级麦吉（Magicrew，2026-10-29）：服务名由 `${product.id}Auth` 派生 ⇒ `magicrewAuth`。
+  ['magicrew', 'magicrewAuth'],
 ]
 
 /**
@@ -243,7 +248,43 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
   it('注册表覆盖全部可续期 provider，且**不含** opencode / aggregate / auto', () => {
     applyOnce()
     const ids = registeredRuntimeIds().sort()
-    expect(ids).toEqual(AUTH_SERVICE_OF.map(([id]) => id).sort())
+    // ⚠️ **不是「恰好等于有 auth 的集合」**（2026-10-22 合并审计改）。
+    //
+    // 原判据隐含「**有 runtime ⇔ 有 auth**」这条假设，而 PR #3 引入了第一个反例：
+    // **codely 有 `probe` 与 `credits`、但没有 auth 服务**（`channel:false`，
+    // 登录/余额都是自由函数）。
+    //
+    // 为什么必须给它 runtime：`probe` 域**只**在「`for (const [id, auth] of registry)`
+    // 循环体内」被挂上（`...Object.hasOwn(probeById, id) ? { probe: probeById[id] } : {}`），
+    // 而 codely 不在那个数组里 ⇒ `runtimeOf('codely') === undefined` ⇒
+    // `adapterForProbe()` 抛「codely 没有探测适配器」⇒ 用户点「重测」**必报错**。
+    // ⚠️ 这与 `PROBE_EXEMPT` 文档里记的 `opencode` 那条**错误豁免**同型：
+    //    「它没有 `rateLimit: false` 豁免 ⇒ 客户端『重测』按钮会渲染 ⇒ 用户点了
+    //    必报『没有探测适配器』」⇒ 正确修法是**让 probe 可达**，
+    //    **不是**把 codely 塞进 `PROBE_EXEMPT`。
+    //
+    // ⇒ 判据：**有 auth 的必须有 runtime**（原意图不放宽）+ `probeById` 的那些也允许有；
+    //   `opencode` / `aggregate` / `auto` 仍不得有（下面三条不变）。
+    const authIds = AUTH_SERVICE_OF.map(([id]) => id).sort()
+    for (const id of authIds) {
+      expect(ids, `有 auth 的 ${id} 必须有 runtime`).toContain(id)
+    }
+    // ⚠️ **额外允许的、无 auth 但有 probe 的家**（本仓当前**只有 codely**）。
+    //
+    // 为什么必须给它 runtime：`probe` 域**只**在上面那个
+    // `for (const [id, auth] of registry)` 循环体内被挂上，而 codely 不在那个
+    // 数组里（`channel:false`、无 auth 服务）⇒ `runtimeOf('codely') === undefined`
+    // ⇒ `adapterForProbe()` 抛「codely 没有探测适配器」⇒ 用户点「重测」**必报错**。
+    //
+    // ⚠️ 这与 `PROBE_EXEMPT` 文档里记的 `opencode` 那条**错误豁免**同型
+    //   （「没有 `rateLimit: false` 豁免 ⇒ 『重测』按钮会渲染 ⇒ 用户点了必报
+    //   『没有探测适配器』」）⇒ 正确修法是**让 probe 可达**，不是塞进豁免表。
+    //
+    // ⚠️ **刻意不含 `opencode`**：它虽然也在 `probeById` 里且无 runtime，
+    //   但那是**存量缺陷**（master 上就如此），修它会牵动另一批守卫，不在本次
+    //   范围内 ⇒ 下面仍显式断言它不得有 runtime，把这条缺口**如实留在这里**。
+    const PROBE_ONLY_NO_AUTH = ['codely']
+    expect(ids).toEqual([...new Set([...authIds, ...PROBE_ONLY_NO_AUTH])].sort())
     // opencode 凭据是静态 API key，没有续期概念 ⇒ 刻意不注册（见设计文档 §3.3）。
     expect(ids).not.toContain('opencode')
     // aggregate / auto 是虚拟 provider，无账号无凭据。
@@ -277,6 +318,17 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     for (const d of PROVIDER_REGISTRY) {
       const runtime = runtimeOf(d.id)
       if (runtime === undefined) continue // 非 channel provider（aggregate）不在此表
+      // ⚠️ 2026-10-29 **本 fork**：`qiniu`（七牛云）是全仓首例
+      //    「`channel: true` 且 `credits.balance: false`」—— 七牛云**没有**
+      //    余额/额度 REST 端点（用量与计费只在控制台可见），故它如实不声明
+      //    余额能力、`src/index.ts` 也不给它挂 `credits:` 域。
+      //    ⇒ 本循环的语义严格按**本条用例的名字**取「有余额能力的渠道」：
+      //    `balance !== true` 的家不做「必须挂 credits」的断言（挂了反而错）。
+      //    ⚠️ 这条 `continue` **不削弱**守卫：原判据 `runtime !== undefined`
+      //    对 `aggregate` 之外的家恒真，也就等于「凡注册了 runtime 就必须有
+      //    credits」—— 那是把「有余额能力」错当成了「有 runtime」；
+      //    `qiniu` 一进来就把它照出来了（它注册 runtime 但确实没有余额端点）。
+      if (d.credits.balance !== true) continue
       if (CREDITS_TABLE_EXEMPT.has(d.id)) {
         expect(
           runtime.credits,
@@ -376,12 +428,22 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     //    再加 astudio（本 fork 与上游各登记一次）⇒ 19 → 20 个真渠道，
     //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 19 个 auth 键。
     // ⚠️ 2026-10-20 加 autoclawintl（AutoClaw 国际版）：19 → 20 个 auth 键。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(20)
+    // ⚠️ 2026-10-22（A6）：codely 翻 `channel: true`：20 → 21。
+    // ⚠️ 2026-10-29 加 qiniu（七牛云）+ magicrew：21 → 22 → 23 个 auth 键。
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(23)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
       '右侧多出 = registry 里有而清单漏登记）',
-    ).toEqual(shouldRegister)
+    // ⚠️ **`shouldRegister` 是「有 auth 的家」，而 codely 无 auth 却有 runtime**
+    //   （2026-10-22 合并审计修：`probe` 域只在那唯一一个循环里挂，codely 不在
+    //   那个 `registry` 数组里 ⇒ `runtimeOf('codely') === undefined` ⇒ 用户点
+    //   「重测」必报「codely 没有探测适配器」）。⇒ 反向断言同样要把它算进来，
+    //   否则「修好了」这件事本身会让本条变红。理由与上面那条用例同源。
+    // ⚠️ 2026-10-22（A6）：codely 现已翻 `channel: true` 并接入 auth ⇒ 它**已在**
+    //    `shouldRegister` 里，不得再额外加 `'codely'`（会重复。旧写法是它当时
+    //    无 auth 却有 runtime 的补丁；现在两者同源）。
+    ).toEqual([...shouldRegister].sort())
   })
 })
 
@@ -425,6 +487,10 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     //    —— 见 `modelscope-adapter.ts` 的 `modelscopeRetryAfterMs`（429 指数退避 /
     //    额度耗尽对齐 UTC+8 零点），与 registry 里**省略 `rateLimit`（= true）** 自洽。
     ['modelscope-adapter.ts', ['modelscope']],
+    // ⚠️ **本 fork 独有**（qiniu，2026-10-29）：它会写 `modelRateLimits`
+    //    （`qiniu-adapter.ts` 的 `qiniuRetryAfterMs`：429 指数退避 / 额度类对齐
+    //    UTC+8 次日零点）⇒ 与 registry 里**省略 `rateLimit`（= true）**自洽。
+    ['qiniu-adapter.ts', ['qiniu']],
     // ⚠️ minimax **曾经**登记为空（不写标记）—— 2026-10-11 的 issue IKJW32 给它
     //    接上请求级换号 + 冷却后，它会写 `modelRateLimits`（额度 24h / 限流 1h）。
     //    下面那条「登记为不写标记的确实没有写点」用例就是靠这个变化**红**出来的。
@@ -456,6 +522,20 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     //    `markLimited` / `updateModelRateLimit`）：限流与额度由讯飞 MAAS 侧按账号
     //    配额管理，本地标记清不掉配额（与 officeace 同因）。留空是**被验证的声明**。
     ['astudio-adapter.ts', []],
+    // ⚠️ codely（Unity 团结引擎）**会写** `modelRateLimits`（2026-10-20）：
+    //    ① 推理改为 HTTP 自签直连（签名已还原，`codely-sign.ts`）⇒ 真会收到
+    //       上游的 402 预算耗尽 / 429 限流响应；
+    //    ② 同日接上请求级换号 + 冷却（额度耗尽 → UTC+8 次日 0 点、429 → 1h）
+    //       ⇒ 它**确实是**写点文件，必须登记并与 `WRITES_RATE_LIMIT_PROVIDERS`
+    //       / `probeById` 三处同步（否则标记写进去永远清不掉）。
+    //    ⚠️ 它**曾**登记为 `[]`（不写标记）—— 这个变化正是下面那条
+    //    「登记为不写标记的确实没有写点」用例**红**出来的，与 minimax 2026-10-11、
+    //    accio 2026-10-18 两次同型。用户报障「用完积分怎么不自动切账号」即由此而来。
+    ['codely-adapter.ts', ['codely']],
+    // ⚠️ 超级麦吉（Magicrew，2026-10-29）**不写** `modelRateLimits`：
+    //    本家没有请求级换号/冷却（单账号直连，key 由 `MagicrewAuth` 续期管理）
+    //    ⇒ 留空是**被验证的声明**（下面那条「登记为不写的确实没有写点」会真跑）。
+    ['magicrew-adapter.ts', []],
   ]
 
   /**

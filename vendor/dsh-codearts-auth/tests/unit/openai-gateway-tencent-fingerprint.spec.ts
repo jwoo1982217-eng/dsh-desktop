@@ -1,3 +1,7 @@
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { zstdDecompressSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
 import { toGenerateOptions } from '../../src/openai-gateway/messages.js'
 import { toResponsesGenerateOptions } from '../../src/openai-gateway/responses.js'
@@ -442,6 +446,442 @@ describe('腾讯系内容级风控指纹改写（IKLYCT）：Claude Code 反馈�
     expect(out).toContain('# Executing actions with care')
     expect(out).toContain('- /help: show help')
     expect(out.split('\n')).toHaveLength(realSystem.split('\n').length)
+  })
+})
+
+/**
+ * 第四条指纹：**DSH 自己的 system 身份首句**（2026-10-20 登记；2026-10-21 换措辞）。
+ *
+ * ## 它与前三条的本质差别
+ *
+ * 前三条都是**别的客户端**注进来的模板句（换会话 / 清历史可绕）；这一条是 DSH
+ * `base` 段每轮必带的**首句** ⇒ 绕不掉，只能靠 `tencent-fingerprint.ts` 这张表。
+ * 它此前**零用例**（本节是它的第一个守卫）。
+ *
+ * ## 2026-10-21 换措辞的依据：**CodeBuddy 自己的会话**（不是读源码推的）
+ *
+ * 本机一条真实 CodeBuddy 会话（标题「AI编程助手介绍」，id
+ * `8c9dbeb10e2846d7b0fa569b14aa4335`）的落盘记录里，assistant 的 reasoning
+ * 逐字复述了它自己的 system：`an AI coding assistant, powered by Hy4 preview model`；
+ * 客户端提示词**资产**（`extensions/genie/product.json` 的 `craft-agent-prompt`）
+ * 首行是 `You are an AI coding assistant,{{ ModelNamePrompt }}.`，该变量渲染成
+ * `" powered by <模型展示名> model"` —— 两条独立来源拼出的字节一致：
+ *
+ *   `You are an AI coding assistant, powered by Hy4 preview model.`
+ *
+ * ⇒ 与我们那句**结构完全同形**（`You are <名词> powered by <Y>`），差别只在
+ *   **Y 填什么**：官方填**模型展示名**，我们填**harness 名**。
+ *
+ * ⚠️ 本文件里留了这句字面量（与上面 Claude 那条同理）：改写已覆盖 `system` 与
+ * `assistant` 正文两处，不再有「观察者污染实验对象」的风险。
+ *
+ * ## ⚠️ 这一节锁得住什么、锁不住什么
+ *
+ * 锁得住：**我们改谁、改成什么、出站文本里不许残留 `DeepSeek Harness`**。
+ * **锁不住新措辞在上游是否放行** —— 那一格只有 e2e 能验，见
+ * `tests/e2e/buddy-fingerprint-roles.e2e.spec.ts` 第 4 节（改 `replace` 必须跑它）。
+ */
+const DSH_TRIGGER = 'You are an AI agent powered by DeepSeek Harness'
+/** 官方**原生兜底**措辞（模型名缺失时官方资产渲染出来的就是这个形态）。 */
+const DSH_REWRITE = 'You are an AI coding assistant, powered by a large language model'
+
+/**
+ * 第五条指纹：**DSH Web 运行面的开头两句**（`WEB_SURFACE_PROMPT`，2026-10-21 真实报障）。
+ *
+ * ⚠️ 这里**逐字写成单行**（不像源码那样拼接）：两份独立誊写才对得上 ——
+ * 源码那边只要少一个空格，本节就会红。长度断言是第二道拦。
+ */
+const WEB_SURFACE_TRIGGER = 'You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.'
+const WEB_SURFACE_REWRITE = 'You are interacting with the user through the harness Web GUI whose URL the runtime context names. When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.'
+
+/**
+ * 第六条指纹：**DSH 的 `@` 文件引用说明句**（`FILE_REFERENCE_PROMPT`，2026-10-28 真实报障）。
+ *
+ * ## 现象
+ *
+ * 真实会话每轮 `400/11128 Illegal API invocation from an unapproved channel`，
+ * 报错原文 `INVALID_REQUEST` + 「请求被拦截，请重新发送」。前五条全部命中并被改写
+ * （身份句、Web 面两句都在），**仍被拦** ⇒ 触发物不在已登记的清单里。
+ *
+ * ## 根因（本机 2026-10-28 逐格实测，`copilot.tencent.com` + `deepseek-v4.1-flash`）
+ *
+ * 真实 system（18,383 字符）逐行二分 ⇒ 第 160 行为临界点。行内前缀二分
+ * 给出 **110 字符放行 / 111 字符被拦**、**后缀砍到 50 字符即放行** ⇒ 字面量
+ * 从行首起算、共 111 字符，恰好是这两句的并集。
+ *
+ * ⚠️⚠️ 本条**不含任何品牌词**（没有 `DeepSeek Harness`、没有 `dsh`）⇒ 按
+ * 「找含品牌名的句子」的思路**必然漏掉它**。这正是它被前五条漏掉的原因，
+ * 也是它值得单独登记一条注释的理由：**判据不是品牌名，是「`@` 语法说明」
+ * 这个 DSH 独有写法**。
+ *
+ * 出处：`packages/context/file-reference/src/index.ts` 的 `FILE_REFERENCE_PROMPT`，
+ * 由 `file-reference-local` 注入为 `context:file-reference` 段（该段在 agent
+ * 有 `read` 工具时恒非空 ⇒ **每轮必带**）。
+ */
+const FILE_REFERENCE_TRIGGER = 'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root'
+/** 只调整语序，语义不变：仍是「路径相对工作区根解析」。其余 402 字符逐字不动。 */
+const FILE_REFERENCE_REWRITE = 'Tokens prefixed with @ are paths the user explicitly referenced. Paths resolve relative to the workspace root'
+
+describe('腾讯系内容级风控指纹改写（2026-10-28）：DSH `@` 文件引用说明句', () => {
+  it('★ 字面量被改写成等义语序替换，且长度判据锁住 111 字符', () => {
+    // 两份独立誊写 + 长度断言：源码那边少一个字符，本节就红。
+    expect(FILE_REFERENCE_TRIGGER).toHaveLength(111)
+    expect(FILE_REFERENCE_REWRITE).toHaveLength(109)
+    const out = rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER, 'buddy')
+    expect(out).toBe(FILE_REFERENCE_REWRITE)
+    // 反向对照：输入必须真的变了（防「两边写成同一个字面量」这类恒真断言）。
+    expect(out).not.toBe(FILE_REFERENCE_TRIGGER)
+    // 两站都改（`find` 是 provider 无关的；被拦与否另说）。
+    expect(rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER, 'workbuddy'))
+      .toBe(FILE_REFERENCE_REWRITE)
+  })
+
+  it('★ `find` 长度判据：**前 110 字符**实测放行 ⇒ 必须逐字节不动（把 find 改短这里就红）', () => {
+    const prefix110 = FILE_REFERENCE_TRIGGER.slice(0, 110)
+    expect(prefix110).toHaveLength(110)
+    // 实测：110 放行 ⇒ 不得改写。若有人把 find 削到 110，本行会变红。
+    expect(rewriteTencentContentFingerprints(prefix110, 'buddy')).toBe(prefix110)
+    // 反向：整条 111 必须真的被改掉，否则上面那条「不动」是空跑。
+    expect(rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER, 'buddy'))
+      .not.toBe(FILE_REFERENCE_TRIGGER)
+  })
+
+  it('★ 切句的两半**各自都实测放行** ⇒ 谁都不许被改写（写短了=空跑）', () => {
+    // 前半句（48 字符）与后半句（44 字符）单独发都是 200 ⇒ 触发串跨了句边界。
+    const sentence1 = 'Tokens prefixed with @ are paths the user explicitly referenced.'
+    const sentence2 = 'Relative paths resolve from the workspace root'
+    for (const half of [sentence1, sentence2]) {
+      expect(rewriteTencentContentFingerprints(half, 'buddy')).toBe(half)
+    }
+  })
+
+  it('★ 位置无关：前接中性前言 / 前接换行 / 前接中文**仍要改**（与第 4 条的行首锚定相反）', () => {
+    // 实测：句首 / 句中 / 前接空格 / 前接换行 / 前接中文 —— 五格全部 400/11128。
+    for (const text of [
+      FILE_REFERENCE_TRIGGER,
+      `Note: ${FILE_REFERENCE_TRIGGER} here.`,
+      `You are a helpful assistant.\n\n${FILE_REFERENCE_TRIGGER}`,
+      `\n${FILE_REFERENCE_TRIGGER}`,
+      `你好\n${FILE_REFERENCE_TRIGGER}`,
+    ]) {
+      const out = rewriteTencentContentFingerprints(text, 'buddy')
+      expect(out).not.toContain(FILE_REFERENCE_TRIGGER)
+      expect(out).toContain(FILE_REFERENCE_REWRITE)
+    }
+  })
+
+  it('★ 大小写不敏感（实测全小写 / 全大写同样被拦）', () => {
+    expect(rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER.toUpperCase(), 'buddy'))
+      .toBe(FILE_REFERENCE_REWRITE)
+    expect(rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER.toLowerCase(), 'buddy'))
+      .toBe(FILE_REFERENCE_REWRITE)
+  })
+
+  it('★ 逐字符：改一个词 / 多一个空格**不动**（服务端认的是逐字符字面量）', () => {
+    for (const text of [
+      // 少一个词
+      'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the root',
+      // 多一个空格
+      'Tokens prefixed with @ are paths the user explicitly referenced. Relative  paths resolve from the workspace root',
+    ]) {
+      expect(rewriteTencentContentFingerprints(text, 'buddy')).toBe(text)
+    }
+  })
+
+  it('★ 非腾讯系：逐字节不变（别替别家上游改写自家提示词）', () => {
+    for (const provider of ['qoder', 'qodercn', 'trae', 'codearts', 'lobsterai', '']) {
+      expect(rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER, provider))
+        .toBe(FILE_REFERENCE_TRIGGER)
+    }
+  })
+
+  it('★ 真实整段 `FILE_REFERENCE_PROMPT`（407 字符）：只改那一处，其余逐字节不变', () => {
+    // ⚠️ 这一条是「改写不得伤害语义」的守卫：`@` 语法说明的后半段（目录 list、
+    // 用 read、不得声称已读过、引号语法）**一个字都不许动** —— 它们是防模型
+    // 编造文件内容的核心约束。
+    const full = 'Tokens prefixed with @ are paths the user explicitly referenced. '
+      + 'Relative paths resolve from the workspace root; absolute paths identify files or '
+      + 'directories on the host. A trailing slash marks a directory: list it when its '
+      + 'contents matter. Anything else is a file: use the read tool when its contents are '
+      + 'needed, and do not claim to have inspected it before reading. @"..." quotes a path '
+      + 'containing spaces.'
+    const out = rewriteTencentContentFingerprints(full, 'buddy')
+    expect(out).not.toContain(FILE_REFERENCE_TRIGGER)
+    expect(out).toContain(FILE_REFERENCE_REWRITE)
+    // 除该处外逐字节不变。
+    expect(out).toBe(full.replace(FILE_REFERENCE_TRIGGER, FILE_REFERENCE_REWRITE))
+    // 后半段的核心约束必须原样保留。
+    expect(out).toContain('A trailing slash marks a directory: list it when its contents matter.')
+    expect(out).toContain('use the read tool when its contents are needed')
+    expect(out).toContain('do not claim to have inspected it before reading')
+    expect(out).toContain('@"..." quotes a path containing spaces.')
+  })
+
+  it('★ 幂等：改写结果再跑一次逐字节不变', () => {
+    const once = rewriteTencentContentFingerprints(FILE_REFERENCE_TRIGGER, 'buddy')
+    expect(rewriteTencentContentFingerprints(once, 'buddy')).toBe(once)
+  })
+})
+
+describe('腾讯系内容级风控指纹改写（2026-10-21）：DSH 身份首句', () => {
+  it('★ 首句改成官方同形措辞，且出站文本里**不再有 `DeepSeek Harness`**', () => {
+    // 后半句才是本条的**真正收益**，所以写成不变式而不是只断言等值：
+    // 旧的等义改写（`…built on the DeepSeek Harness runtime`）把这个 token
+    // 原样留着，上游一旦把名单从「整句逐字符」放宽成关键词就立刻失效。
+    const out = rewriteTencentContentFingerprints(DSH_TRIGGER, 'buddy')
+    expect(out).toBe(DSH_REWRITE)
+    expect(out).not.toContain('DeepSeek Harness')
+    // 反向对照：输入必须真的变了（防「两边写成同一个字面量」这类恒真断言）。
+    expect(out).not.toBe(DSH_TRIGGER)
+    expect(rewriteTencentContentFingerprints(DSH_TRIGGER, 'workbuddy')).toBe(DSH_REWRITE)
+  })
+
+  it('★ `find` 不带尾句点 ⇒ 带句点 / 后接正文两种形态都被改，且只改一次', () => {
+    expect(rewriteTencentContentFingerprints(`${DSH_TRIGGER}.`, 'buddy'))
+      .toBe(`${DSH_REWRITE}.`)
+    const withBody = `${DSH_TRIGGER}.\n\nYou are a coding agent. 用中文回答。`
+    const out = rewriteTencentContentFingerprints(withBody, 'buddy')
+    expect(out).toBe(`${DSH_REWRITE}.\n\nYou are a coding agent. 用中文回答。`)
+    expect(out).not.toContain('DeepSeek Harness')
+    // 幂等：改写后的文本再跑一次**逐字节不变**（新串不得再命中任何一条 find）。
+    expect(rewriteTencentContentFingerprints(out, 'buddy')).toBe(out)
+  })
+
+  it('★ 大小写不敏感（实测全大写同样被拦）', () => {
+    expect(rewriteTencentContentFingerprints(DSH_TRIGGER.toUpperCase(), 'buddy'))
+      .toBe(DSH_REWRITE)
+    expect(rewriteTencentContentFingerprints(DSH_TRIGGER.toLowerCase(), 'workbuddy'))
+      .toBe(DSH_REWRITE)
+  })
+
+  /**
+   * 守卫：**漂移容忍**（2026-10-30 实测定案）。
+   *
+   * ⚠️⚠️ 存在的理由：`find` 是**逐字符**字面量 ⇒ DSH 只要改动其中**一个**
+   * 字符，这条规则就**静默失效**（症状 = 每轮 400/11128，与「没登记过」同形）。
+   * 本文件顶部把这条风险登记为「漂移风险未解」。
+   *
+   * ⚠️ 放宽的**只有形态**这几维（实测依据见 `CONTENT_FINGERPRINTS` 第 4 条的
+   * `note`）：大小写、空白量、可选逗号、可选 `coding`、可选定冠词 `the`。
+   * **不放宽**成关键词 —— 锚点仍必须是整句（「换 Y」那一格必须**不**命中，
+   * 否则会篡改用户自己写的同形句）。
+   */
+  it('★★ 漂移容忍：空白量 / 可选逗号 / `coding` / `the` 都要命中', () => {
+    for (const variant of [
+      // 空白量（实测：双空格仍被上游拦 ⇒ 上游归一空白 ⇒ 我们也必须认）
+      'You are an AI agent  powered by DeepSeek Harness',
+      'You are an AI agent\tpowered by DeepSeek Harness',
+      'You are an AI agent\npowered by DeepSeek Harness',
+      // 可选逗号（实测：`agent,` ⇒ 200、`agent, ` ⇒ 200）
+      'You are an AI agent, powered by DeepSeek Harness',
+      'You are an AI agent,powered by DeepSeek Harness',
+      // 可选 `coding`（用户手填 / DSH 改词）
+      'You are an AI coding agent powered by DeepSeek Harness',
+      // 可选定冠词
+      'You are an AI agent powered by the DeepSeek Harness',
+      // 组合
+      'you are an ai coding agent,  powered by the deepseek harness',
+    ]) {
+      const out = rewriteTencentContentFingerprints(variant, 'buddy')
+      expect(out, `漂移形态必须被改写：${variant}`).toBe(DSH_REWRITE)
+    }
+  })
+
+  it('★★ 漂移容忍**不得**越界成关键词匹配（否则会篡改用户自己的同形句）', () => {
+    // ⚠️ Y 不是 `DeepSeek Harness` ⇒ 那是**别人**写的同形句，不该替它改成
+    //    「a large language model」（那会丢掉用户的真实信息）。
+    const foreign = 'You are an AI agent powered by Some Other Harness'
+    expect(rewriteTencentContentFingerprints(foreign, 'buddy')).toBe(foreign)
+    // ⚠️ 骨架不完整（缺 `powered by`）⇒ 不是同一句。
+    const partial = 'You are an AI agent. DeepSeek Harness is documented below.'
+    expect(rewriteTencentContentFingerprints(partial, 'buddy')).toBe(partial)
+  })
+
+  it('★ 整段真实 system：只改首句，其余段落与行数逐字节不变', () => {
+    // 现场形状：本句是 system 的**绝对首行**，后面跟着真正的行为约定与语言约束
+    // —— 那些**不能**被碰（改了会篡改用户提示词并破坏上游的前缀缓存）。
+    const realSystem = [
+      `${DSH_TRIGGER}.`,
+      '',
+      'You are a coding agent. Use the tools to resolve the request.',
+      '',
+      '# 语言约束',
+      '- 推理输出一律使用中文。',
+      '- 正文输出一律使用中文。',
+    ].join('\n')
+    const out = rewriteTencentContentFingerprints(realSystem, 'buddy')
+    expect(out.startsWith(`${DSH_REWRITE}.`)).toBe(true)
+    expect(out).not.toContain('DeepSeek Harness')
+    expect(out).toContain('# 语言约束')
+    expect(out).toContain('- 正文输出一律使用中文。')
+    expect(out.split('\n')).toHaveLength(realSystem.split('\n').length)
+  })
+
+  it('★ 五条指纹互不干扰（任一条的 find/replace 变更都会在这里露出来）', () => {
+    const all = [TRIGGER, CLAUDE_TRIGGER, FEEDBACK_TRIGGER, DSH_TRIGGER, WEB_SURFACE_TRIGGER].join('\n')
+    const out = rewriteTencentContentFingerprints(all, 'workbuddy')
+    expect(out).toBe(
+      [REWRITE, CLAUDE_REWRITE, FEEDBACK_REWRITE, DSH_REWRITE, WEB_SURFACE_REWRITE].join('\n'),
+    )
+    // 无状态残留：`g` 正则的 lastIndex 不留痕（连续两次调用结果一致）。
+    expect(rewriteTencentContentFingerprints(all, 'workbuddy')).toBe(out)
+  })
+
+  it('★ 非腾讯系：逐字节不变（别替别家上游改写自家提示词）', () => {
+    for (const provider of ['qoder', 'qodercn', 'trae', 'codearts', 'lobsterai', '']) {
+      expect(rewriteTencentContentFingerprints(DSH_TRIGGER, provider)).toBe(DSH_TRIGGER)
+    }
+  })
+})
+
+/**
+ * 第五条指纹：**DSH Web 运行面的开头两句**（`@deepseek-ai/dsh-harness-dev-context` 的
+ * `WEB_SURFACE_PROMPT`，2026-10-21 真实报障「buddy: 请求被拦截，请重新发送」）。
+ *
+ * ## 为什么前四条覆盖不到它
+ *
+ * 真实 system（5,780 字符）里 `DeepSeek Harness` 出现 **3 次**：第 1 行（第 4 条）、
+ * 第 33 行（`HARNESS_SOURCE_PROMPT`，实测**不拦**）、第 35 行（本条所在行）。
+ * 只改第 1 行 ⇒ 插件发出的形态**仍被整轮 400/11128**。
+ * 而这句**只在 Web 运行时挂载**（该插件 README：`--help` 与非 Web 组合从不挂载）
+ * ⇒ 任何取自 CLI / 桌面面的「真实整段」都不会含它，**测出来必然 200**。
+ *
+ * ## ⚠️ 本条最容易写错的地方：`find` 的**长度**
+ *
+ * 触发串是**前两句的并集**（221 字符）：前 220 字符放行、221 拦；
+ * 而把这一行**按句切开**后**两半各自都放行**（跨句边界的字面量）。
+ * 故 `find` 写短了会**静默空跑**（登记了却仍每轮 400），
+ * 下面那条「两半都不许被改写」的用例就是钉这一格的。
+ */
+describe('腾讯系内容级风控指纹改写（2026-10-21）：DSH Web 运行面两句', () => {
+  it('★ 字面量被改写成去掉品牌串的等义形态，且不再含 `DeepSeek Harness`', () => {
+    // 长度断言是「两份独立誊写」的第二道拦（源码是拼接的、这里是单行）。
+    expect(WEB_SURFACE_TRIGGER).toHaveLength(221)
+    expect(WEB_SURFACE_REWRITE).toHaveLength(212)
+    const out = rewriteTencentContentFingerprints(WEB_SURFACE_TRIGGER, 'buddy')
+    expect(out).toBe(WEB_SURFACE_REWRITE)
+    expect(out).not.toContain('DeepSeek Harness')
+    // 反向对照：输入必须真的变了（防恒真断言）。
+    expect(out).not.toBe(WEB_SURFACE_TRIGGER)
+    // 两站都改（`find` 是 provider 无关的；被拦与否另说 —— 实测只有 buddy 拦）。
+    expect(rewriteTencentContentFingerprints(WEB_SURFACE_TRIGGER, 'workbuddy')).toBe(WEB_SURFACE_REWRITE)
+  })
+
+  it('★ `find` 长度判据：**前 220 字符**实测放行 ⇒ 必须逐字节不动（把 find 改短这里就红）', () => {
+    const prefix220 = WEB_SURFACE_TRIGGER.slice(0, 220)
+    expect(prefix220).toHaveLength(220)
+    expect(rewriteTencentContentFingerprints(prefix220, 'buddy')).toBe(prefix220)
+    // 反向：221（整条）必须真的被改掉，否则上面那条「不动」是空跑。
+    expect(rewriteTencentContentFingerprints(WEB_SURFACE_TRIGGER, 'buddy'))
+      .not.toBe(WEB_SURFACE_TRIGGER)
+  })
+
+  it('★ 切句的两半**各自都实测放行** ⇒ 谁都不许被改写（写短了=空跑，写散了=空跑）', () => {
+    const sentence1 = 'You are interacting with the user through the DeepSeek Harness Web GUI '
+      + 'whose URL the runtime context names.'
+    const sentence2 = 'When the user refers to "this page", "this GUI", or "this app" '
+      + 'without naming another target, they mean this GUI.'
+    for (const half of [sentence1, sentence2]) {
+      expect(rewriteTencentContentFingerprints(half, 'buddy')).toBe(half)
+    }
+  })
+
+  it('★ 位置无关：前接中性前言 / 前接换行**仍要改**（与第 4 条的行首锚定**相反**）', () => {
+    for (const text of [
+      `You are a helpful assistant.\n\n${WEB_SURFACE_TRIGGER}`,
+      `\n${WEB_SURFACE_TRIGGER}`,
+    ]) {
+      const out = rewriteTencentContentFingerprints(text, 'buddy')
+      expect(out).not.toContain(WEB_SURFACE_TRIGGER)
+      expect(out).toContain(WEB_SURFACE_REWRITE)
+    }
+  })
+
+  it('★ 大小写不敏感（实测全大写同样被拦）', () => {
+    expect(rewriteTencentContentFingerprints(WEB_SURFACE_TRIGGER.toUpperCase(), 'buddy'))
+      .toBe(WEB_SURFACE_REWRITE)
+  })
+
+  it('★ 非腾讯系：逐字节不变', () => {
+    for (const provider of ['qoder', 'qodercn', 'trae', 'codearts', 'lobsterai', '']) {
+      expect(rewriteTencentContentFingerprints(WEB_SURFACE_TRIGGER, provider))
+        .toBe(WEB_SURFACE_TRIGGER)
+    }
+  })
+
+  it('★ 与身份句同处一份 system：**两条都要改**（报障者说的「单句用例抓不到」那一格）', () => {
+    // 真实形状：第 1 行是身份句、第 35 行是本条 —— 只改其中一条都仍被拦。
+    const real = [
+      `${DSH_TRIGGER}.`,
+      '',
+      'You are a coding agent. Use the tools to resolve the request.',
+      '',
+      WEB_SURFACE_TRIGGER,
+      '',
+      '尾注。',
+    ].join('\n')
+    const out = rewriteTencentContentFingerprints(real, 'buddy')
+    expect(out).toContain(DSH_REWRITE)
+    expect(out).toContain(WEB_SURFACE_REWRITE)
+    expect(out).not.toContain(DSH_TRIGGER)
+    expect(out).not.toContain(WEB_SURFACE_TRIGGER)
+    // 除这两处外逐字节不变（行数、其余段落）。
+    expect(out.split('\n')).toHaveLength(real.split('\n').length)
+    expect(out).toContain('You are a coding agent. Use the tools to resolve the request.')
+    expect(out).toContain('尾注。')
+  })
+
+  it('★ 幂等：改写结果再跑一次逐字节不变', () => {
+    const once = rewriteTencentContentFingerprints(WEB_SURFACE_TRIGGER, 'buddy')
+    expect(rewriteTencentContentFingerprints(once, 'buddy')).toBe(once)
+  })
+
+  it('★ 漂移守卫：本机**真实** system 里的那一行必须仍能被改写（读不到会话数据时自行退回）', () => {
+    // ## 为什么这条单测要读用户目录（本仓库唯一一条）
+    //
+    // 上游认的是**逐字符的长字面量** ⇒ DSH 哪天改动这两句里的任一字符，本条的 `find`
+    // 会**静默**停止匹配 —— 症状与「完全没登记」**同形**（该渠道整轮 400 复发）。
+    // e2e 发的是**固定载荷**，锁的只是「这串字面量会被拦」，**锁不住「DSH 改了措辞」**。
+    // 故这里直接读本机会话落盘里**真实**的 system，把漂移变成一条红。
+    //
+    // ⚠️ 只读（不解压写回、不打印任何正文）；任何环境层面的失败都**自行退回**，
+    // 绝不因为「本机没有会话数据」而变红 —— 那种情况下判定权在 e2e。
+    const root = join(homedir(), '.dsh', 'sessions')
+    const files: string[] = []
+    try {
+      for (const ws of readdirSync(root)) {
+        let entries: string[]
+        try { entries = readdirSync(join(root, ws)) } catch { continue }
+        for (const e of entries) {
+          const f = join(root, ws, e, 'session.v4.jsonl.zstd')
+          if (existsSync(f)) files.push(f)
+        }
+      }
+    } catch { return }
+    const newest = files
+      .map((f) => ({ f, mtime: statSync(f).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime)
+      .slice(0, 8)
+
+    for (const { f } of newest) {
+      let rows: string[]
+      try { rows = zstdDecompressSync(readFileSync(f)).toString('utf8').split('\n') } catch { continue }
+      for (const row of rows) {
+        if (!row.includes('"system/message"')) continue
+        let text = ''
+        try {
+          const data = JSON.parse(row).data
+          text = (data.message?.content ?? []).map((c: { text?: string }) => c.text ?? '').join('')
+        } catch { continue }
+        const line = text.split('\n').find((l) => l.includes('DeepSeek Harness') && l.includes('Web GUI'))
+        if (line === undefined) continue
+        // 旧版形态（URL 内联）实测**不拦**、刻意不登记 ⇒ 跳过它，别把守卫带偏。
+        if (/Web GUI at /.test(line)) continue
+        const out = rewriteTencentContentFingerprints(line, 'buddy')
+        expect(out, `DSH 改写了 Web 运行面那两句 ⇒ 第 5 条的 find 漂移（${f}）`).not.toContain('DeepSeek Harness')
+        return
+      }
+    }
   })
 })
 

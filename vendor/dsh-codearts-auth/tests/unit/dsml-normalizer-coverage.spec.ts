@@ -51,6 +51,10 @@ describe('DSML 归一化接线覆盖（防回归）', () => {
       `正文出口清单变了（${emitters.length} 个）：${emitters.join(', ')}。若新增出口，必须同时接入 DSML 归一化。`,
     ).toEqual([
       'buddy-adapter.ts',
+      // ⚠️ codely-adapter.ts（2026-10-20 新增）：推理改为驱动官方 CLI 后成为
+      //    第 9 个正文出口 ⇒ 已同步接入 `createDsmlMarkerNormalizer`（push +
+      //    flush），②③ 两条守卫现在覆盖它。
+      'codely-adapter.ts',
       'gemini-messages.ts',
       'llm-adapter.ts',
       'lobsterai-adapter.ts',

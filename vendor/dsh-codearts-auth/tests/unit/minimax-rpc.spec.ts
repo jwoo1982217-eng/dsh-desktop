@@ -56,7 +56,9 @@ describe('接线点完整性（源码断言）', () => {
     //    的 `apply()` 行为用例守。
     expect(descriptorOf('minimax')?.settingsNamespace).toBe('llm-minimax')
     // 3. 服务实例 + 适配器注册
-    expect(indexSource).toContain('new MinimaxAuth(ctx)')
+    // ⚠️ 2026-10-24 本地试验版改：构造带了 `journalHome`（journal 落盘根目录），
+    //    文本形态从 `new MinimaxAuth(ctx)` 变为 `new MinimaxAuth(ctx, {`。
+    expect(indexSource).toContain('new MinimaxAuth(ctx, {')
     expect(indexSource).toContain('registerMinimaxLlm(ctx, {')
     // 4. refreshTargets 表
     // ⚠️ **2026-10-08 改（Task 10）**：原先断言 `src/index.ts` 的源码文本含手抄清单
@@ -95,17 +97,26 @@ describe('接线点完整性（源码断言）', () => {
     ).toContain('minimax')
   })
 
-  it('⚠️ index.ts 的 refresh 回调必须用两层结构（available.entry.*）', () => {
-    // 这是「续期静默写不回账号池」的真实缺陷形态：写成 available.id /
-    // available.credentialRef 会得到 undefined，UI 永远显示「已过期」。
+  it('⚠️ index.ts 的 refresh 回调必须续「选中的账号」（entry 两层结构，不得按模型过滤）', () => {
+    // 这是「续期静默写不回账号池」真实缺陷形态的防线（2026-10-24 本地试验版改）：
+    // 新形态**先定位**：优先「上一次选中的账号」（`lastPickedMinimaxAccount`），
+    // 找不到才退「池内第一个可用账号」（空 modelId —— 刻意的，H2 那组测试
+    // 驱动的正是这条回退，不得按模型过滤）；落点必须是**账号条目**（两层结构）
+    // 且走 `refreshAccountCredential`（可被 H2 桩替换的公共入口）。
     const code = stripComments(indexSource)
-    const block = code.slice(code.indexOf('const minimax = new MinimaxAuth(ctx)'))
+    const block = code.slice(code.indexOf('const minimax = new MinimaxAuth(ctx,'))
     const refreshPart = block.slice(0, block.indexOf('fetchRemoteModels'))
-    expect(refreshPart).toContain('available.entry.credentialRef')
-    expect(refreshPart).toContain('available.entry.id')
-    // 反向：不得出现裸字段取法（注释已剥离，故命中即真问题）
+    // 精准定位：先按「上一次选中的账号」找条目
+    expect(refreshPart).toContain("entries.find((e) => e.id === lastPickedMinimaxAccount)")
+    // 落点必须是 entry（两层结构）；**不得**用裸字段取法（旧缺陷形态）
+    expect(refreshPart).toContain("(await pool.getAvailableAccount(MINIMAX.id, ''))?.entry")
+    expect(refreshPart).toContain('refreshAccountCredential(')
+    expect(refreshPart).toContain('target.credentialRef, pool, target.id')
     expect(refreshPart).not.toMatch(/available\.credentialRef\b/)
     expect(refreshPart).not.toMatch(/available\.id\b/)
+    // 单凭据 refresh() 只能是「找不到账号条目」时的兜底，不得提前 return
+    expect(refreshPart.indexOf('await minimax.refresh()'))
+      .toBeGreaterThan(refreshPart.indexOf('refreshAccountCredential('))
   })
 
   it('⚠️ jet-hub-rpc.ts 的 minimax 真协议分支齐全（account.create）', () => {

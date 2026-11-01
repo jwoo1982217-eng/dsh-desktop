@@ -27,7 +27,7 @@
  * 修的是「用户看到的原因」。绝不静默换模型、也绝不绕过限流标记（有用例锁死）。
  */
 import { Context } from '@deepseek-ai/cordis'
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -206,6 +206,61 @@ describe('模型级限流被误报成「未登录」（IKJOZ9）', () => {
   })
 
   describe('不得误伤：三种「不是全部限流」的情形', () => {
+    /**
+     * ⚠️ **必须桩掉全局 `fetch`**（2026-10-20 补，否则本组会超时）。
+     *
+     * ## 症状与根因（实测，不是猜测）
+     *
+     * 本组的三条阴性对照在「Qoder 接上 `balance:` 选号」之后**各超时 ~5.0s**
+     * （撞 vitest 默认 5s）。加 `--testTimeout=40000` 后**全绿**，各约 10.3–10.7s
+     * ⇒ **纯超时，判据本身是对的**。
+     *
+     * 根因不在判据：本组取号会真的走 `createCredentialResolver` 的
+     * `kind: 'buddy'` 分档路径 ⇒ `fetchQoderCreditBalance` 真发请求 ⇒
+     * 本机 `openapi.qoder.sh` **不可达**（实测 ~10.7s 才失败）。
+     * ⚠️ 这是**测试基建没跟上生产接线**，不是生产缺陷；但不桩的话本文件
+     * 在断网机器上恒红（CI 里表现为 flaky）。
+     *
+     * ## 为什么桩在**这个 describe** 而不是文件级
+     *
+     * 同文件「端到端」那条**自己塞了 `adapter.fetchImpl`**（只拦推理请求），
+     * 文件级 stub 会改变它的时序前提。本组与它互不相干 ⇒ 只在本组内桩。
+     *
+     * ⚠️ 响应体用 **2026-10-20 实测的真实报文形状**（qodercn 账号
+     * `nick8893875717`）：`userQuota` 的 `total` 是 0，额度落在 `addOnQuota`
+     * （2000）。刻意让 `remaining` 非 0 —— 余额为 0 会让分档判 `none`，
+     * 本组就测不到「正常取号」了。
+     */
+    const QODER_USAGE_BODY = {
+      displayMode: 'qoder',
+      qoderUsage: {
+        userId: '01a0cca1-2528-718e-a44e-a31d9263e29a',
+        userType: 'personal_standard',
+        usageType: 'credits',
+        totalUsagePercentage: 0,
+        isQuotaExceeded: false,
+        // ⚠️ 永久哨兵（`9999-12-31`），不是真实到期时刻 —— 见
+        //    `qoder-credits.ts` 的 `QODER_PERMANENT_EXPIRY_MS`。
+        expiresAt: 253402214400000,
+        upgradeUrl: 'https://qoder.cn/pricing?client=qoder',
+        userQuota: { total: 0, used: 0, remaining: 0, percentage: 0, unit: 'credits' },
+        addOnQuota: {
+          total: 2000, used: 0, remaining: 2000, percentage: 0, unit: 'credits',
+          detailUrl: 'https://qoder.cn/account/usage',
+        },
+        isPlanQuotaProrated: false,
+      },
+    }
+
+    beforeEach(() => {
+      vi.stubGlobal('fetch', async () => new Response(JSON.stringify(QODER_USAGE_BODY), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+    })
+
+    afterEach(() => { vi.unstubAllGlobals() })
+
     it('账号没有该模型的限流标记 → 正常取号，不报限流', async () => {
       const ctx = boot()
       await addAccount(ctx, 'qoder')
@@ -248,10 +303,13 @@ describe('模型级限流被误报成「未登录」（IKJOZ9）', () => {
 
   describe('端到端：qoder 额度用尽后的第二次请求（issue 原症状）', () => {
     it('第 1 次报额度 → 标记落下 → 第 2 次报「限流」而不是「请先登录」', async () => {
+      // 真实apply还会读取远端模型元数据；该GET也必须在隔离夹具中返回。
+      vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', {headers:{'content-type':'application/json'}})))
       const ctx = boot()
       const adapter = ctx.llm.adapterByProvider.get('qoder') as {
         fetchImpl?: typeof fetch
-        options: { refresh: () => Promise<void> }
+        fetchFor?: (accountId?: string) => typeof fetch
+        options: { refresh: () => Promise<void>; fetchFor?: (accountId?: string) => typeof fetch }
         stream(options: unknown): AsyncIterable<unknown>
       }
       await addAccount(ctx, 'qoder', {
@@ -273,6 +331,8 @@ describe('模型级限流被误报成「未登录」（IKJOZ9）', () => {
         { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
       )) as unknown as typeof fetch
       // 续期走网络；真实场景下它会成功（空 modelId 取号不按模型过滤），这里替身掉。
+      const realFetchFor = adapter.fetchFor
+      adapter.fetchFor = () => adapter.fetchImpl!
       const realRefresh = adapter.options.refresh
       adapter.options.refresh = async () => {}
 
@@ -299,6 +359,7 @@ describe('模型级限流被误报成「未登录」（IKJOZ9）', () => {
         second = await run()
       } finally {
         adapter.options.refresh = realRefresh
+        adapter.fetchFor = realFetchFor
       }
 
       // ① 第 1 次：额度用尽（这条一直是对的）

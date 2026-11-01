@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import {
   candidateKeyOf,
   candidateRowLabel,
+  candidateRowParts,
   candidateStateOf,
   candidateToggleAction,
   describeCandidateState,
@@ -161,6 +162,102 @@ describe('candidateRowLabel：候选行的展示文案', () => {
     expect(() => candidateRowLabel(undefined)).not.toThrow()
     expect(() => candidateRowLabel({})).not.toThrow()
     expect(typeof candidateRowLabel(undefined)).toBe('string')
+  })
+})
+
+/**
+ * `candidateRowParts` —— 聚合页候选行「分格渲染」的数据来源。
+ *
+ * ⚠️ 为什么必须存在这个函数（而不是让渲染层去 split 那个标签字符串）：
+ * 用户 2026-10-27 报障「美化聚合页模型列表」之后，候选行要把
+ * 渠道名 / 模型 id / 倍率 / 补丁拆成四格分别上色。如果渲染层拿到的还是
+ * `candidateRowLabel()` 拼好的 `buddy · m · x0.15` 再 `split(' · ')`，
+ * **模型 id 本身含 `·` 时立刻错位**（真实存在这种 id）——
+ * 于是「倍率格子」会显示模型 id 的后半截，而真正的倍率丢失。
+ * ⇒ 拆分必须在纯函数里按**字段**做，渲染层只消费字段。
+ */
+describe('candidateRowParts：候选行的结构化字段（分格渲染的唯一数据来源）', () => {
+  const base = { provider: 'buddy', realId: 'deepseek-v4.1-flash' }
+
+  it('原样给出 provider 与 realId', () => {
+    expect(candidateRowParts({ ...base, price: 0.15 })).toEqual({
+      provider: 'buddy',
+      realId: 'deepseek-v4.1-flash',
+      price: 0.15,
+      patched: false,
+    })
+  })
+
+  it('★ 模型 id 里含「·」时不被拆散（这正是不能用 split 的理由）', () => {
+    // ⚠️ 反向钉子：若实现改成「拼字符串再 split(' · ')」，这条会红 ——
+    //    这也是本用例存在的主要目的（它是防回退的钉子，不是凑覆盖率）。
+    const parts = candidateRowParts({ provider: 'loomy', realId: 'foo · bar', price: 2 })
+    expect(parts.realId).toBe('foo · bar')
+    expect(parts.provider).toBe('loomy')
+  })
+
+  it('★ price 为 Infinity（无标注哨兵）时给 null，不是 Infinity', () => {
+    // ⚠️ 直接透传 Infinity 会让渲染层「判 !isFinite 才不显示」的责任落到调用方，
+    //    而任何一处漏判都会把 xInfinity 印到界面上。
+    const parts = candidateRowParts({ ...base, price: Number.POSITIVE_INFINITY })
+    expect(parts.price).toBeNull()
+  })
+
+  it('★ price 为 0 时保留 0（渲染层据此显示「免费」，不得当假值丢掉）', () => {
+    const parts = candidateRowParts({ ...base, price: 0 })
+    expect(parts.price).toBe(0)
+    expect(parts.price).not.toBeNull()
+  })
+
+  it('price 缺失 / 非数字时给 null', () => {
+    expect(candidateRowParts(base).price).toBeNull()
+    expect(candidateRowParts({ ...base, price: 'x0.15' }).price).toBeNull()
+    expect(candidateRowParts({ ...base, price: Number.NaN }).price).toBeNull()
+  })
+
+  it('viaPatch === true 才算补丁（字符串 "true" 不算）', () => {
+    expect(candidateRowParts({ ...base, viaPatch: true }).patched).toBe(true)
+    expect(candidateRowParts({ ...base, viaPatch: 'true' }).patched).toBe(false)
+    expect(candidateRowParts(base).patched).toBe(false)
+  })
+
+  it('畸形入参不抛错，且字段退化为占位符', () => {
+    for (const bad of [undefined, null, {}]) {
+      expect(() => candidateRowParts(bad)).not.toThrow()
+      expect(candidateRowParts(bad)).toEqual({
+        provider: '?',
+        realId: '?',
+        price: null,
+        patched: false,
+      })
+    }
+  })
+
+  it('★ candidateRowLabel 与 candidateRowParts 同源：标签必须与字段一致', () => {
+    // ⚠️ 两条出口若各自实现一份判据，必然出现「tooltip 说无倍率、界面却显示 x0.15」
+    //    这类分裂。这条用**一组**输入同时核对两者。
+    const cases = [
+      { provider: 'buddy', realId: 'm', price: 0.15, viaPatch: false },
+      { provider: 'buddy', realId: 'm', price: 0, viaPatch: false },
+      { provider: 'loomy', realId: 'a · b', price: 2, viaPatch: true },
+      { provider: 'trae', realId: 'm', price: Number.POSITIVE_INFINITY, viaPatch: false },
+    ]
+    for (const c of cases) {
+      const parts = candidateRowParts(c)
+      const label = candidateRowLabel(c)
+      expect(label).toContain(parts.provider)
+      // 模型 id 原样出现在标签里（含含「·」的那条）
+      expect(label).toContain(parts.realId)
+      if (parts.price === null) {
+        expect(label).not.toContain('x')
+        expect(label).not.toContain('Infinity')
+      } else if (parts.price === 0) {
+        expect(label).toContain('免费')
+      } else {
+        expect(label).toContain(`x${parts.price}`)
+      }
+      expect(label.includes('补丁')).toBe(parts.patched)
+    }
   })
 })
 

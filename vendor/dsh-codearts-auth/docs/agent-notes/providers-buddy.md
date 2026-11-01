@@ -218,7 +218,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 
 要点：
 
-- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13011111100`，
+- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13999991100`，
   `profile-summary` 返回的就是完整号码）与已脱敏的露 4 位形态，输出都是
   `130******00`。幂等意味着老账号无需重新登录、重复运行不产生新写入
 - ⚠️ **判据只认「像手机号」的形态**：`/^1\d{10}$/`（完整）或
@@ -237,7 +237,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 排查 / 验证：
 
 - `scripts/probe-lobsterai-profile.mjs` —— 打印 `profile-summary` 的完整响应
-  （**发现 `nickname` 在这里是完整号码 `13011111100`**，与登录响应的脱敏形态不同）
+  （**发现 `nickname` 在这里是完整号码 `13999991100`**，与登录响应的脱敏形态不同）
 - `scripts/verify-lobsterai-nickname.mjs` —— 用真实账号跑一遍
   `repairAccountNicknames` 并打印修复前后昵称（⚠️ **会写真实账号池昵称**）
 - `tests/unit/lobsterai.spec.ts` 的「手机号掩码（只露末 2 位）」段（8 条，
@@ -403,12 +403,13 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 集合**硬编码**为 `new Set(['glm-5.3-flash'])` —— `deepseek-v4.1-flash` 是
 2026-09 新增的 benefit 模型，因此从不带该头，后端按非 benefit 通道处理它。
 
-实证矩阵（2026-09-23，对齐 deveco-code-rust `fb1b4a2`）：
+实证矩阵（2026-09-23，对齐 deveco-code-rust `fb1b4a2`；⚠️ `deepseek-v4.1-flash`
+那一行**已于 2026-10 失效**，见下方复测）：
 
 | 模型 id | 来源 | 不带 maas_type | 带 maas_type |
 |---|---|---|---|
 | `glm-5.3-flash` | gateway/config | 404 未注册 | ✓ 成功 |
-| `deepseek-v4.1-flash` | gateway/config | 404 未注册 | ✓ 成功 |
+| `deepseek-v4.1-flash` | gateway/config | 404 未注册 | ✓ 成功（**2026-10 已反转**） |
 | `deepseek-v4-flash-0731` | gateway/config | 404 未注册 | ✓ 成功 |
 | `deepseek-v4-pro-0813` | gateway/config | 404 未注册 | ✓ 成功 |
 | `deepseek-v4-flash`（无后缀） | 静态表 / 归一化结果 | ✓ 成功 | ✗ unsupported |
@@ -417,26 +418,35 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 
 结论：**`gateway/config` 返回的模型即 benefit 集合**，无需靠模型名硬编码。
 
+⚠️ **2026-10-26 复测（本机真实账号，逐模型两态直连）**：`deepseek-v4.1-flash`
+已按常规 `0.18x` 模型下发 —— 不带该头正常出流，**带上即 `4004.200 benefit not found`**。
+这正是「静态表会过时」的实锤，也是本轮删除兜底表的依据（见下一小节）。
+
 要点：
 
-- 判定 `isCodeArtsBenefitModel`（`src/models.ts`）：远端拉取并缓存的集合
-  （`~/.cache/deveco/codearts_benefit_models.json`）∪ 静态兜底
-  `CODEARTS_BENEFIT_FALLBACK`（`glm-5.3-flash` / `deepseek-v4.1-flash`）。
-  远端集合优先，后端新增 benefit 模型**无需改代码**
+- 判定 `isCodeArtsBenefitModelKnown`（`src/models.ts`）：**只看**远端拉取并缓存的
+  集合（`~/.cache/deveco/codearts_benefit_models.json`）。已删除静态兜底表
+  `CODEARTS_BENEFIT_FALLBACK` 与 `isCodeArtsBenefitModel`：它两次成为缺陷根源
+  （表过时 ⇒ 首条消息必报 4004.200）。后端再变由**双向自愈**兜住
+  （404 → 补头一次；4004.200 → 先领福利、再去头一次）
 - ⚠️ **只记录「归一化未改写」的 id**：gateway 下发的是
   `deepseek-v4-flash-0731`，而 `normalizeModelId` 会把它改写成
   `deepseek-v4-flash` —— 两者在后端是**不同模型、benefit 属性相反**，
   记录改写后的 id 会让无后缀模型多带 `maas_type` 而失败
 - ⚠️ **判定必须在 `stream()` 的重试循环外算一次**（要读缓存文件，不宜每轮 IO）
+- ⚠️ **去头自愈的门禁是「本轮真的带了该头」**（`benefitHeaderSent`），
+  不是「该模型是 benefit 模型」：没带过却收到 4004.200 说明是**别人**补的头，
+  去头等于逐字节重发
 - ⚠️ **缓存读写必须用顶层 `import { … } from 'node:fs'`，不能用 `require`** ——
   本包是 ESM（`package.json` 的 `"type": "module"`），`require` 未定义、抛
   ReferenceError 后被 `catch` 静默吞掉，表现为「写不进也读不回」（`loadModelsCache`
   的模型列表磁盘缓存曾因此长期失效）
 - `deepseek-v4.1-flash` 的上下文窗口按 IDE 下发的 inferhub-provider 配置声明为
   **1000000**（与无后缀 v4-flash/pro 的 1048576 不同）
-- 回归用例：`tests/unit/models.spec.ts`（集合判定 / 落盘不含改写 id / 缓存往返）、
-  `tests/unit/llm-adapter.spec.ts`（v4.1 带 `maas_type` 且参与签名、无后缀
-  v4-flash 不带）、`tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
+- 回归用例：`tests/unit/models.spec.ts`（远端集合唯一权威 / 未确认不带头 /
+  落盘不含改写 id / 缓存往返）、`tests/unit/llm-adapter.spec.ts`（远端确认 ⇒
+  带 `maas_type` 且参与签名；未确认 ⇒ 404 才补头；没带头时的 4004.200 不得重试）、
+  `tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
 
 ### ⚠️⚠️ `InferHub.4004.200` 有**两条下发通道**，只接一条 = 两套判据（Issue IKLBSH A6）
 
@@ -471,6 +481,51 @@ benefit 那条必须排在**限流之前**（否则被 `isRateLimited` 截走当
 回归用例：`tests/unit/llm-adapter.spec.ts` 的
 「★ benefit 去头重试必须接上 4xx 通道」（4 条：主用例 + 非 benefit 模型对照 +
 报文不含该码对照 + SSE 通道既有行为不变）。
+
+### ⚠️⚠️ 本机装了会**重签** CodeArts 请求的压缩插件时，`maas_type` 由它说了算（2026-10-26）
+
+**用户报障**：`deepseek-v4.1-flash` 发消息即 `本轮运行失败 codearts: benefit not found`，
+而官方 CodeArts Agent 用同一账号同一模型正常。
+
+**实测（本机真实账号，直连 `chat/completions`，`max_tokens=4`，逐模型两态）**：
+
+| 模型 | 不带 `maas_type` | 带 `maas_type: benefit` |
+|---|---|---|
+| `deepseek-v4.1-flash` | ✅ 正常出流 | ❌ `InferHub.4004.200 benefit not found` |
+| `glm-5.3-flash` | ❌ `InferHub.002002009.404` 未注册 | ❌ `4004.200`（该账号没有 benefit 包） |
+| `deepseek-v4-flash` / `GLM-5.2` / `openpangu-2.0-flash/pro` / `kimi-k2.6-vl` | ✅ 正常出流 | —（未测） |
+
+**根因**：`billion-context`（bili）作为同进程 DSH 插件拦截全局 `fetch`，把带
+`SDK-HMAC-SHA256` 签名的请求交给自己的代理**重签**。它的 `signApigHeaders()` 会
+`deleteSignedHeaders(target)` 删掉 `authorization / x-sdk-date / x-sdk-content-sha256 /
+x-security-token / maas_type`，再按**它自己的**判据补 `maas_type`：
+
+```js
+apigBenefitFor(model, route) = route.models[model].benefit ?? DEFAULT_BENEFIT_MODELS.includes(model)
+DEFAULT_BENEFIT_MODELS = ["glm-5.3-flash", "deepseek-v4.1-flash"]   // ← 第二项已过时
+```
+
+于是**插件自己的判定被完全覆盖**：本轮没带头，bili 补上 ⇒ 上游 `4004.200` ⇒
+插件去头重试**仍是同一个出站请求**（bili 又补上）⇒ 如实抛错。
+路由键按前缀匹配（`upstreamUrl === key || upstreamUrl.startsWith(key + "/")`），
+故配置键写 `https://snap-access.cn-north-4.myhuaweicloud.com/api/v2` 即命中
+`/api/v2/chat/completions`。
+
+**必须同时满足三件事，缺一不可**：
+
+1. 插件按**远端 `gateway/config` 集合**判定（本仓库已删掉静态兜底表；官方内核
+   也是 `if (model_id ∈ gatewayConfig.models) headers.maas_type = "benefit"`）。
+2. bili 的逐模型开关与同一份集合一致：
+   `providers."<base>".models."glm-5.3-flash".benefit = true`，其余（尤其
+   `deepseek-v4.1-flash`）`false`。⚠️ 改的是**配置文件**，bili 在**启动时**读取
+   （`/__bili/config/reload` 有管理面鉴权，外部脚本调不通）⇒ **改完要重启客户端**。
+3. 去头自愈只能以「本轮**真的带了**该头」为前提（`benefitHeaderSent`）：
+   没带过头却收到 `4004.200`，那是别的组件补的，去头是**逐字节重发**，只会
+   白烧唯一一次自愈名额并同时锁死补头方向。
+
+⚠️ 别走进的反向坑：把**所有**模型都设成 `benefit:false` 会让 `glm-5.3-flash`
+在 bili 重签时丢掉必需的头（我们的「补头自愈」同样会被它删掉）⇒ 该模型坏。
+开关必须逐模型、按远端集合来。
 
 ## ⚠⚠️ 腾讯系内容级风控：system 里的客户端模板句会被**整轮拦死**（Issue IKJNA1）
 
@@ -682,6 +737,38 @@ unapproved channel`）⇒ 说明那批请求确实打到了能报 11128 的网�
 账号更少、渠道更不可用。**症状与 PR #105 明确要避免的失败形态逐字同形**，
 只是入口判据认错了报文。
 
+##### 🔴 2026-10-30：`11140` 还有**第五族** —— 账号被平台限制（**换号/补头都无效**）
+
+当天在 `www.workbuddy.ai` 上排查「版本过旧」时，把同一组 5 个
+`WORKBUDDY_ACCOUNT_*` 逐个打了一遍，报文里带出了**此前没登记过的
+`displayTips.zh`**：
+
+```json
+{"code":11140,"msg":"request illegal",
+ "displayTips":{"zh":"账号存在异常行为，已被限制使用"}}
+```
+
+⇒ **`11140` 不只有「三头渠道校验」那一族**：同一 `code`、同一 `msg`，但
+`displayTips.zh` 说的是**平台把这个账号限制了**。
+
+| 判据 | 族 | 换号有用？ | 补头有用？ |
+|---|---|---|---|
+| 三头缺失（IKM7SG） | 渠道校验 | ✅ | ✅ 补三头即 200 |
+| **`displayTips.zh` 含「账号存在异常行为」** | **账号被限制** | ✅（换**别的**账号） | ❌ **实测 6 种补头全无效** |
+
+实测否证（同账号 `80E83BC0`，5.9.4 版本、带首位 system）：
+补 `X-Product-Version:5.9.4` / `X-Product-Version:1.106.1` /
+`X-Requested-With:XMLHttpRequest` / 两者合并 / `X-Agent-Intent:craft` /
+`X-Skip-User-Agent-Merge:true` —— **7 格全是 11140 + 同一句 tips**。
+
+⚠️ **排查启示**：`msg` 一样时**必须读 `displayTips.zh`**才能分出这两族
+（只看 `code`/`msg` 会把「账号被封」误判成「少发了头」，然后去加一堆没用的头）。
+⚠️ **本机 5 个 wb 账号全部命中此族**（同一时刻），而 buddy 站同一台机器上的
+`BUDDY_ACCOUNT_A6146635` 仍是干净 200 ⇒ **不是 IP 级、也不是代码级**。
+⚠️ **一个待验证的猜想**（未证）：长期发**过期的客户端版本**（我们此前一直发
+`5.5.2`，真实客户端已是 `5.9.4`）可能正是被标记的原因之一。无法回溯证明，
+但**保持版本与真实客户端一致**反正没有代价 —— 见下面那节。
+
 ##### ⚠️ `request illegal` 与 11140 **共用**，所以两条判据必须**同时**按 `code` 收窄
 
 实测 11140 的报文是 `{"code":11140,"msg":"request illegal"}` —— **同一句措辞**。
@@ -695,6 +782,24 @@ unapproved channel`）⇒ 说明那批请求确实打到了能报 11128 的网�
 「安全策略拦截 / blocked by security policy」也高度相近。
 用它会把**内容级**的 `Illegal API invocation…` 拖进换号，而那一句换号**完全无效**
 （腾讯指纹改写链路处理、每个账号都被拦在同一句上）⇒ 整池被白烧。
+
+##### ✅ 但 `errorDetail` 的**展示出口**必须认 `displayTips`（2026-10-31 修）
+
+上面那条「判据不得用 `displayTips`」说的是**分类**；**展示**是另一回事 ——
+第五族报文（账号被限制）**只有 `displayTips`、没有 `displayMsg`**：
+
+```json
+{"code":11140,"msg":"request illegal",
+ "displayTips":{"zh":"账号存在异常行为，已被限制使用"}}
+```
+
+旧 `errorDetail` 只认 `displayMsg` ⇒ 提不出任何本地化文案 ⇒ 用户只看到
+`request illegal`，**上游唯一说清原因的字段被白白埋掉** —— 与 2026-09-27 那条
+`displayMsg` 事故（`errorDetail` 只读 `data.message`）**同型**。
+修法：`errorDetail` 加 `displayTips.{zh,en}` 腿，**优先级锁死**
+`displayMsg` 在前、`displayTips` 在后（两者都在时以前者为准），由两条行为级
+用例锁住（含优先级对照格）。⚠️ **与判据的边界要分清**：分类判据**仍不得**
+扫 `displayTips`（上面那条警告照旧成立）—— 展示出口与分类出口是两条路。
 
 ⚠️ **右边界是 `(?![\d.])`、不是 `(?![0-9])`**（自引入缺陷，单测实测）：
 JSON 允许非整数码，`JSON.stringify({code:11128.5})` 写出 `11128.5`，`.` 不在
@@ -1340,6 +1445,242 @@ review.`（**11128 各子原因共用/漂移 `displayMsg` 本仓已有先例**�
 —— 它锁的恰恰是缺陷本身。已改为断言**零冷却**，并补一格「msg 是其它 11128 子原因」
 来保住该组原本要验的「渠道校验判据不得靠 `displayTips` 认领」。
 
+### ⚠️⚠️ 第四条指纹：**DSH 自己的身份首句**（2026-10-20 登记；2026-10-21 换措辞）
+
+**与前三条的本质差别**：ZCode / Claude 那三条都是**别的客户端**往 system 里注的
+模板句（换会话、清历史可绕）；这一条是 DSH `base` 段**每轮必带的首句** ⇒ **绕不掉**，
+只能靠 `src/openai-gateway/tencent-fingerprint.ts` 那张表。
+
+| 项 | 值 |
+|---|---|
+| `find` | `You are an AI agent powered by DeepSeek Harness`（刻意不带尾句点，一条覆盖带/不带句点两种形态） |
+| 锚点 | **行首锚定**（与 Claude 身份句同族，与 ZCode / 反馈句**相反**） |
+| 位置 | system 的**绝对首行**（`base` 段）——DSH 每轮必带 |
+
+**2026-10-20 本机对 `copilot.tencent.com` 逐格实测**（判据来自当时的 `replace`）：
+
+| 形态 | 结果 |
+|---|---|
+| 裸串作整个 system（绝对行首） | ❌ 400/11128 |
+| 前接任意前缀（`You are a helpful assistant.\n\n` + 裸串） | ✅ 200 |
+| 改写后裸串（无句点 / 带句点 / 后接正文） | ✅ 200 |
+| 整段真实 system（首句改写，8683 字符） | ✅ 200 |
+| 整段真实 system（首句删除，8624 字符） | ✅ 200 |
+| 时序对照：同一工作区 2026-09-28 的会话，system 首行即本句且当时可用 | ⇒ 该句**一直在行首**，是上游后续才把它纳入名单，不是本机配置变更所致 |
+
+#### 2026-10-21：`replace` 换成**官方同形形态**（用户要求；取证自 CodeBuddy 自己的会话）
+
+**取证路径**（不是读源码推的）：CodeBuddy 中国版的会话落盘在两处 ——
+元数据 `%APPDATA%\CodeBuddy CN\codebuddy-sessions.vscdb`（SQLite，`ItemTable` 的
+`session:<id>` 键），正文
+`%LOCALAPPDATA%\CodeBuddyExtension\Data\<userId>\CodeBuddyIDE\<userId>\history\<工作区 hash>\<会话 id>\messages\*.json`
+（⚠️ `globalStorage\...\genie-history\...\conversations\<id>\` 是**空目录**，
+system 提示词本身**不落盘**）。取用户截图里那条（标题「AI编程助手介绍」，
+id `8c9dbeb10e2846d7b0fa569b14aa4335`）：
+
+- 该会话 assistant 的 **reasoning 逐字复述了自己的 system**：
+  「系统提示说我是 "an AI coding assistant, powered by Hy4 preview model"」；
+- 客户端提示词**资产** `extensions/genie/product.json` 的 `craft-agent-prompt` 首行是
+  `You are an AI coding assistant,{{ ModelNamePrompt }}.`，而该变量渲染成
+  `" powered by <模型展示名> model"`。
+
+两条**独立**来源拼出的字节一致 ⇒ 官方首句是：
+
+```
+You are an AI coding assistant, powered by Hy4 preview model.
+```
+
+**⇒ 与我们那句结构完全同形**，差别只在 **Y 填什么**：
+
+| | 首句 |
+|---|---|
+| DSH（本插件每轮必带） | `You are an AI agent powered by DeepSeek Harness.` |
+| CodeBuddy 官方 | `You are an AI coding assistant, powered by <模型展示名> model.` |
+
+**为什么要改**：旧的 `replace` 是 `You are an AI agent built on the DeepSeek Harness
+runtime` —— 它是「等义改写」，把 `DeepSeek Harness` 这个 token **原样留着**，
+属于「只躲开了字面量、没解决身份」：上游一旦把名单从「整句逐字符」放宽成关键词/正则，
+这一条立刻失效。
+
+**改成了什么**：官方**原生兜底**措辞（模型名缺失时官方发出来的就是这个形态）
+
+```
+You are an AI coding assistant, powered by a large language model
+```
+
+三条取舍：① 出站 system 里**彻底不再出现 `DeepSeek Harness`**（本条的真正收益）；
+② 措辞取自官方资产而**不是自造**；③ **刻意不带具体模型名** —— 那要把 model 透传进
+`rewriteTencentContentFingerprints`（7 处调用点），且我们的目录展示名与官方展示名
+不一定一致，多一处信号反而多一处**不一致**。
+
+✅ **2026-10-21 实发验收通过**（模型 `deepseek-v4.1-flash`，两站各测一次）：
+`buddy` 站裸串仍 `400/11128`、换成新措辞后拿到**干净的 200**；
+`workbuddy` 站本来就放行（见下）。
+
+跑法：`pnpm test:e2e:buddy-fingerprint`（双闸门已绑好）；
+指定模型：`DSH_BUDDY_FINGERPRINT_MODEL=deepseek-v4.1-flash pnpm test:e2e:buddy-fingerprint`。
+其中「当前 `replace` 的措辞实测放行」那一格就是换措辞的**验收条件**，
+它红了要改**措辞**、不是改断言。
+
+#### ⚠️⚠️ 本条是**端点相关**的（登记时只测过 `copilot.tencent.com`）
+
+2026-10-21 两站对照实测（两站都跑满两轮，结果可重复）：
+
+| 站点 | 裸串 + `step-5-preview` | 裸串 + `deepseek-v4.1-flash` |
+|---|---|---|
+| `copilot.tencent.com`（buddy） | ❌ `400/11128` | ❌ `400/11128` |
+| `www.workbuddy.ai`（workbuddy） | ✅ 200 | ✅ 200 |
+
+两个模型都测过 ⇒ **站点差异、不是模型差异**。登记表对 `workbuddy` **仍保留**这条
+改写（措辞语义等义、对该站无害，国际站哪天也上名单时它就是现成的防线），
+但别把「国际站没拦」读成「这条登记多余」—— 它挡的是 buddy 站**每轮必带**的首句。
+
+⚠️ 这条差异是本次实测**新发现的**：那条 2026-10-20 的登记注释只写了
+`copilot.tencent.com + 账号 A`，而 e2e 第 4 节第一版照抄了邻节的「两站都测」写法，
+把**从没测过**的那一格当成已知 ⇒ 实测当场红。**教训：「照抄邻节的站点矩阵」不等于
+「那一格测过」**，与「锚点结论不可跨条推用」是同一条纪律的另一面。
+
+#### 🔴 2026-10-30 复测：匹配语义三格 + 「逗号」这条民间修法（实测成立）
+
+用户报「buddy / workbuddy 的提示词过滤好像更新了，社区传的改法是 `agent` 后加个
+逗号」。本机逐格复测（`copilot.tencent.com` + `deepseek-v4.1-flash` + 账号
+`BUDDY_ACCOUNT_A6146635`，**先按基线筛出可放行账号再固定用它**）：
+
+| 形态 | 结果 | 说明 |
+|---|---|---|
+| 原文 `You are an AI agent powered by DeepSeek Harness` | ❌ 400/11128 | 仍被拦（未解除） |
+| **全小写** / **全大写** / 只改一个词的大小写 | ❌ 400/11128 | ⇒ **大小写不敏感** |
+| **双空格**（`agent␠␠powered`） | ❌ 400/11128 | ⇒ 上游**归一空白** |
+| **`agent` 后加逗号**（`agent, powered`） | ✅ **200** | ⇒ 民间修法**成立** |
+| **`agent,powered`**（逗号无空格） | ✅ 200 | ⇒ 只要打断字面量即可 |
+| `Harness` 后加逗号 | ❌ 400/11128 | 逗号位置必须在 `agent` 之后 |
+| 裸两个词 `DeepSeek Harness` | ✅ 200 | ⇒ **认整句、不认 token**（与本文件既有结论一致） |
+| 现行 `replace`（官方同形） | ✅ 200 | ⇒ 本仓既有修法**仍然有效** |
+
+⇒ 三条可推广的结论：
+1. **上游是「大小写不敏感 + 空白归一」的整句匹配**，因此**逗号**（标点）是可靠的
+   最小打断手段，而**多加空格不算**。
+2. 「逗号」这条修法**能保留 `DeepSeek Harness` token**（上表倒数第二行证明 token
+   本身不拦）—— 但本仓**刻意不采用**它作 `replace`：2026-10-21 那节的收益 ① 是
+   「出站 system 里彻底不再出现 `DeepSeek Harness`」，换回逗号形态会**撤销**该收益
+   （上游哪天从「整句」放宽成「关键词」就立刻失效）。
+3. ⇒ 落地的是**漂移容忍**而不是换 `replace`：`find` 仍是那句话、`replace` 仍是
+   官方同形，但匹配放宽到「形态」几维（`findRegex`，见
+   `src/openai-gateway/tencent-fingerprint.ts` 第 4 条）。这治的是本文件顶部登记的
+   「**漂移风险未解**」：DSH 改一个字符即静默失效。
+
+⚠️ **`workbuddy` 这一格本次测不了**：本机 5 个 `WORKBUDDY_ACCOUNT_*` 全部回
+`403 / 11140 / request illegal`（= 本文件「第四族」账号级渠道校验，**与内容无关**：
+同一账号上 system 有/无、`max_tokens` 16/64/不发、加 `reasoning_effort`、换官方同形
+措辞，**七种变体全是 11140**）⇒ 该站当前**无法做内容级对照**。
+⚠️ **不要用 refresh 去「修好」它**：本文件记过「诊断脚本对真实凭据 refresh 会烧掉
+账号的 token」，那是不可逆的。
+
+#### ⚠️ 跑这一节时暴露的**四个 e2e 探针缺陷**（都已修，2026-10-21）
+
+它们都会让「跑不通」看起来像「指纹结论」——正是本文件反复警告的那类误判：
+
+| # | 缺陷 | 症状 | 修法 |
+|---|---|---|---|
+| ① | 两站共用**同一个** `BUDDY_*` 账号 | `workbuddy` 恒 **HTTP 401** | 按站点取凭据（`WORKBUDDY_*` / `BUDDY_*`） |
+| ② | 按行正则解析 `.credentials.yaml` | 报「磁盘上没有 workbuddy 凭据」（**明明有 5 个**） | 复用 `image-probe-shared.ts` 的 `credentialFor()`（YAML 单引号标量会**折行**：workbuddy 那条 2,165 字符） |
+| ③ | 两站硬编码同一套 CodeBuddy 头值 | `workbuddy` 恒 `400/11128/msg=request illegal`（**渠道校验**，不是内容级） | 头全部由 `src/product.ts` 现算：`X-IDE-Name`/`X-Product` 是 `attributionName`（`CodeBuddy` vs `WorkBuddy`）、UA 按模型族、另补三枚 `X-Conversation-*` 与 `X-Agent-Purpose` |
+| ④ | 固定用**第一个**账号 | 第一个 workbuddy 账号恰好**被限流** ⇒ 每条断言都红在 `429/code 6004` | 落地本文件一直声明的「**先筛基线放行的账号再固定用它**」（基线 = 中性 system 拿到干净 200；全部不可用则**抛出并逐条列出原因**，不静默跳过） |
+
+⚠️ 另有**一条既有夹具缺陷**（与本轮改动无关、但同批修掉）：`loadTriggerLine()` 取的
+文档那一行现在带 `` `$Js="…"` `` 的双引号与行尾 `\r`，直接拼进 JSON 文本会抛
+`Expected ',' or '}' after property value` ⇒ 角色矩阵里 `reasoning_content` /
+`tool_calls` 两条用例根本**跑不起来**。修法是替换**JSON 转义后**的形态。
+
+**结果**：`pnpm test:e2e:buddy-fingerprint` 全文件 **45/45 通过**（`deepseek-v4.1-flash`，
+连续两轮一致）。
+
+⚠️⚠️ **别把本条读成「封号」判据**：本仓库实测到的通道门控是**按账号 + 三个请求头**
+（IKM7SG），而 11128 的内容级那一支是**字面量黑名单**、不读语义。换措辞的已验证收益
+只有「不再命中那条字面量、出站不带自家 token」这两条；「被上游识别成第三方客户端
+并封号」这一层，**目前没有任何证据**。同理，若将来要「更像官方」，收益最大的不是
+这一句，而是**整体一致性**（官方把 `<user_info>` / `<rules>` / `<project_context>` /
+`<system_reminder>` / `<user_query>` 那套包裹发在 **user 消息**里，见上文的会话落盘）。
+
+⚠️ **本条在 2026-10-21 之前零用例**：`tests/unit/openai-gateway-tencent-fingerprint.spec.ts`
+已补一节（锁「改谁、改成什么、出站不许残留 `DeepSeek Harness`」），但单测**锁不住**
+「新措辞在上游是否放行」—— 那只有 e2e 能验。
+
+⚠️⚠️ **但上面那条「实发验收通过」只覆盖「身份句单独」的情形**。同一天（2026-10-21）晚上
+又发现：真实 system 里 `DeepSeek Harness` **另有**一处能单独拦、且**只改第 1 行不够** ——
+见下一节。**两条必须同时改才放行。**
+
+### ⚠️⚠️⚠️ 第五条指纹：**DSH Web 运行面的开头两句**（2026-10-21 真实报障）
+
+**现象**（用户转来的报障）：「本轮运行失败 `buddy: 请求被拦截，请重新发送
+Illegal API invocation from an unapproved channel`」。报障者的诊断是「黑名单认的是
+`DeepSeek Harness` 这个 token，DSH 的 system 里它出现 3 次，插件只改第 1 行」。
+
+**核对结论：方向对、机制错。**
+
+| 他的说法 | 实测 |
+|---|---|
+| system 里 `DeepSeek Harness` 共 3 次 | ✅ 对（真实 system 5,780 字符：第 **1** 行、第 **33** 行、第 **35** 行；他说的 78/80 只是行数不同） |
+| 只改第 1 行 ⇒ 照样被拦 | ✅ 对，且**已复现** |
+| 「认的是 token 本身」 | ❌ 错：整个 system 只发 `DeepSeek Harness` 两个词 ⇒ **200**；第 33 行那句单独 ⇒ **200** |
+
+**真凶是第 35 行那句** —— `@deepseek-ai/dsh-harness-dev-context` 的 `WEB_SURFACE_PROMPT`
+**前两句**（221 字符）。它**单独就能拦**，且**位置无关**。
+
+#### 逐格实测（2026-10-21；`copilot.tencent.com` + `deepseek-v4.1-flash`；载荷**逐字节**取自本机会话落盘的真实 system；另用**三个不同账号**复测一致）
+
+| 载荷 | 结果 |
+|---|---|
+| 真实整段（3 处都在） | ❌ 400/11128 |
+| 真实整段 + **只改第 1 行**（= 修复前插件发出的形态） | ❌ **400/11128** ← 报障现场 |
+| 真实整段 + 两处都改 | ✅ 200 |
+| 只发第 33 行那句（`HARNESS_SOURCE_PROMPT`） | ✅ 200 ⇒ **不登记它** |
+| 整个 system 只有 `DeepSeek Harness` 两个词 | ✅ 200 ⇒ **不是「认 token」** |
+| 第 35 行**整行**（1,002 字符） | ❌ 400/11128 |
+| 该行**前 220 字符** | ✅ 200 |
+| 该行**前 221 字符** | ❌ 400/11128 ⇒ **字面量 = 前两句** |
+| 切句后的**两半各自**（前一句 107 / 后七句 894） | ✅ 都放行 ⇒ 触发串**跨句边界**，切开会**空跑** |
+| 去掉行首 38 字符 | ✅ 200 ⇒ 字面量**从行首开始** |
+| 中性前言 + 该字面量 | ❌ 400/11128 ⇒ **位置无关** |
+| 该字面量放 **assistant 正文** | ❌ 400/11128 ⇒ 现有改写范围已覆盖 |
+| `www.workbuddy.ai` 站同一载荷 | ✅ 200 ⇒ **站点相关**（与第 4 条同型） |
+| 旧版形态 `…Web GUI at http://127.0.0.1:3080.` | ✅ 200 ⇒ **刻意不登记** |
+
+#### ⚠️⚠️ 为什么我们**连续两次**没抓到这一格（两条同型失误，都值得记）
+
+1. **2026-10-20 那条「整段真实 system（首句改写）✅ 200」用的是不含这两句的载荷**：
+   `dsh-harness-dev-context` **只在 Web 运行时挂载**（它 README 原话：`--help` 与非 Web
+   组合**从不挂载**）⇒ 任何取自 CLI / 桌面面的「真实整段」**天然不含** Web 运行面那句，
+   测出来必然是 200。
+2. **2026-10-21 新写的 e2e 第 4 节又踩了同一个坑**：那格「整段形态」用
+   `'padding. '.repeat(200)` 冒充「长正文」，里面根本没有另外两处 ⇒ 同一格**连续两次**
+   没测到。报障者那句「**只测单句的用例永远抓不到这一格**」说到了根上。
+
+⇒ 可推广：**「真实整段」必须逐字节取自真实落盘的 system**，用填充字符串冒充 = 空跑；
+且**哪个运行面**决定了 prompt 里有没有这句（Web / CLI / 桌面各不同）。
+
+#### 修法与守卫（2026-10-21）
+
+- `src/openai-gateway/tencent-fingerprint.ts` 新增第 5 条：`find` = 该 221 字符字面量，
+  `replace` = 去掉品牌串的等义形态（212 字符），锚点**不做行首正则**（实测位置无关）。
+- 单测 9 条：**两份独立誊写**（源码拼接 / 测试单行）+ 长度断言（221/212）、
+  **前 220 字符必须逐字节不动**（`find` 写短了就红）、**切句两半都不许被改**、
+  大小写、位置无关、assistant、五条互不干扰、幂等。
+- e2e 第 5 节（`pnpm test:e2e:buddy-fingerprint`）：两站各测「拦 / 改写后 200」、
+  220 前缀放行、位置无关、assistant 正文、旧形态**反向断言**、以及
+  **`★★` 多出现位置那一格**（只改第 1 行 ⇒ 仍被拦；两处都改 ⇒ 放行）—— 报障者的原话那一格。
+
+#### ⚠️ 尚未解决的**漂移风险**（如实登记）
+
+上游认的是**逐字符的长字面量** ⇒ DSH 哪天改动这两句里的**任一字符**，第 5 条的 `find`
+会**静默**停止匹配（症状与「完全没登记」**同形**：该渠道整轮 400 复发）。
+当前守卫是单测里那条**读本机会话落盘**的漂移用例（本仓库**唯一**一条读用户目录的单测：
+只读、不打印正文、读不到就自行退回、CI 上会 skip；已做变异验证 —— 往 `find` 里注入
+一个空格，它**精确变红**并指出是哪台/哪个 session 文件）。它**只在本机有效**。
+要不要再加一道**运行时**闸门（例如出站 system 里若仍残留 `DeepSeek Harness` 就告警，
+或干脆按 token 做去标识化），**留待用户决定** —— 后者更抗漂移，但属于「泛化改写」，
+与本文件「表驱动、逐条实测」的纪律相冲突。
+
 ## 模型计费倍率与同名模型（必须写进 `name`，不是 `description`）
 
 **倍率必须拼进 `name`。** 这是被用户报障纠正过的结论：
@@ -1557,7 +1898,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 
 要点：
 
-- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13011111100`，
+- ⚠️ **两种输入都收敛到同一形态，因此幂等**：完整 11 位（`13999991100`，
   `profile-summary` 返回的就是完整号码）与已脱敏的露 4 位形态，输出都是
   `130******00`。幂等意味着老账号无需重新登录、重复运行不产生新写入
 - ⚠️ **判据只认「像手机号」的形态**：`/^1\d{10}$/`（完整）或
@@ -1576,7 +1917,7 @@ UI 表现为 `TraeAdapter.reasoningFor` 返回 `undefined` → 不声明 `reason
 排查 / 验证：
 
 - `scripts/probe-lobsterai-profile.mjs` —— 打印 `profile-summary` 的完整响应
-  （**发现 `nickname` 在这里是完整号码 `13011111100`**，与登录响应的脱敏形态不同）
+  （**发现 `nickname` 在这里是完整号码 `13999991100`**，与登录响应的脱敏形态不同）
 - `scripts/verify-lobsterai-nickname.mjs` —— 用真实账号跑一遍
   `repairAccountNicknames` 并打印修复前后昵称（⚠️ **会写真实账号池昵称**）
 - `tests/unit/lobsterai.spec.ts` 的「手机号掩码（只露末 2 位）」段（8 条，
@@ -1742,12 +2083,13 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 集合**硬编码**为 `new Set(['glm-5.3-flash'])` —— `deepseek-v4.1-flash` 是
 2026-09 新增的 benefit 模型，因此从不带该头，后端按非 benefit 通道处理它。
 
-实证矩阵（2026-09-23，对齐 deveco-code-rust `fb1b4a2`）：
+实证矩阵（2026-09-23，对齐 deveco-code-rust `fb1b4a2`；⚠️ `deepseek-v4.1-flash`
+那一行**已于 2026-10 失效**，见下方复测）：
 
 | 模型 id | 来源 | 不带 maas_type | 带 maas_type |
 |---|---|---|---|
 | `glm-5.3-flash` | gateway/config | 404 未注册 | ✓ 成功 |
-| `deepseek-v4.1-flash` | gateway/config | 404 未注册 | ✓ 成功 |
+| `deepseek-v4.1-flash` | gateway/config | 404 未注册 | ✓ 成功（**2026-10 已反转**） |
 | `deepseek-v4-flash-0731` | gateway/config | 404 未注册 | ✓ 成功 |
 | `deepseek-v4-pro-0813` | gateway/config | 404 未注册 | ✓ 成功 |
 | `deepseek-v4-flash`（无后缀） | 静态表 / 归一化结果 | ✓ 成功 | ✗ unsupported |
@@ -1756,26 +2098,35 @@ CodeArts 的 `snap-access/api/v2/chat/completions` 上有**两套模型注册**�
 
 结论：**`gateway/config` 返回的模型即 benefit 集合**，无需靠模型名硬编码。
 
+⚠️ **2026-10-26 复测（本机真实账号，逐模型两态直连）**：`deepseek-v4.1-flash`
+已按常规 `0.18x` 模型下发 —— 不带该头正常出流，**带上即 `4004.200 benefit not found`**。
+这正是「静态表会过时」的实锤，也是本轮删除兜底表的依据（见下一小节）。
+
 要点：
 
-- 判定 `isCodeArtsBenefitModel`（`src/models.ts`）：远端拉取并缓存的集合
-  （`~/.cache/deveco/codearts_benefit_models.json`）∪ 静态兜底
-  `CODEARTS_BENEFIT_FALLBACK`（`glm-5.3-flash` / `deepseek-v4.1-flash`）。
-  远端集合优先，后端新增 benefit 模型**无需改代码**
+- 判定 `isCodeArtsBenefitModelKnown`（`src/models.ts`）：**只看**远端拉取并缓存的
+  集合（`~/.cache/deveco/codearts_benefit_models.json`）。已删除静态兜底表
+  `CODEARTS_BENEFIT_FALLBACK` 与 `isCodeArtsBenefitModel`：它两次成为缺陷根源
+  （表过时 ⇒ 首条消息必报 4004.200）。后端再变由**双向自愈**兜住
+  （404 → 补头一次；4004.200 → 先领福利、再去头一次）
 - ⚠️ **只记录「归一化未改写」的 id**：gateway 下发的是
   `deepseek-v4-flash-0731`，而 `normalizeModelId` 会把它改写成
   `deepseek-v4-flash` —— 两者在后端是**不同模型、benefit 属性相反**，
   记录改写后的 id 会让无后缀模型多带 `maas_type` 而失败
 - ⚠️ **判定必须在 `stream()` 的重试循环外算一次**（要读缓存文件，不宜每轮 IO）
+- ⚠️ **去头自愈的门禁是「本轮真的带了该头」**（`benefitHeaderSent`），
+  不是「该模型是 benefit 模型」：没带过却收到 4004.200 说明是**别人**补的头，
+  去头等于逐字节重发
 - ⚠️ **缓存读写必须用顶层 `import { … } from 'node:fs'`，不能用 `require`** ——
   本包是 ESM（`package.json` 的 `"type": "module"`），`require` 未定义、抛
   ReferenceError 后被 `catch` 静默吞掉，表现为「写不进也读不回」（`loadModelsCache`
   的模型列表磁盘缓存曾因此长期失效）
 - `deepseek-v4.1-flash` 的上下文窗口按 IDE 下发的 inferhub-provider 配置声明为
   **1000000**（与无后缀 v4-flash/pro 的 1048576 不同）
-- 回归用例：`tests/unit/models.spec.ts`（集合判定 / 落盘不含改写 id / 缓存往返）、
-  `tests/unit/llm-adapter.spec.ts`（v4.1 带 `maas_type` 且参与签名、无后缀
-  v4-flash 不带）、`tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
+- 回归用例：`tests/unit/models.spec.ts`（远端集合唯一权威 / 未确认不带头 /
+  落盘不含改写 id / 缓存往返）、`tests/unit/llm-adapter.spec.ts`（远端确认 ⇒
+  带 `maas_type` 且参与签名；未确认 ⇒ 404 才补头；没带头时的 4004.200 不得重试）、
+  `tests/e2e/v4-models.e2e.spec.ts`（真实收发，需闸门）
 
 ## ⚠️⚠️ 更正：腾讯风控**也拦 `assistant` 正文**，且直连路径必须一起改（2026-10-12）
 

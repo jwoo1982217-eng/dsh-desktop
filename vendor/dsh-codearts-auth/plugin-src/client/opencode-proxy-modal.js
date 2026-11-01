@@ -103,7 +103,7 @@ export function OpencodeProxyModal({ ctx, accountId, current, onClose }) {
   const activeHint = (MODES.find((m) => m.id === mode) || {}).hint || ''
 
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget) close() },
   },
     React.createElement('div', {
@@ -253,7 +253,7 @@ export function GeminiProxyModal({ ctx, accountId, current, onClose }) {
   const activeHint = (MODES.find((m) => m.id === mode) || {}).hint || ''
 
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget) close() },
   },
     React.createElement('div', {
@@ -340,6 +340,347 @@ export function GeminiProxyModal({ ctx, accountId, current, onClose }) {
 }
 
 /**
+ * 「设置 Qoder 出口代理」弹窗（**组件**，用 `React.createElement` 渲染）。
+ *
+ * ## 为什么需要它（真实报障 2026-10-21）
+ *
+ * Qoder **国际版**（`openapi.qoder.sh`）在本机被 **SNI 阻断**：TCP 443 能握手
+ * （93ms），但 TLS ClientHello 被丢弃 ⇒ `fetch` 恒 10.7s `UND_ERR_CONNECT_TIMEOUT`。
+ * 余额端点与推理通道**同时**失败，于是三层症状叠在一起：
+ *
+ * 1. 对话：`TRANSPORT: fetch failed`；
+ * 2. 面板：两张卡片的积分行转 11 秒然后报「连不上 …」；
+ * 3. 聚合：锁定状态下永远报「无法确认是否有可用账号」。
+ *
+ * 而**中国版**（`openapi.qoder.com.cn`）直连 160ms 就通 ⇒ 出口只能**按账号**配。
+ * 在此之前 Qoder 是唯一有墙外端点却**没有** per-账号代理按钮的渠道
+ * （opencode / Gemini 都有），用户唯一的出路是导出 `HTTPS_PROXY` 再重启 DSH。
+ *
+ * ## 为什么独立成组件（不是给 GeminiProxyModal 加个参数）
+ *
+ * 与 {@link GeminiProxyModal} 拆出来的理由同源：两家的「不设代理会怎样」
+ * 语义不同 —— Gemini 是「全部端点都在墙外，一定连不上」，Qoder 是
+ * **「只有国际版在墙外，中国版不设反而更快」**。复用一个组件按 provider
+ * 换文案，就是把两套语义塞进一个函数（本仓库反复记录的那类漂移）。
+ * **复用**输入形态预设（`LOCAL_PORT_PRESETS`），**不复用**组件。
+ *
+ * ## ⚠️ 「测试连接」按 provider 分别探测
+ *
+ * 宿主侧 `qoder.testProxy` 接受 `provider`，打的是该站自己的余额端点
+ * （`{openApiBase}/sash/api/v2/me/usage`）。401 也算通 —— 它证明
+ * TCP + TLS + 代理握手全过。只按国际版探测会让中国版用户看到「连不上」，
+ * 那是**探测目标错了**，不是代理配错了。
+ *
+ * @param props { ctx: { rpc(payload) }, accountId, current, provider, onClose }
+ *   `provider` 缺省为 `'qoder'`（国际版）。
+ */
+export function QoderProxyModal({ ctx, accountId, current, provider, onClose }) {
+  const isCn = provider === 'qodercn'
+  const [mode, setMode] = React.useState(guessMode(current))
+  const [url, setUrl] = React.useState(current || '')
+  const [busy, setBusy] = React.useState(false)
+  const [testing, setTesting] = React.useState(false)
+  const [error, setError] = React.useState('')
+  const [result, setResult] = React.useState(null)
+
+  const close = () => { if (onClose) onClose() }
+
+  const save = async (value) => {
+    setBusy(true)
+    setError('')
+    try {
+      await ctx.rpc({ method: 'qoder.setProxy', payload: { accountId, proxy: value } })
+      close()
+    } catch (err) {
+      setError(err && err.message ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const test = async () => {
+    setTesting(true)
+    setError('')
+    setResult(null)
+    try {
+      const r = await ctx.rpc({
+        method: 'qoder.testProxy',
+        // ⚠️ 必须把 provider 带上去：两站主机不同，探测错站点的结果是假阴性。
+        payload: { proxy: url, provider: isCn ? 'qodercn' : 'qoder' },
+      })
+      setResult(r)
+    } catch (err) {
+      setError(err && err.message ? err.message : String(err))
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  const activeHint = (MODES.find((m) => m.id === mode) || {}).hint || ''
+
+  return React.createElement('div', {
+    className: 'dim-jh-modalOverlay',
+    onClick: (e) => { if (e.target === e.currentTarget) close() },
+  },
+    React.createElement('div', {
+      className: 'dim-jh-modal',
+      role: 'dialog',
+      'aria-modal': 'true',
+      style: { maxWidth: '520px' },
+    },
+      React.createElement('div', { className: 'dim-jh-modalHead' },
+        React.createElement('div', { className: 'dim-jh-modalTitle' },
+          isCn ? '设置 Qoder（中国版）出口代理' : '设置 Qoder 出口代理'),
+        React.createElement('span', { className: 'dim-jh-modalSubtitle' },
+          current ? '当前：已配置' : '当前：直连（本机出口）'),
+      ),
+      // ⚠️ 提示必须**分站诚实**：国际版在中国大陆基本连不上，中国版不设代理
+      // 反而更快。写成一句通用话术会让中国版用户白配一条代理（多一跳、更慢），
+      // 也会让国际版用户以为「不设置也能凑合」。
+      React.createElement('p', { className: 'dim-jh-modalHint' },
+        isCn
+          ? '中国版（openapi.qoder.com.cn）通常直连就通，不设代理反而少一跳。'
+            + '只有在直连被限速或需要固定出口时才需要配这里。'
+          : 'Qoder 国际版（openapi.qoder.sh）在中国大陆被阻断：TCP 能连、TLS 握手被丢，'
+            + '表现为「转十秒然后 fetch failed」。插件进程不读系统代理，'
+            + '所以浏览器能用 ≠ 这里能用。设置代理后，该账号的登录、续期、'
+            + '积分与对话都会走它；也可以改用中国版账号（直连即可）。'),
+      React.createElement('div', { className: 'dim-jh-modalBody' },
+        React.createElement('div', { className: 'dim-jh-fieldRow' },
+          MODES.map((m) => React.createElement('label', { key: m.id, className: 'dim-jh-radio' },
+            React.createElement('input', {
+              type: 'radio',
+              name: 'qoder-proxy-mode',
+              checked: mode === m.id,
+              onChange: () => {
+                setMode(m.id)
+                setError('')
+                setResult(null)
+              },
+            }),
+            m.label,
+          )),
+        ),
+        React.createElement('p', { className: 'dim-jh-hint' }, activeHint),
+        mode === 'local' && React.createElement('div', { className: 'dim-jh-presetRow' },
+          LOCAL_PORT_PRESETS.map((p) => React.createElement('button', {
+            key: p.port,
+            type: 'button',
+            className: 'dim-jh-btn',
+            title: p.hint,
+            onClick: () => { setUrl(p.url); setError(''); setResult(null) },
+          }, p.label)),
+        ),
+        React.createElement('input', {
+          className: 'dim-jh-input',
+          placeholder: mode === 'socks5' ? 'socks5://user:pass@host:port' : 'http://user:pass@host:port',
+          value: url,
+          // ⚠️ 含认证信息时用 password 类型：代理口令不该裸显在屏幕上。
+          type: url.includes('@') ? 'password' : 'text',
+          onChange: (e) => { setUrl(e.target.value); setResult(null) },
+        }),
+        // ⚠️ **不说「出口 IP」**：这里测的是「能不能连上该站的余额端点」，
+        // 回显 HTTP 状态码（401 也是通的 —— 没带 Token 而已，见宿主侧注释）。
+        result && React.createElement('p', { className: 'dim-jh-hint' },
+          `已连通 ${result.host || (isCn ? 'openapi.qoder.com.cn' : 'openapi.qoder.sh')}`
+          + `（HTTP ${result.status}）· ${result.latencyMs}ms`),
+        error && React.createElement('p', { className: 'dim-jh-error' }, error),
+      ),
+      React.createElement('div', { className: 'dim-jh-modalActions' },
+        React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn',
+          disabled: testing || busy || url.trim().length === 0,
+          onClick: test,
+        }, testing ? '测试中…' : '测试连接'),
+        // 只有已配置过才显示「清除」：没配过就没有可清除的东西。
+        current ? React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn',
+          disabled: busy,
+          onClick: () => save(''),
+        }, '清除代理') : null,
+        React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn dim-jh-btnPrimary',
+          disabled: busy || url.trim().length === 0,
+          onClick: () => save(url),
+        }, '保存'),
+        React.createElement('button', { type: 'button', className: 'dim-jh-btn', onClick: close }, '取消'),
+      ),
+    ),
+  )
+}
+
+/**
+ * MiniMax **国际站**账号的「设置出口代理」弹窗。
+ *
+ * ## ⚠️ 为什么不能直接复用 {@link OpencodeProxyModal} / {@link GeminiProxyModal}
+ *
+ * 三家**形态相同、语义不同**，而 UI 上必须说清的那句「不设置会怎样」也
+ * **完全不同**：
+ *
+ * - opencode：「不设代理 = 与其它账号共用同一出口 IP = 共用同一份额度」；
+ * - Gemini：「不设代理 = 墙外服务可能**根本连不上**」；
+ * - **minimaxintl：「不设代理 ≠ 连不上，而是**连得上却被转到中国站**」
+ *   —— 上游按出口 IP 国别分流，大陆来源恒 307 到 `agent.minimaxi.com`，
+ *   而中国站不认国际站 token ⇒ 与「凭据失效」**逐字同形**的 401。
+ *
+ * 复用一个组件却按 provider 换文案，等于把三套语义塞进一个函数 ——
+ * 正是本仓库反复记录的那类漂移。故独立成组件，**复用**输入形态预设
+ * （`LOCAL_PORT_PRESETS`），**不复用**组件。
+ *
+ * ## ⚠️⚠️ 「测试连接」的回显必须区分「通」与「通了但仍在大陆」
+ *
+ * 这是本家与另两家**唯一实质不同**的一格：另两家只要拿到 HTTP 响应就算通，
+ * 而本家拿到 HTTP 响应**也可能仍是被分流**（307 到中国站）。宿主侧
+ * `minimaxintl.testProxy` 因此额外回 `geoRouted`，这里必须显示成
+ * **警告**而不是绿色 —— 否则用户看到「已连通」以为配好了，实际照样 401。
+ *
+ * ⚠️ 复用了 `src/minimax-rpc.ts` 的探测端点（国际站公开目录端点，无 token 也
+ * 回 200）⇒ 点「测试连接」**不消耗任何凭据**，不会烧掉用户的 refresh_token
+ * （本仓库在 MiniMax 上有过「诊断脚本对真实凭据 refresh 而烧账号」的事故）。
+ *
+ * ⚠️ 同样必须用 `React.createElement` 渲染（hook 计数事故，见上方
+ * {@link OpencodeProxyModal} 的说明）。
+ *
+ * @param props { ctx: { rpc(payload) }, accountId, current, onClose }
+ */
+export function MinimaxIntlProxyModal({ ctx, accountId, current, onClose }) {
+  const [mode, setMode] = React.useState(guessMode(current))
+  const [url, setUrl] = React.useState(current || '')
+  const [busy, setBusy] = React.useState(false)
+  const [testing, setTesting] = React.useState(false)
+  const [error, setError] = React.useState('')
+  const [result, setResult] = React.useState(null)
+
+  const close = () => { if (onClose) onClose() }
+
+  const save = async (value) => {
+    setBusy(true)
+    setError('')
+    try {
+      await ctx.rpc({ method: 'minimaxintl.setProxy', payload: { accountId, proxy: value } })
+      close()
+    } catch (err) {
+      setError(err && err.message ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const test = async () => {
+    setTesting(true)
+    setError('')
+    setResult(null)
+    try {
+      const r = await ctx.rpc({ method: 'minimaxintl.testProxy', payload: { proxy: url } })
+      setResult(r)
+    } catch (err) {
+      setError(err && err.message ? err.message : String(err))
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  const activeHint = (MODES.find((m) => m.id === mode) || {}).hint || ''
+
+  return React.createElement('div', {
+    className: 'dim-jh-modalOverlay',
+    onClick: (e) => { if (e.target === e.currentTarget) close() },
+  },
+    React.createElement('div', {
+      className: 'dim-jh-modal',
+      role: 'dialog',
+      'aria-modal': 'true',
+      style: { maxWidth: '520px' },
+    },
+      React.createElement('div', { className: 'dim-jh-modalHead' },
+        React.createElement('div', { className: 'dim-jh-modalTitle' }, '设置 MiniMax 国际站出口代理'),
+        React.createElement('span', { className: 'dim-jh-modalSubtitle' },
+          current ? '当前：已配置' : '当前：直连（本机出口）'),
+      ),
+      // ⚠️ 这段提示是本功能的存在理由，且必须**诚实**：本家的失败不是「连不上」
+      // 而是「连上了却被转到中国站」，与另两家的措辞不同，别照抄。
+      React.createElement('p', { className: 'dim-jh-modalHint' },
+        '国际站（agent.minimax.io）按出口 IP 所在国家分流：中国大陆来源会被转到中国站，'
+        + '而中国站不认国际站账号 ⇒ 报出与「凭据失效」一模一样的错误，凭据本身却是好的。'
+        + '设置这里的代理后，该账号的登录、续期、积分与对话都会走它。'),
+      // ⚠️ 必须说清与 XFF 的关系：两者可叠加，但 XFF 是兜底而非替代。
+      React.createElement('p', { className: 'dim-jh-hint' },
+        '另有「MiniMax 国际站分流设置」（X-Forwarded-For）：它只是**声明**一个海外 IP，'
+        + '上游不认即失效；本设置是**真正**换出口，两者可叠加。'),
+      React.createElement('div', { className: 'dim-jh-modalBody' },
+        React.createElement('div', { className: 'dim-jh-fieldRow' },
+          MODES.map((m) => React.createElement('label', { key: m.id, className: 'dim-jh-radio' },
+            React.createElement('input', {
+              type: 'radio',
+              name: 'minimaxintl-proxy-mode',
+              checked: mode === m.id,
+              onChange: () => {
+                setMode(m.id)
+                setError('')
+                setResult(null)
+              },
+            }),
+            m.label,
+          )),
+        ),
+        React.createElement('p', { className: 'dim-jh-hint' }, activeHint),
+        mode === 'local' && React.createElement('div', { className: 'dim-jh-presetRow' },
+          LOCAL_PORT_PRESETS.map((p) => React.createElement('button', {
+            key: p.port,
+            type: 'button',
+            className: 'dim-jh-btn',
+            title: p.hint,
+            onClick: () => { setUrl(p.url); setError(''); setResult(null) },
+          }, p.label)),
+        ),
+        React.createElement('input', {
+          className: 'dim-jh-input',
+          placeholder: mode === 'socks5' ? 'socks5://user:pass@host:port' : 'http://user:pass@host:port',
+          value: url,
+          // ⚠️ 含认证信息时用 password 类型：代理口令不该裸显在屏幕上。
+          type: url.includes('@') ? 'password' : 'text',
+          onChange: (e) => { setUrl(e.target.value); setResult(null) },
+        }),
+        result && React.createElement('p', {
+          className: 'dim-jh-hint',
+          // ⚠️⚠️ **被分流时不能显示成正常的绿**：那是用户真正想问的答案。
+          style: result.geoRouted ? { color: 'var(--dim-warn, #d9a441)' } : undefined,
+        }, result.geoRouted
+          ? `代理可用，但出口仍被判定为中国大陆（HTTP ${result.status}）· ${result.latencyMs}ms`
+            + ' —— 换个海外出口的代理再试'
+          : `出口已在海外，未被分流（HTTP ${result.status}）· ${result.latencyMs}ms`),
+        error && React.createElement('p', { className: 'dim-jh-error' }, error),
+      ),
+      React.createElement('div', { className: 'dim-jh-modalActions' },
+        React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn',
+          disabled: testing || busy || url.trim().length === 0,
+          onClick: test,
+        }, testing ? '测试中…' : '测试连接'),
+        // 只有已配置过才显示「清除」：没配过就没有可清除的东西。
+        current ? React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn',
+          disabled: busy,
+          onClick: () => save(''),
+        }, '清除代理') : null,
+        React.createElement('button', {
+          type: 'button',
+          className: 'dim-jh-btn dim-jh-btnPrimary',
+          disabled: busy || url.trim().length === 0,
+          onClick: () => save(url),
+        }, '保存'),
+        React.createElement('button', { type: 'button', className: 'dim-jh-btn', onClick: close }, '取消'),
+      ),
+    ),
+  )
+}
+
+/**
  * 「添加 OpenCode 账号」弹窗（**组件**，用 `React.createElement(OpencodeKeyModal, props)` 渲染）。
  *
  * ## ⚠️⚠️ 同样是组件，不能直接函数调用
@@ -376,7 +717,7 @@ export function OpencodeKeyModal({ error, busy, inputRef, onSubmit, onSubmitAnon
     onSubmit(value)
   }
   return React.createElement('div', {
-    className: 'dim-jh-modalOverlay dim-jh-modalOverlay--top',
+    className: 'dim-jh-modalOverlay',
     onClick: (e) => { if (e.target === e.currentTarget && !busy && onClose) onClose() },
   },
     React.createElement('div', {
@@ -406,7 +747,11 @@ export function OpencodeKeyModal({ error, busy, inputRef, onSubmit, onSubmitAnon
       mode === 'key'
         ? React.createElement(React.Fragment, null,
             React.createElement('p', { className: 'dim-jh-modalHint' },
-              '在 opencode.ai/auth 生成 API key（形如 sk-…）后粘贴到下方。'
+              // ⚠️ 前缀**两种都要提**：opencode 2026-10-22 起签发 `oc_sk_…`
+              // （Gitee IKPLRU），旧号手里仍是 `sk-…`；只写一种会让另一种的人
+              // 以为自己的 key 不对。生成地址也从旧的 `/auth` 更正到控制台账号页。
+              '在 opencode.ai/console/account 生成 API key 后粘贴到下方'
+              + '（旧 key 形如 sk-…，新 key 形如 oc_sk_…）。'
               + '可启用付费模型，并为每个账号单独设置出口代理。'),
             // ⚠️ 内容必须在 modalBody 里（flex:1; min-height:0; overflow-y:auto），
             // 否则弹窗内容会被裁掉（见 jet-hub.js 既有 modal 的注释）。
@@ -417,7 +762,7 @@ export function OpencodeKeyModal({ error, busy, inputRef, onSubmit, onSubmitAnon
                   className: 'dim-jh-input',
                   // ⚠️ password 类型：API key 是凭据，不该在屏幕上裸显。
                   type: 'password',
-                  placeholder: 'sk-…',
+                  placeholder: 'sk-… / oc_sk_…',
                   autoFocus: true,
                   // Enter 直接提交：粘贴 key 后最自然的动作就是回车。
                   onKeyDown: (e) => {

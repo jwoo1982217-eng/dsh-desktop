@@ -137,8 +137,16 @@ export interface ModelCatalogConfig {
    * 反之若把 `buddy` 统一成 `['text']`，会**静默关掉图片能力**（见
    * `CatalogEntry.inputModalities` 的说明）。
    * ⇒ **两个方向都会出真缺陷，故本回调必须逐家提供**，骨架不替各家决定。
+   *
+   * ⚠️⚠️ **必须传 `modelId`**（2026-10-21 接 codearts 图片时踩到）：`codearts` 的
+   * VL 模型（`kimi-k2.6-vl` / `Qwen3-VL-235B`）**刻意不进对话目录**（上下文小、
+   * 不支持工具调用），但它们**能收图**、且识图工具要按 id 借它们 ⇒ 它们走的正是
+   * 本回调这条「目录外」路径。不传 id 就只能在「恒 `['text']`」与「全都给 image」
+   * 之间二选一：前者让 VL 模型永远声明不了 image（DSH 在入库阶段拒图，真缺陷），
+   * 后者让文本模型也能被发图（上游 406，每轮都失败）。
+   * ⇒ 传 id 后实现方才能**按 id 判能力**，两个方向都正确。
    */
-  unknownModelInputModalities?(): readonly ('text' | 'image')[] | undefined
+  unknownModelInputModalities?(modelId: string): readonly ('text' | 'image')[] | undefined
   /**
    * **目录里没有该 id** 时 `resolveModel` 该报什么思考档位。
    *
@@ -156,6 +164,33 @@ export interface ModelCatalogConfig {
    * 失去思考档位选择器（它们的档位本就与模型无关）。
    */
   unknownModelReasoning?(): LlmResolvedModelInfo['reasoning']
+  /**
+   * **目录里没有该 id** 时 `resolveModel` 该报什么上下文窗口。
+   *
+   * ⚠️ 与上面两个回调**同一个形态**：各家处理不同，且**不能统一**。
+   *
+   * | 家 | 未知 id ⇒ | 理由 |
+   * |---|---|---|
+   * | `codearts` | **仍给具名兜底**（`CODEARTS_FALLBACK_CONTEXT_WINDOW`） | 本家目录的窗口**全部来自本地静态表**（上游端点不下发），且缺窗口会让用户的上下文占用条**整条消失**、自动压缩阈值失去唯一输入 |
+   * | 其余 | 不提供 ⇒ 未知模型**不声明** context | 多数家的窗口来自**远端该模型的**配置，未知 id 无从得知 ⇒ 编一个就是假窗口 |
+   *
+   * ⚠️ **不提供本回调 ⇒ 沿用旧行为**（`entry` 缺失时不落 `context`），
+   * 这是刻意的：本字段是为 codearts 那个真实报障加的，**不得**顺手把其余
+   * 12 家也改成「未知 id 给兜底」—— 那会给它们造出**假窗口**（分母错 ⇒ 占用比
+   * 与压缩阈值一起错，且比"不显示"更难发现）。
+   *
+   * ⚠️ 与 `CatalogEntry.contextWindow` 的关系：**后者管目录内条目，本回调管
+   * 目录外 id**，两条路径必须都覆盖，否则「选择器里能选到的」与「手填的」
+   * 会分叉（codearts 的报障正是从「目录内条目漏了」来的）。
+   *
+   * ⚠️⚠️ **必须传 `modelId`**（2026-10-21 全量测试实测踩到）：本回调最初没有入参，
+   * 于是「目录里没有该 id」时只能给一个**与模型无关**的常数 ⇒ 真实缺陷：
+   * `glm-5.3` 在静态窗口表里是 1M，却**不在静态兜底目录**（`DEFAULT_MODELS`）里
+   * ⇒ 离线/首次启动时它算「目录外 id」⇒ 拿到常数兜底 524_288 ⇒ **占用比分母错
+   * 2 倍**（而用户报障的正是这个模型）。传 `modelId` 后实现方才能做
+   * 「**表内优先、查不到才兜底**」，与目录内路径**同口径**。
+   */
+  unknownModelContextWindow?(modelId: string): number | undefined
   /**
    * 异步读原始目录并**转换**成 `CatalogEntry[]`。
    *
@@ -616,7 +651,13 @@ export function createModelCatalog(
       model: string,
       _signal?: AbortSignal,
     ): Promise<LlmResolvedModelInfo> {
-      const all = await config.loadCatalog()
+      _signal?.throwIfAborted()
+      // 宿主会逐条解析刚列出的模型；复用同一份元数据，避免每条都等待远端刷新。
+      // 未见过的 id 仍走原来的目录读取，刷新成功后也继续更新这份缓存。
+      const all = cached?.some((entry) => entry.id === model)
+        ? cached
+        : await config.loadCatalog()
+      _signal?.throwIfAborted()
       cached = all
       const entry = all.find((item) => item.id === model)
       // ⚠️ name 三级回退，**绝不空**（空名会让选择器出现空白项）：
@@ -652,12 +693,32 @@ export function createModelCatalog(
         // ⇒ 家数**只在上面那个接口字段的表格里维护**，这里**刻意不抄数字**
         // （原先抄了个「10 家」并写成只有 `buddy` 省略，与那张表**互相矛盾**，
         // 正是「同一事实写多处 ⇒ 必有一处先腐坏」）。
-        const unknownModalities = config.unknownModelInputModalities?.()
+        // ⚠️ **必须把 `model` 传进去**：`codearts` 的 VL 模型刻意不在目录里，
+        //    却仍要按 id 声明 `image`（见该回调的注释）。
+        const unknownModalities = config.unknownModelInputModalities?.(model)
         if (unknownModalities !== undefined) resolved.inputModalities = unknownModalities
       }
-      // ⚠️ 未知模型**不编造** context（宁可让 DSH 用默认值，也不报一个假窗口）。
-      if (entry?.contextWindow !== undefined && entry.contextWindow > 0) {
-        resolved.context = { contextWindow: entry.contextWindow }
+      // ⚠️ 未知模型**默认不编造** context（宁可让 DSH 用默认值，也不报一个假窗口）。
+      //
+      // ⚠️ 但**声明了 `unknownModelContextWindow` 的家**（当前只有 `codearts`）例外：
+      //    它的窗口本就全部来自本地静态表、且缺窗口的后果是「占用条整条消失 +
+      //    自动压缩阈值失去唯一输入」⇒ 用**具名兜底**而不是省略。
+      //    判据与理由见该回调的注释；**不得**把它推广到其余各家。
+      const knownContextWindow = entry?.contextWindow
+      if (knownContextWindow !== undefined && knownContextWindow > 0) {
+        resolved.context = { contextWindow: knownContextWindow }
+      } else if (entry === undefined) {
+        // ⚠️ **必须把 `model` 传进去** —— 实现方要能「表内优先、查不到才兜底」。
+        //    不传会让「静态窗口表里有、但静态兜底目录里没有」的 id（如 `glm-5.3`）
+        //    在离线路径上拿到常数兜底，与目录内路径的取值分叉（实测过）。
+        const fallbackContextWindow = config.unknownModelContextWindow?.(model)
+        // ⚠️ 同样要过「正整数」闸门：0/负数/NaN 会让 DSH 抛
+        //    `INVALID_MODEL_CONTEXT`，**整轮对话起不来**（不是降级，是崩）。
+        if (fallbackContextWindow !== undefined
+          && Number.isInteger(fallbackContextWindow)
+          && fallbackContextWindow > 0) {
+          resolved.context = { contextWindow: fallbackContextWindow }
+        }
       }
       // ⚠️ 非法值必须过滤：0/负数/NaN 会让 DSH 抛 INVALID_MODEL_MAX_TOKENS，
       // **整轮对话起不来**（不是降级，是崩）。

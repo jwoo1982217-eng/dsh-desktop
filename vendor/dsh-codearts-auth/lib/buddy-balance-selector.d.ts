@@ -60,6 +60,14 @@ export interface BuddyAccountBalanceEntry extends BuddyAccountBalance {
     tier?: BuddyBalanceTier;
     /** 原始拆分结果（展示「15 天内到期 X · 永久 Y」用）。 */
     split?: BuddyCreditSplit;
+    /**
+     * ⚠️ **本次读数是「降级结果」**（`balance.degraded === true`）。
+     *
+     * 语义：**总额读到了、逐包明细丢了** ⇒ 拆分出的「永久桶」可能其实是
+     * 「明明有临期、但我们看不到」。此时**不得**断言 `exhausted`（见
+     * `noAccountReason` 的注释与实测）。
+     */
+    degraded?: boolean;
 }
 /** 一条待选账号（调用方从账号池取出）。 */
 export interface BuddyCandidateAccount {
@@ -137,13 +145,73 @@ export type BuddySelectionResult = {
  * `undefined/...` 的畸形请求 → 余额恒查不到 → 未锁定时换号优化静默失效、
  * 锁定时永远报「无法确认是否有可用账号」。这条漏洞比烧积分更难归因。
  */
+/**
+ * 余额查询回调的**第二、三参**（账号 id / 按账号取出口）。
+ *
+ * ## 为什么需要它
+ *
+ * 出口代理是**账号维度**的，而选号器在给某个候选查余额时**知道**那是哪个账号
+ * ⇒ 必须把它传给 `fetchBalance`，否则国际站那类「端点按出口 IP 分流」的渠道
+ * 会恒查不到余额（症状：聚合轮换里被**静默剔除**，而面板走另一条带 XFF 的
+ * 链路却还能刷新 —— 极难归因）。
+ *
+ * ⚠️ 之所以是**可选对象**而不是再添一个位置参数：既有 6 处 `fetchBalance`
+ * 都是两参箭头（buddy / trae / loomy / raccoon / minimax 两站），加必填第三参
+ * 会让它们全部要改；而它们是**合法且正确**的（那几家不需要按账号换出口）。
+ */
+export interface BalanceFetchContext {
+    /** 正在查余额的账号 id（拿不到时为空串 = 无账号维度）。 */
+    accountId: string;
+    /** 按账号 id 取出口（未注入 = 直连）。 */
+    fetchFor?: (accountId: string) => typeof fetch;
+}
 type FetchBalanceRule<TProduct, TCredential> = TProduct extends BuddyProduct ? {
     /** 余额查询（缺省走真实的 `fetchCreditBalance`）。 */
-    fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>;
+    fetchBalance?: (credential: TCredential, product: TProduct, ctx?: BalanceFetchContext) => Promise<CreditBalance | null>;
 } : {
     /** ⚠️ 非 buddy provider **必填** —— 缺省会拼出畸形 URL 并静默失效。 */
-    fetchBalance: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>;
+    fetchBalance: (credential: TCredential, product: TProduct, ctx?: BalanceFetchContext) => Promise<CreditBalance | null>;
 };
+/**
+ * **带原因**的余额查询（可选能力）—— 传了它就用它的 `error`，不再一律报
+ * `'余额查询失败（凭据失效或响应异常）'`。
+ *
+ * ## 为什么必须有这一条（真实报障 2026-10-21，Qoder）
+ *
+ * 用户看到的报错：
+ * ```
+ * Qoder：无法确认是否有可用账号。……（余额查询失败（凭据失效或响应异常）；
+ *         余额查询失败（凭据失效或响应异常））……
+ * ```
+ * 而**同一时刻**，Jet Hub 面板上两张账号卡片的积分行写的是完整原因
+ * （`连不上 https://openapi.qoder.sh（UND_ERR_CONNECT_TIMEOUT）：……请导出 HTTPS_PROXY`）
+ * —— 用户据此问「面板说得明明白白，为什么报错里反而不知道？」。
+ *
+ * 根因：`fetchBalance` 的返回类型是 `Promise<CreditBalance | null>`，
+ * **`null` 把「网络不通 / 401 / 响应缺字段 / 不是 JSON」四件事抹成同一格**
+ * （这正是 `src/qoder-credits.ts` 那个 `fetchQoderBalanceDetailed` 存在的原因）。
+ * 面板那条腿走的是 `credits.balances` RPC，它已经改用详细变体；
+ * 而**选号这条腿**（本类）仍在用丢原因的薄封装 ⇒ **同一语义两套判据**
+ * （AGENTS.md 首条红线），且症状是最坏的一种：**把可操作的原因替换成一句
+ * 无从下手的猜测**，用户于是去查凭据 —— 而真实原因是网络。
+ *
+ * ⚠️ **可选**，不是必填：buddy 系（CodeBuddy / WorkBuddy）的余额腿本来就
+ * 只返回 `CreditBalance | null`，强制必填会让所有既有调用点都要造一个
+ * 假的详细变体。未传时退化为原行为（那句概括文案），**语义不变**。
+ *
+ * ⚠️ 返回形状与 `src/provider-runtime.ts` 的 `ProviderBalanceDetail` **刻意一致**
+ * （`balance: T | null` + `error?: string`）：本仓库已有该形状的三处使用
+ * （`fetchBalanceDetailed` / `fetchAstudioBalanceDetailed` / `credits.balances`），
+ * 再发明一个只会多一处漂移。此处**不 import 那个类型**是为了不让
+ * `buddy-balance-selector.ts`（被 buddy 系共用）反向依赖 provider-runtime 的装配域
+ * —— 结构化同构足够，且下面 `FetchBalanceRule` 已经证明了这种「形状对齐、不引类型」
+ * 的写法在本文件是既有惯例。
+ */
+export interface BalanceQueryDetail<TBalance> {
+    balance: TBalance | null;
+    /** 查不到时的**可操作**原因（点名主机 / HTTP 状态 / 缺哪个字段）。 */
+    error?: string;
+}
 /**
  * 选号依赖（便于单测注入）。
  *
@@ -169,6 +237,27 @@ export type BuddySelectionDeps<TProduct = BuddyProduct, TCredential = BuddyCrede
     errorTtlMs?: number;
     /** 「临时积分」窗口覆盖（测试用）。 */
     windowMs?: number;
+    /**
+     * **带原因**的余额查询（可选，传了就优先用它）。
+     *
+     * 见 {@link BalanceQueryDetail} 的长注释：`fetchBalance` 的 `null` 把四种
+     * 完全不同的失败抹成同一格，而锁定时那句概括文案会把用户引向「查凭据」，
+     * 真实原因可能是网络不通。**两者都传时本字段优先**（它是 `fetchBalance`
+     * 的严格超集：能拿到 `balance`，也能拿到为什么拿不到）。
+     *
+     * ⚠️ **第三参与 `fetchBalance` 同款**（{@link BalanceFetchContext}）：详细变体
+     * 优先意味着它一旦注入，`fetchBalance` 整个不再执行 —— 若这里不给 `ctx`，
+     * 那些「必须按账号换出口」的渠道（MiniMax 国际站）会**只在详细变体这条腿上
+     * 丢掉出口**，症状是余额恒查不到、渠道被静默剔除，而 `fetchBalance` 上
+     * 明明接好了。故两者必须同时收 `ctx`，缺一不可。
+     */
+    fetchBalanceDetailed?: (credential: TCredential, product: TProduct, ctx?: BalanceFetchContext) => Promise<BalanceQueryDetail<CreditBalance>>;
+    /**
+     * 按**账号 id** 取出口（可选；仅「端点按出口 IP 分流」的渠道需要，
+     * 如 MiniMax 国际站）。未注入时不出现在 {@link BalanceFetchContext} 里，
+     * 既有 provider 的行为**逐字节不变**。
+     */
+    fetchFor?: (accountId: string) => typeof fetch;
 } & FetchBalanceRule<TProduct, TCredential>;
 /**
  * 余额缓存 + 选号器。

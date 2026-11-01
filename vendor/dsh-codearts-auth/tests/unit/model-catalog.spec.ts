@@ -36,6 +36,25 @@ function makeCatalog(
 }
 
 describe('createModelCatalog：骨架的六条不变式', () => {
+  it('已列出的模型复用目录元数据，不为每条模型重新等待上游', async () => {
+    const load = vi.fn<() => Promise<readonly CatalogEntry[]>>()
+      .mockResolvedValueOnce([{ id: 'remote', name: 'Remote', contextWindow: 128_000, maxTokens: 4096 }])
+      .mockRejectedValue(new Error('远端目录暂时不可用'))
+    const catalog = createModelCatalog({}, {
+      product: { id: 'demo' }, loadCatalog: load, syncCatalog: () => [],
+    })
+    await catalog.listModels('demo')
+    const info = await catalog.resolveModel('demo', 'remote')
+    expect(info.context).toEqual({ contextWindow: 128_000 })
+    expect(info.defaultMaxTokens).toBe(4096)
+    expect(load).toHaveBeenCalledTimes(1)
+    await expect(catalog.resolveModel('demo', 'unknown')).rejects.toThrow('远端目录暂时不可用')
+    const cancelled = new AbortController()
+    cancelled.abort(new Error('已取消'))
+    await expect(catalog.resolveModel('demo', 'remote', cancelled.signal)).rejects.toThrow('已取消')
+    expect(load).toHaveBeenCalledTimes(2)
+  })
+
   it('① 无已登录账号 ⇒ 返回 []，**不抛错**（抛错会在 catalog 里多一条 provider 报错）', async () => {
     const { catalog } = makeCatalog([{ id: 'm1', name: 'M1' }], { visible: false })
     await expect(catalog.listModels('demo')).resolves.toEqual([])

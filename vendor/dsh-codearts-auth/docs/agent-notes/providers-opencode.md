@@ -3,10 +3,10 @@
 
 ## OpenCode V2 协议更新
 
-- 推理/目录端点改为 `https://opencode.ai/inference/v1`；默认 UA 为 `opencode/latest/2.0.29/cli`。⚠️ UA **不是**门禁的一部分（见下方逐变量矩阵）：`opencode/1.18.22` 在其余两项正确时照样 200，改成 `latest/<v>/cli` 只为外形一致，别再写成「不换就 403」。
+- 推理/目录端点改为 `https://opencode.ai/inference/v1`；默认 UA 为 `opencode/latest/2.1.1/cli`（2026-10-27 与官方 v2 通道对齐；⚠️ 仍不是门禁项）。⚠️ UA **不是**门禁的一部分（见下方逐变量矩阵）：`opencode/1.18.22` 在其余两项正确时照样 200，改成 `latest/<v>/cli` 只为外形一致，别再写成「不换就 403」。
 - session 外形仍是 `ses_ + 12hex + 14base62`，但首段必须按 `~(timestamp * 0x1000 + 1)` 的低 48 位生成，不能使用裸时间戳或随机 hex。
 - V2 不发送旧 `x-opencode-request`（⚠️ **它在场即 403**，即使 affinity 头齐全）；四个 session 头复用同一 session，但其中**只有 `x-opencode-session-id` 是必需的**。
-- 门禁工具**只保留 `read`**（名字与 `path/offset/limit` 参数 schema 必须保持上游形态，改名或空 properties 会 403）；不再注入 `shell`。⚠️ 「不再发显式 `tool_choice:none`」**与门禁无关**（实测 V2 接受 `none`/`auto`/`required`/`function` 全部 200），只是因为它**没有约束力**：同一句「读取 /tmp/a.txt」在 `tool_choice:none` 下后端照样产出 `read` 调用 —— 只发一条描述也拦不住。故「未启用工具」的不变式**必须**由响应层逐调用强制。
+- 门禁工具**整套发送**（`edit` / `glob` / `grep` / `question` / `read` / `shell` / `skill` / `subagent` / `webfetch` / `websearch` / `write` / `execute`），名字与参数 schema 必须保持上游形态（改名或空 properties 会 403）；顶层描述统一替换成「禁止调用」（描述不参与判定）。⚠️ 早先「只保留 `read` 也能放行」是当时的实测边界；2026-10-27 起按官方客户端的完整工具集对齐，工具集本身也是形状的一部分。⚠️ 「不再发显式 `tool_choice:none`」**与门禁无关**（实测 V2 接受 `none`/`auto`/`required`/`function` 全部 200），只是因为它**没有约束力**：同一句「读取 /tmp/a.txt」在 `tool_choice:none` 下后端照样产出 `read` 调用 —— 只发一条描述也拦不住。故「未启用工具」的不变式**必须**由响应层逐调用强制。
 - **客户端工具别名统一使用 `dsh_` 前缀**。所有客户端工具（包括 edit/write）都映射；定义、历史调用、指定工具选择同步改名，调用 id、参数 schema、结果正文不变。响应名字跨帧拼接后还原，缺失 index 按调用身份归并；保留/未知/不完整名字**剔除该次调用**（见下），不交给宿主执行、也不整轮报错。
 - 归一只在 `src/opencode-stream.ts` 的 OpenCode 专用前置流中完成，**不修改共享 `src/openai-compat.ts`**；不新增 SSE 单事件大小上限。取消/提前结束须释放前置流及上游连接。
 - 保留账号池的指纹代次、代理同源 fetch、额度分类/换槽与思考档位。不擅自设置默认输出预算；DSH `system` 转成标准 chat system 消息，不注入 OpenCode 身份提示词。
@@ -40,9 +40,9 @@
 `mimo-v2.6-flash-free` / `nemotron-3.5-lightning-free` / `longcat-2.5-preview-free` /
 `space-bunny-free`。
 
-### ⚠️⚠️ 保留门禁工具会被模型真的调用：只能「剔除」，不能整轮报错
+### ⚠️⚠️ 保留的内置工具会被模型真的调用：只能「剔除」，不能整轮报错
 
-`toolsDisabled`（调用方没传工具）时线上仍必须广告门禁 `read`，而模型**会**去调它 ——
+`toolsDisabled`（调用方没传工具）时线上仍必须广告整套内置工具（含 `read`），而模型**会**去调它们 ——
 同一句「读取 /tmp/a.txt」，`big-pickle` **多次**产出 `read{path:"/tmp/a.txt"}`
 （3 次独立观测，含一次完整 SSE 实录，见 `tests/fixtures/opencode-gate-call.sse.txt`；
 ⚠️ **非必然**：另有一次它直接作答、未调工具，故用例把它写成「两种收尾都算过」）。
@@ -68,9 +68,9 @@
 
 | 用户看到 | 实际根因 | 证据 |
 |---|---|---|
-| 一条回复**几乎没有正文**，却提示「已达到输出 token 上限」/「回答被截断…发送"继续"」 | **模型唯一意图是调门禁 `read`**，该调用被剔除 ⇒ 消费器报 `max-tokens` | 真机 fixture 34 帧里 `content` 分片 **0 个**（只有 reasoning）⇒ 客户端那句「已有输出保留在对话中」是**假话**；客户端 bundle 里没有任何「工具调用被剔除」文案（grep 零命中），用户唯一可见信号就是这条 token 提示 |
+| 一条回复**几乎没有正文**，却提示「已达到输出 token 上限」/「回答被截断…发送"继续"」 | **模型唯一意图是调某个内置工具（最常见 `read`）**，该调用被剔除 ⇒ 消费器报 `max-tokens` | 真机 fixture 34 帧里 `content` 分片 **0 个**（只有 reasoning）⇒ 客户端那句「已有输出保留在对话中」是**假话**；客户端 bundle 里没有任何「工具调用被剔除」文案（grep 零命中），用户唯一可见信号就是这条 token 提示 |
 
-⇒ 遇到该症状**先查宿主日志**（`[codearts-auth] opencode: 上游调用了保留门禁工具 read…`），
+⇒ 遇到该症状**先查宿主日志**（`[codearts-auth] opencode: 上游调用了保留的内置工具 read…`），
 不要按「输出上限」调 `maxTokens`：调大没用，模型下一轮还会去调它。
 真正的用户可见修复需要共享消费器新增一种 finish 变体（超本 PR 范围，**未做**）。
 
@@ -720,3 +720,59 @@ models.dev 每个条目带 `provider.api`。实测（2026-10-17）按它分组�
 
 ⚠️ 这是 `isAbandonedOfficeAceLogin` 注释里记的同型事故（「20 次只有 10 次变红」）
 的**复发** —— 当年没被根治。教训：断言必须是**确定时刻**可驱动的。
+
+## ⚠️⚠️ Issue IKPLRU：key 形状闸**不得绑死前缀**（`sk-` → `oc_sk_`）
+
+**报障（2026-10-22，yinhx3）**：opencode 控制台新签发的 key 改成 `oc_sk_…`
+开头（官方文档 [console/api](https://opencode.ai/v2/docs/console/api/) 全文用
+`Authorization: Bearer oc_sk_…`，示例 `oc_sk_1a2b3c4d5e6f_…`），而
+`src/opencode-rpc.ts` 的形状闸写的是 `^sk-…` ⇒ **新 key 全部被拒**，
+报「API key 形状不对（应以 sk- 开头…）」，用户一个账号都加不进来。
+
+**判据落点**（改动只有一处，见 `KEY_PATTERN`）：形状闸只筛「像不像粘贴过来的
+密钥串」—— ≥20 位、无空白、`[A-Za-z0-9_.-]`（覆盖 base64url 与本形态的
+`oc_sk_<hex>_<secret>`）。**旧 `sk-` key 必须继续可用**（存量用户手里就是它），
+所以也**不能**改成「只认 `oc_sk_`」。⚠️ 别再把任何具体前缀写回判据：
+前缀是上游会改的东西，这类静态假设**必然腐坏**（与「静态兜底表必然腐坏」同型）。
+
+**同批实测挖出的第二个缺陷（独立于 IKPLRU，已一并修）**：`slotNamesOf` 把 key
+尾段**原样**拼进 `credentialRef()`，而它的 `REF_PATTERN` 只认
+`[A-Za-z_][A-Za-z0-9_]*` ⇒ 尾段含 `-` 或 `.` 时**抛 TypeError**，用户看到
+`credential ref "OPENCODE_ACCOUNT_-D-E-F-G" must match /^[A-Za-z_][A-Za-z0-9_]*$/`
+这条与 key 毫无关系的报错，**账号写不进去**。探针实测（修复前）：
+
+```
+key = sk-<40×a>-d-e-f-g  ⇒  {"ok":false,"error":{"message":"credential ref \"OPENCODE_ACCOUNT_-D-E-F-G\" must match …"}}
+```
+
+⇒ 修法是**只在尾段不合法时**归一化（合法尾段的 ref 逐字节不变 ⇒ 存量账号引用不动），
+并追加 key 的短哈希。
+
+⚠️ **正确例子是 `…ab-cd` vs `…ab.cd`，不是 `…ab-cd` vs `…ab_cd`**（2026-10-25 审计 A1-F1）：
+`ab_cd` 的尾 8 位**本身就合法**（`[A-Z0-9_]*` 通过）⇒ 走合法分支、ref 不带 hash ⇒
+两者**分支不同**、天然不相等，与 hash 腿无关。用那一对的用例在「删掉 hash 后缀」的
+变异下**仍然全绿**（无牙）—— 本目录 2026-10-25 审计实测。真会撞的是
+`…ab-cd` vs `…ab.cd`（两者都不合法、剥掉 `-`/`.` 后都是 `AB`）。
+
+**同时更正的文案**：生成地址 `opencode.ai/auth`（已 302 到 `/console/login`）
+→ `opencode.ai/console/account`；面板提示与 placeholder 两种前缀都写
+（`sk-… / oc_sk_…`），只写一种会让另一种的用户以为自己的 key 不对。
+
+### 2026-10-25 审计补齐的四条（均已修 + 有守卫）
+
+| 项 | 缺陷 | 修法 |
+|---|---|---|
+| **`existed:true` 死锁（P1）** | 池里有同 id 但**凭据读不到**时无条件早退（源码下标证明是**没走到写**）⇒ 用户粘贴正确 key「以为修好了」而凭据一字节未落盘；该账号随后被 `api_key ?? anonymousKey` **降级成匿名免费通道**，面板一切正常、零日志，且 opencode **没有** `setApiKey`（唯一出路「先删后加」无人得知）。「账号在、凭据缺」是**产品自己的 export→import 往返**能造出来的 | 改**三态**：`same-key` 复用 / `missing` 覆盖写到**条目当前引用的 ref** / `other-key`（同尾段另一把 key）**仍复用不覆盖** —— 三态是必须的，把 `other-key` 也算坏槽会**改掉用户已有的号** |
+| **`anon-` 尾段伪装匿名槽（P2）** | 尾 8 位为 `anon-abc` 的 key 产出 `opencode-anon-abc`，命中「匿名通道」的 id 前缀判据 ⇒ 客户端打匿名标签 + `ensureDefaultAnonymousSlot` **永久跳过**创建默认匿名槽 ⇒ 零账号新用户**失去免费通道**。**base 下不可达**（含 `-` 的尾段先在 `credentialRef()` 抛 TypeError），**本 PR 放宽字符集后才成立** | 只在**确实会撞**前缀时把 id 改成 `opencode-key-<尾段>`；合法且不撞的存量 id **逐字节不变** |
+| **归一化 ref 不被识别（P2，后果比原判重）** | `ACCOUNT_REF_RE` 尾段是纯 hex，而归一化 ref 形如 `…_<8HEX>` ⇒ `providerOfAccountRef` 返 `undefined`。除「`state.json` 丢失时静默消失」外，**更严重的是 `backup.ts` 的跨 provider 校验 fail-open**：同一误用在 hex 尾 ref 下被拒（`imported=0`）、在归一化 ref 下被采纳（`imported=1`） | 尾段放宽为 `([0-9A-Za-z_]{6,}|[0-9A-Za-z]*_[0-9A-Fa-f]{8})`（三条并列，见 `jet-hub-store.ts` 的表格）；**识别面只增不减** |
+| **hash 碰撞概率未登记** | 8 hex = 32 bit；N=100 约 `1.2e-6`。后果不是报错而是 `credentials.set` **后者覆盖前者**、两条账号共用一份 key。审计实测：固定尾段时约 **125,655** 次即找到真碰撞（`69E9E9E1`） | 本节登记（不修：彻底消掉要动 `backup.ts` 第 ④ 层语义） |
+
+**守卫**（2026-10-25 后）：
+- `tests/unit/opencode-rpc.spec.ts`：`oc_sk_` 被接受 / 含 `-` 尾段不抛错 /
+  **真撞对**（`…ab-cd` vs `…ab.cd`，并自证两者剥完相同）/ **合法尾段 ref 公式逐字节锁定** /
+  **`existed` 三态**（凭据缺失必写、损坏必写、**另一把 key 不得覆盖**）/
+  **`anon-` 尾段不落匿名命名空间**（含与真实匿名槽共存的对照）
+- `tests/unit/jet-hub-store.spec.ts`：归一化 ref 与存量 ref 都能被 `providerOfAccountRef` 识别
+- `tests/unit/opencode-client-panel.spec.ts`：两条文案断言
+- `tests/unit/repo-pii-guard.spec.ts` + `scripts/audit-repo-secrets.mjs`：新增 `oc_sk_` 泄漏判据
+  （放宽入库闸门必须同步放宽**泄漏**闸门，否则新形态泄漏是静默的）

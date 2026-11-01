@@ -92,6 +92,21 @@ export const REFRESH_PROVIDERS = [
   //    —— 没有 refresh 端点，但 `refreshAccountCredential` 仍按统一接口做
   //    有效性对账并回写池内 `expiresAt`）。
   'modelscope',
+  // ⚠️ **Codely**（Unity，2026-10-22 A6）：有真实 refresh 端点（`POST /auth/refresh`，
+  //    实测 200 且 `refresh_token` 不轮换），`refreshAccountCredential` 续期并回写凭据 +
+  //    池内 `expiresAt` ⇒ 不属 loomy / zcode 那类豁免。
+  //    ⚠️ 它之前不在本表里，理由是当时 `CodelyAuth.refreshAll` **2 参、对不上契约**
+  //    （TS2322）⇒ 接不上。现已改成单参并真接（见 A5）。
+  'codely',
+  // qiniu (fork-only, 2026-10-29): same reason as modelscope / loomy -- no refresh
+  // endpoint (static sk- API key, long-lived), but QiniuAuth.refreshAccountCredential
+  // still re-reads the credential and writes back pool expiresAt via the shared
+  // contract, so it stays in this table (omitting it leaves that provider zero coverage).
+  'qiniu',
+  // ⚠️ 超级麦吉（Magicrew，2026-10-29）：有真实 refresh 端点
+  //    （`PUT /api/v1/model-gateway/tokens`，`refreshMagicrewKey` 是 refresh_token 的唯一出口），
+  //    `refreshAccountCredential` 续期并回写池内 `expiresAt` ⇒ 不属 loomy / zcode 那类豁免。
+  'magicrew',
 ] as const
 
 /**

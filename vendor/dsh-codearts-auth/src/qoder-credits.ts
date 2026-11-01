@@ -69,14 +69,99 @@
 
 import { roundCredits, type CheckinStatus, type ClaimOutcome, type CreditBalance, type CreditPackage } from './credits.js'
 import { QODER_BILLING_UTC_OFFSET_MS } from './model-queue.js'
+import { networkBlockedHint } from './network-hint.js'
 import { withQoderMachineHeadersAsync } from './qoder-machine.js'
 import { qoderBearerToken, type QoderCredential } from './qoder.js'
 import type { QoderProduct } from './qoder-product.js'
+import type { ProviderBalanceDetail } from './provider-runtime.js'
 
 /** 用量接口路径（挂 `openApiBase`）。 */
 export const QODER_USAGE_PATH = '/sash/api/v2/me/usage'
 /** 活动列表路径（挂 `openApiBase`）。 */
 export const QODER_CAMPAIGNS_PATH = '/sash/api/v1/me/campaigns'
+
+/**
+ * Qoder 对 `userQuota`（套餐额度）下发的 **永久哨兵** 到期时刻
+ * （毫秒）—— `253402214400000` = `9999-12-31T00:00:00.000Z`。
+ *
+ * ## 取证：**这不是任何东西的真实到期时刻**
+ *
+ * 2026-10-20，两个真实 qodercn 账号，`GET {openApiBase}/sash/api/v2/me/usage`
+ * （`openApiBase` = `https://openapi.qoder.com.cn`）：
+ *
+ * ```json
+ * { "displayMode": "qoder",
+ *   "qoderUsage": {
+ *     "userId": "…", "userType": "personal_standard", "usageType": "credits",
+ *     "totalUsagePercentage": 0, "isQuotaExceeded": false,
+ *     "expiresAt": 253402214400000,
+ *     "upgradeUrl": "https://qoder.cn/pricing?client=qoder",
+ *     "userQuota":  { "total": 0, "used": 0, "remaining": 0,
+ *                     "percentage": 0, "unit": "credits" },
+ *     "addOnQuota": { "total": 2000, "used": 0, "remaining": 2000,
+ *                     "percentage": 0, "unit": "credits",
+ *                     "detailUrl": "https://qoder.cn/account/usage" },
+ *     "isPlanQuotaProrated": false } }
+ * ```
+ *
+ * ⚠️ 三个必须分辨的事实（缺一就会把哨兵当到期时刻）：
+ * - `expiresAt` 的**语义归属是 `userQuota`（套餐额度）**，**不是** `addOnQuota`，
+ *   也**不是**任何一笔逐包到期；
+ * - `addOnQuota`（用户截图里「个人资源包 1,900」）**只给聚合标量**
+ *   （`total` / `used` / `remaining`）+ 一个 `detailUrl` 网页链接，
+ *   **没有任何日期字段**；
+ * - `dedicatedResourcePackages` 是**唯一**带真实逐包到期（`expiresAt` 字符串）
+ *   的字段，而本机账号实测为 `undefined`。
+ *
+ * ## 权威旁证（Qoder 官方客户端 asar，来源同一次审计）
+ *
+ * `D:\Qoder\resources\app.asar` 的 `/out/renderer/assets/index-DDa3WwIe.js`
+ * 与 `/out/main/index.js` 里客户端自己的用量面板 `buildUsageItemGroups()`：
+ * - 对 `addOnQuota` **只渲染 used/total/remaining，不给任何日期**；
+ * - 只有 `userQuota.expiresAt` 走 `renewson`（文案「将于 {{date}} 刷新」，
+ *   语义是**订阅刷新日**，不是积分到期）；
+ * - `dedicatedResourcePackages` 才走 `expiresOn`（文案「有效期至 {{date}}」）。
+ *
+ * ⇒ 官方客户端自己就不把 `expiresAt` 当作「这批积分何时作废」。
+ *
+ * ## ⚠️ 若把它写进 `deductionEndTime` 会发生什么（**可观测后果**）
+ *
+ * 客户端 `plugin-src/client/credit-expiry.js` 的 `formatPackageExpiry` 会把
+ * `253402214400000` 渲染成 **`9999-12-31（约 2900000 天后）`** ——
+ * 用户看到的是荒谬文案。反之，**不写** `deductionEndTime` 时
+ * `packageExpiryMs` 返回 `null` ⇒ 显示**「长期」**，正是三档分档里
+ * 「永久（未知到期）」那一档的展示形态。
+ *
+ * ⇒ 判据：`expiresAt >= 本常量`，**或**解析出的年份 `>= 9999`（兜住
+ *   `9999-01-01`~`9999-12-30` 这类小于常量、但同样是哨兵的取值——
+ *   它们落在 `253370764800000`~`253402214399999` 区间）。命中即
+ *   **不写** `deductionEndTime`（保守方向：未知到期 ⇒ 永久桶）。
+ */
+export const QODER_PERMANENT_EXPIRY_MS = 253402214400000
+
+/**
+ * 该毫秒值是否是 Qoder 的**永久哨兵**（`9999-12-31` 那一族）。
+ *
+ * ⚠️ **两条支路共用本判据**（本仓库红线：同一语义只留一份实现）：
+ * - 支路 A（`userQuota` 的数字 `expiresAt`）—— `qoderUsage.expiresAt`；
+ * - 支路 B（`dedicatedResourcePackages[].expiresAt` 的 ISO 字符串，解析后）。
+ *
+ * 上一版只判了支路 A，于是支路 B 的哨兵会原样写进 `deductionEndTime` ⇒
+ * 客户端渲染「9999-12-31（约 290 万天后）」，且该包被判成 `longTerm`
+ * 而不是 `permanent`（锁定时**照样可选** ⇒ 锁定形同虚设）。
+ * 详见 `toPackage` 里 `expIsPermanent` 那一段的实测记录。
+ *
+ * 判据三条（任一命中即哨兵）：
+ * 1. `>= QODER_PERMANENT_EXPIRY_MS`（`9999-12-31T00:00:00Z` 及更晚）；
+ * 2. 解析出的 **UTC 年份 >= 9999**（兜住 `9999-01-01`~`9999-12-30`，
+ *    它们小于上面的常量但同样是哨兵）；
+ * 3. 非有限值 —— 返回 `false`（「解析失败」不是哨兵，由调用方按「未知到期」
+ *    处理；两者最终都落永久桶，但语义不同，不要混在一个判据里）。
+ */
+export function isPermanentSentinelMs(ms: number): boolean {
+  if (!Number.isFinite(ms) || ms <= 0) return false
+  return ms >= QODER_PERMANENT_EXPIRY_MS || new Date(ms).getUTCFullYear() >= 9999
+}
 
 /**
  * 每日活动**刷新时刻**（UTC+8 的小时）。来源是服务端自己下发的原文：
@@ -333,7 +418,20 @@ export const QODER_PLAN_PACKAGE = '套餐额度'
 function toPackage(
   name: string,
   quota: unknown,
-  options: { active?: boolean; expiredTime?: string } = {},
+  options: {
+    active?: boolean
+    expiredTime?: string
+    /**
+     * `qoderUsage.expiresAt`（**数字毫秒**）。
+     *
+     * ⚠️ **只有 `userQuota` 那一条传它** —— `expiresAt` 的语义归属就是
+     * `userQuota`（套餐额度）：见 {@link QODER_PERMANENT_EXPIRY_MS} 的取证。
+     * `addOnQuota`（只给聚合标量、**任何日期字段都没有**）与
+     * `dedicatedResourcePackages`（逐包自己带 `expiresAt` 字符串，走
+     * `expiredTime` 那条既有路径）都**不传**。
+     */
+    expiresAtMs?: number
+  } = {},
 ): CreditPackage | undefined {
   const total = readNumber(quota, 'total')
   const used = readNumber(quota, 'used')
@@ -344,12 +442,122 @@ function toPackage(
   const remaining = remainingRaw !== undefined
     ? Math.max(0, remainingRaw)
     : Math.max(0, totalValue - usedValue)
-  // 到期时间归一化：Qoder 的专用资源包用 expiredTime 字段（ISO 日期字符串）。
-  // 套餐额度/资源包没有独立到期（统一"领取后 30 天"），不设置 deductionEndTime，
-  // 前端 formatPackageExpiry 对 Qoder 的特定包名走"30 天内有效"的特殊显示。
+  /**
+   * 到期时间归一化 —— **两条互斥判据**。
+   *
+   * ## ⚠️ 2026-10-20 更正：旧注释说「Qoder 没有独立到期，一律不设置
+   * `deductionEndTime`」，那句话对 `userQuota` 一层**不成立**（它在说谎）
+   *
+   * 旧原文（本仓库历史）：
+   * > 到期时间归一化：Qoder 的专用资源包用 expiredTime 字段（ISO 日期字符串）。
+   * > 套餐额度/资源包没有独立到期（统一"领取后 30 天"），不设置 deductionEndTime，
+   * > 前端 formatPackageExpiry 对 Qoder 的特定包名走"30 天内有效"的特殊显示。
+   *
+   * 两处不实：① `userQuota` 那层其实**有** `usage.expiresAt`（数字毫秒），
+   * 只是个人版下发的恒是永久哨兵；② 前端 `formatPackageExpiry`（`credit-expiry.js`）
+   * **没有**、也从来没有「对 Qoder 特定包名走 30 天内有效」的分支 ——
+   * 它只按 `deductionEndTime` 是否有值分流（有 ⇒ 绝对日期 + 天数；无 ⇒ 「长期」）。
+   * ⇒ 本次把它改写成下面这条真实的两分支判据。
+   *
+   * ## 判据（两条**互不重叠**的支路 —— 调用点按 pack 种类各自只走一支）
+   *
+   * | 支路 | 来源与调用点 | 命中条件 | 动作 |
+   * |---|---|---|---|
+   * | A（**本次新增**） | `options.expiresAtMs` = `qoderUsage.expiresAt`，只在 `userQuota` 那一条传 | 非有限值 / `<= 0` | 落到 B |
+   * | A | 同上 | **永久哨兵**（`>= QODER_PERMANENT_EXPIRY_MS`，或解析出的年份 `>= 9999`） | **不写** `deductionEndTime` ⇒ 前端「长期」 |
+   * | A | 同上 | 真实时间戳 | **写** `deductionEndTime` ⇒ 前端显示真实日期 |
+   * | B（**既有，未改动**） | `options.expiredTime` = 逐包 ISO 字符串（`dedicatedResourcePackages[].expiresAt`） | `Date.parse` 有限 | **写** `deductionEndTime` |
+   * | B | 同上 | 缺失 / 解析失败 | **不写** |
+   *
+   * ⚠️ 支路 B 是**既有行为、本次刻意不动**（Lead 2026-10-20 明确：该路径已在工作，
+   * 既不是缺陷也不是本任务的新增能力）。它服务的是 `dedicatedResourcePackages[]`
+   * —— 全上游**唯一**带真实逐包到期的字段，仍照旧精确折算。
+   *
+   * ⚠️ 「不写」是**保守方向**：`splitBuddyCreditsByExpiry` 对缺
+   * `deductionEndTime` 的包按**永久桶**处理 —— 未知到期假定为长期，
+   * 而临期判据宁可漏报也不瞎报（本仓库红线「绝不编造日期」）。
+   */
+  const explicitMs = options.expiresAtMs
+  const explicitUsable = typeof explicitMs === 'number' && Number.isFinite(explicitMs) && explicitMs > 0
+  // ⚠️ 与支路 B 共用 `isPermanentSentinelMs` 一份判据（含「年份 >= 9999」兜底，
+  //    兜住 `9999-01-01`~`9999-12-30` 这些小于常量但同样是哨兵的取值）。
+  const explicitIsPermanent = explicitUsable && isPermanentSentinelMs(explicitMs)
   const expMs = options.expiredTime && options.expiredTime.length > 0
     ? Date.parse(options.expiredTime.replace(' ', 'T'))
     : Number.NaN
+  /**
+   * ⚠️⚠️ **支路 B 也要过永久哨兵判据**（2026-10-21 合并审计发现，真实缺陷）。
+   *
+   * ## 缺陷是什么
+   *
+   * 上一版只对**支路 A**（`userQuota` 的数字 `expiresAt`）做了哨兵识别，
+   * 判定为永久后**直接落到支路 B**（`expiredTime` 字符串）。而支路 B 服务的是
+   * `dedicatedResourcePackages[].expiresAt` —— 那个字段**同样可能下发 9999 哨兵**，
+   * 且本机账号恰好没有样本（`undefined`），所以这条路径从未被真机数据验证过。
+   *
+   * 实测（本机，构造报文）：
+   * ```
+   * toPackage('专用资源包', {total:100,used:0,remaining:100},
+   *           { expiredTime: '9999-12-31T00:00:00.000Z' })
+   *   → deductionEndTime = 253402214400000
+   *   → 客户端 formatPackageExpiry 渲染成「9999-12-31（2912150 天后）」
+   * ```
+   * 这正是本 PR 在 `userQuota` 那一路**声称已消灭**的荒谬文案 ——
+   * 只堵了一个入口，另一个入口原样漏着。
+   *
+   * ## 两个可观测后果（第二个更严重）
+   *
+   * 1. **荒谬展示**：卡片上出现「9999-12-31（约 290 万天后）」。
+   * 2. **分桶错位**：该包落进 `longTerm`（约 290 万天后 ⇒ 远超 15 天窗口），
+   *    而它的语义是**未知到期**（应落 `permanent`）。⚠️ 这两个桶**选号行为不同**：
+   *    `longTerm` 在锁定永久积分时**仍然可选**，而 `permanent` 会被拦 ——
+   *    于是「锁住的永久积分」在这一路径上**照样被烧**，锁定形同虚设。
+   *
+   * ## 修法
+   *
+   * 把「哨兵识别」抽成对**毫秒值**的纯判据 `isPermanentSentinelMs()`，两条支路
+   * 共用同一份实现（本仓库红线：同一语义只留一处判据）。支路 B 解析出 `expMs`
+   * 后先过它，命中就**不写** `deductionEndTime`（= 永久桶 = 前端「长期」）。
+   *
+   * ⚠️ 字符串里的「年份 >= 9999」也要认 —— 上游若发 `"9999-12-31"` 这种**纯日期**
+   *    （不带 `T00:00:00Z`），`Date.parse` 仍能解析，落到同一个毫秒判据上。
+   */
+  const expIsPermanent = isPermanentSentinelMs(expMs)
+  const deductionEndTime = explicitUsable && !explicitIsPermanent
+    ? explicitMs
+    : (Number.isFinite(expMs) && !expIsPermanent ? expMs : undefined)
+  /**
+   * ⚠️⚠️ **`expiredTime` 也必须过滤哨兵**（2026-10-21 对抗性审计发现，P1：
+   * 上一版只挡住了 `deductionEndTime`，这条泄漏仍然存在）。
+   *
+   * ## 为什么挡住 `deductionEndTime` 还不够
+   *
+   * 客户端 `credit-expiry.js` 的 `packageExpiryMs()` 是**两段回落**：
+   * ```js
+   * // 1) 先读 deductionEndTime（数字）
+   * // 2) 读不到 ⇒ 回落到 expiredTime（字符串，Date.parse）
+   * ```
+   * 于是即使 `deductionEndTime` 被正确清空，只要 `expiredTime` 里还留着原串，
+   * tooltip 仍会渲染出哨兵日期。实测（本机，构造报文）：
+   * ```
+   * { deductionEndTime: undefined,
+   *   expiredTime: '9999-12-31T00:00:00.000Z' }
+   * → packageExpiryMs    = 253402214400000
+   * → formatPackageExpiry = "9999-12-31（2912150 天后）"
+   * ```
+   * ⇒ 正是 `toPackage` 上方注释声称「已消灭」的那句荒谬文案，**换了个字段入口
+   *   又回来了**。分桶不受影响（`permanent`，锁定会拦），但用户看到的明细
+   *   仍然自相矛盾：三档行说「永久」、hover 里说「9999-12-31 到期」。
+   *
+   * ## 修法
+   *
+   * 哨兵命中时**连 `expiredTime` 一起清空**（置 `''`）。二者必须是同一份判据的
+   * 两个出口 —— 只清一个就留了另一半泄漏。
+   *
+   * ⚠️ 非哨兵的真实日期**照旧原样透出**（tooltip 要显示上游原文），
+   *    `undefined`（解析失败）也照旧透出（它不是哨兵，只是我们认不出）。
+   */
+  const expiredTimeRaw = options.expiredTime ?? ''
   return {
     name,
     unit: readString(quota, 'unit') ?? 'credits',
@@ -359,8 +567,8 @@ function toPackage(
     active: options.active ?? true,
     cycleStartTime: '',
     cycleEndTime: '',
-    expiredTime: options.expiredTime ?? '',
-    ...(Number.isFinite(expMs) ? { deductionEndTime: expMs } : {}),
+    expiredTime: expIsPermanent ? '' : expiredTimeRaw,
+    ...(deductionEndTime !== undefined ? { deductionEndTime } : {}),
   }
 }
 
@@ -379,46 +587,197 @@ export async function fetchQoderCreditBalance(
   product: QoderProduct,
   fetcher: typeof fetch = fetch,
 ): Promise<CreditBalance | null> {
-  let response: Response
+  const detailed = await fetchQoderBalanceDetailed(credential, product, { fetcher })
+  return detailed.balance
+}
+
+/** {@link fetchQoderBalanceDetailed} 的可选项。 */
+export interface QoderBalanceOptions {
+  /** 注入 fetcher（测试用；生产用全局 `fetch`）。 */
+  fetcher?: typeof fetch
+  /**
+   * 单次请求超时（毫秒）。默认 {@link QODER_CREDITS_TIMEOUT_MS}。
+   *
+   * ⚠️ 面板**并发**查询所有账号（2026-10-21 起），故 N 个账号的最坏总耗时
+   *    约等于**单账号**的耗时，不再线性叠加。但单账号本身仍可能耗满本值：
+   *    国际版被 SNI 阻断时实测 10.7s（undici 自己的 connect timeout 先于
+   *    本值触发）⇒ 调小本值**不会**让墙外的失败更快返回，只能调大。
+   */
+  timeoutMs?: number
+}
+
+/**
+ * 查询 Qoder 账号积分余额，**失败时带上可读原因**（Jet Hub 面板用）。
+ *
+ * ## 为什么需要这个并列函数（而不是改造上面那个）
+ *
+ * `fetchQoderCreditBalance` 的契约是「查不到就 `null`」—— 它服务于
+ * `BuddyBalanceSelector`（选号/分档，只关心金额）与 `sharedPackageExpiry`
+ * （折算到期，只关心日期）。那两处**不需要**原因，硬塞原因会让 20 多处
+ * `balance!.total` 断言全破。
+ *
+ * 但**面板**需要原因：原实现的报障形态是「一直读取中」，最终只落到一句
+ * 「积分查询失败（凭据失效或响应异常）」—— 这句话把**网络不通**、**401**、
+ * **响应变形**、**企业版无数字**四种完全不同的处境压成同一句，用户无法据此
+ * 做任何事。实测本机 Qoder 国际版：`openapi.qoder.sh` 的 TCP 443 能连通
+ * （93ms），但 **TLS ClientHello 被丢**（12s 无响应），故 `fetch` 必在 10.7s
+ * 后报 `UND_ERR_CONNECT_TIMEOUT` —— 这是**环境问题**，不是凭据问题。
+ *
+ * ## 判据分层（与 `astudio-credits.ts` 的 `fetchAstudioBalanceDetailed` 同款）
+ *
+ * 1. **传输层**：`aborted` / 错误码命中「出不去」⇒ 点名实际主机 + 出路。
+ * 2. **HTTP 层**：401/403 = 凭据；其它非 2xx = 服务端（带状态码）。
+ * 3. **形状层**：非 JSON / 非对象 / 缺 `qoderUsage` / 一个包都没解析出来。
+ * 4. **企业版**：`displayMode === 'enterprise'` ⇒ 上游本就不给数字（不是故障）。
+ *
+ * @returns 成功时 `{ balance }`；失败时 `{ balance: null, error }`。
+ *   ⚠️ 永远返回 `balance` 字段（共享骨架靠 `balance` 判定成败，
+ *   `error` 只影响文案 —— 见 `provider-runtime.ts` 的 `ProviderBalanceDetail`）。
+ */
+export async function fetchQoderBalanceDetailed(
+  credential: QoderCredential,
+  product: QoderProduct,
+  options: QoderBalanceOptions = {},
+): Promise<ProviderBalanceDetail> {
+  const fetcher = options.fetcher ?? fetch
+  const timeoutMs = options.timeoutMs ?? QODER_CREDITS_TIMEOUT_MS
+  const url = `${product.openApiBase}${QODER_USAGE_PATH}`
+  /**
+   * ⚠️⚠️ **构造请求头必须在 try 内**（2026-10-21 合并审计发现，!136 引入的回归）。
+   *
+   * `creditsHeaders` 会抛（凭据形状异常等），而本函数的契约是「**本身不抛**」——
+   * 它一抛，`src/jet-hub-rpc.ts` 的 `Promise.all` 失败隔离就失效：
+   * 一个坏账号让**整批** `credits.balances` 变成 `ok:false`，客户端把同一句
+   * message 盖到该 provider 的**每一个**账号卡片上 —— 按账号给原因的能力
+   * 在异常路径上一次性全丢。
+   *
+   * ⚠️ 并发改造**之前**是串行 `for` + 每格自己的错误分支，所以那时抛不出去；
+   *    改成 `Promise.all` 时必须把这条腿一起包进来。实测对照：
+   *    BASE（改动前）同一路径返回 `null`，HEAD 抛出 ⇒ 隔离确实被打破。
+   *
+   * ⚠️ 文案**不要**复用下面那条「网络异常」——凭据构造失败不是网络问题，
+   *    照实说「凭据不可用」并带上根因（别吞 message）。
+   */
+  let headers: Record<string, string>
   try {
-    response = await fetcher(`${product.openApiBase}${QODER_USAGE_PATH}`, {
-      method: 'GET',
-      headers: await creditsHeaders(credential, product),
-      signal: AbortSignal.timeout(QODER_CREDITS_TIMEOUT_MS),
-    })
-  } catch {
-    // 网络失败：返回 null（与其它 provider 同语义），不抛错。
-    return null
+    headers = await creditsHeaders(credential, product)
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    return { balance: null, error: `积分查询失败（凭据不可用）：${reason}` }
   }
 
-  // 401/403 是凭据问题，其它非 2xx 是服务端问题 —— 两者都返回 null，
-  // 由调用方统一显示「查询失败」原因。
-  if (!response.ok) return null
+  let response: Response
+  // 自己 arm 的超时是否真的触发 —— `AbortSignal.timeout()` 超时**不带** `UND_ERR_*`
+  // 错误码（IKLTZ2 审计 P2-2 的实际教训），只能靠读 `signal.aborted` 判断。
+  // ⚠️ 这里**必须**自己持有 controller 才能读到；用 `AbortSignal.timeout()` 的
+  //    返回值虽然也是 AbortSignal，但它在 catch 时才 aborted，语义等价 ——
+  //    故仍直接用它，只是要在 catch 里读一次 `.aborted`。
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  try {
+    response = await fetcher(url, { method: 'GET', headers, signal: timeoutSignal })
+  } catch (error) {
+    const hint = networkBlockedHint({
+      error,
+      aborted: timeoutSignal.aborted,
+      subject: product.openApiBase,
+      /**
+       * ⚠️ **只给出路，不断言机制**（2026-10-21 合并审计发现）。
+       *
+       * 旧文案写死「Qoder **国际版**端点在本机被阻断（TCP 能连通、TLS 握手被丢）」，
+       * 两处都错：
+       * ① 本分支被 `isQoderFamily` **两站共用** ⇒ 中国版用户在自己公司网络里失败时，
+       *    会读到与同一句里打印的主机名（`product.openApiBase`）**自相矛盾**的结论；
+       * ② `remedy` 是常量 ⇒ 不论命中哪个码照发，而对 `ENOTFOUND`（DNS 解析不到）
+       *    说「TCP 能连通」是**事实性错误**。
+       * ⇒ 站点已由 `subject`（主机名）点名，机制留给用户自己看码；
+       *    这里只保证**出路**是可操作的。
+       *
+       *    ⚠️ 2026-10-25 审计 A2-10：本句原先写「本插件目前**没有**按账号配代理的
+       *    按钮，故只能说『换网络 / 启动前导出 HTTPS_PROXY』」—— `618a090` 起
+       *    **已有**该按钮（Jet Hub 的 Qoder 账号卡片 →「代理」）⇒ 那段自述已过时。
+       *    保留「换网络 / HTTPS_PROXY」作为**全局**出路仍正确（它们确实都能用），
+       *    但不得再声称「没有按账号代理入口」。
+       */
+      remedy: '插件进程不走系统代理；请在能直接访问该地址的网络下使用，'
+        + '或为插件进程配置出口代理后在启动 DSH 前导出 HTTPS_PROXY。',
+    })
+    if (hint !== undefined) return { balance: null, error: hint }
+    // 不是「出不去」⇒ 老实说清楚是什么（含 message，别吞）。
+    const reason = error instanceof Error ? error.message : String(error)
+    return { balance: null, error: `积分查询失败（网络异常）：${reason}` }
+  }
+
+  // 401/403 是凭据问题，其它非 2xx 是服务端问题 —— 两者原因不同，不能混。
+  if (!response.ok) {
+    const status = response.status
+    if (status === 401 || status === 403) {
+      return {
+        balance: null,
+        error: `积分查询失败（HTTP ${status}，登录已失效）：请删除该账号后重新登录 Qoder`,
+      }
+    }
+    return { balance: null, error: `积分查询失败（HTTP ${status}）` }
+  }
 
   let body: unknown
   try {
     body = await response.json()
   } catch {
-    return null
+    return { balance: null, error: '积分查询失败（响应不是 JSON）' }
   }
 
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return { balance: null, error: '积分查询失败（响应不是对象）' }
+  }
   const root = body as Record<string, unknown>
 
-  // 企业版：无额度数字，只有外部链接。返回 null 而非 0（见函数注释）。
-  if (root.displayMode === 'enterprise') return null
+  // 企业版：无额度数字，只有外部链接。这不是故障 ⇒ 原因写清「上游不给数字」。
+  if (root.displayMode === 'enterprise') {
+    return {
+      balance: null,
+      error: '企业版账号不提供额度数字（上游只给网页版用量链接），请在 Qoder 网页端查看',
+    }
+  }
 
   const usage = root.qoderUsage
-  if (typeof usage !== 'object' || usage === null) return null
+  if (typeof usage !== 'object' || usage === null) {
+    return { balance: null, error: '积分查询失败（响应缺少 qoderUsage 字段）' }
+  }
 
+  const parsed = parseQoderUsage(usage as Record<string, unknown>)
+  if (parsed === null) {
+    return { balance: null, error: '积分查询失败（响应未包含任何额度包）' }
+  }
+  return { balance: parsed }
+}
+
+/**
+ * 从 `qoderUsage` 对象解析出余额（纯函数，`fetchQoderCreditBalance` 与
+ * `fetchQoderBalanceDetailed` 共用**同一份**解析 —— 红线：同一语义只留一处）。
+ *
+ * @returns 解析不出任何包时 `null`（= 查不到，而非余额 0）。
+ */
+function parseQoderUsage(qoderUsage: Record<string, unknown>): CreditBalance | null {
   const packages: CreditPackage[] = []
-  // 顺序即展示顺序：套餐额度 → 赠送/资源包 → 专用资源包。
-  const userQuota = toPackage(QODER_PLAN_PACKAGE, (usage as Record<string, unknown>).userQuota)
+  // 顺序即展示顺序：套餐额度 → 赠送/资源包 → 专用资源包（⚠️ 顺序与「一个包都
+  // 解析不出来就返回 null」这两条是**既有的、本次不动**）。
+  // ⚠️ `usage.expiresAt`（数字毫秒）**只传给 `userQuota` 那一条** ——
+  //    它的语义归属就是套餐额度，不是 `addOnQuota`（那一层只给聚合标量、
+  //    连日期字段都没有），也不是任何逐包到期（那些走各自的 `expiredTime`）。
+  //    传给别处会把哨兵/未知到期挂到错误的包上，分档随之错位。
+  const userQuotaExpiresAtMs = readNumber(qoderUsage, 'expiresAt')
+  const userQuota = toPackage(
+    QODER_PLAN_PACKAGE,
+    qoderUsage.userQuota,
+    { expiresAtMs: userQuotaExpiresAtMs },
+  )
   if (userQuota !== undefined) packages.push(userQuota)
-  const addOnQuota = toPackage('资源包', (usage as Record<string, unknown>).addOnQuota)
+  // ⚠️ 刻意**不传** `expiresAtMs`：`addOnQuota` 没有任何日期字段，
+  //    传了就是把套餐的哨兵按到资源包头上。
+  const addOnQuota = toPackage('资源包', qoderUsage.addOnQuota)
   if (addOnQuota !== undefined) packages.push(addOnQuota)
 
-  const dedicated = (usage as Record<string, unknown>).dedicatedResourcePackages
+  const dedicated = qoderUsage.dedicatedResourcePackages
   if (Array.isArray(dedicated)) {
     for (const item of dedicated) {
       const pkg = toPackage(

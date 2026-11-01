@@ -1332,6 +1332,16 @@ export class AggregateAdapter extends LlmAdapter {
     //    ⚠️ **不许用「猜一个每日 UTC+8 零点」消除它** —— 那是凭空造一个上游从未
     //    承诺的重置时刻（本仓库红线「绝不编造数字」）。
     'modelscope',
+    // ⚠️ qiniu（七牛云，2026-10-29）：`channel: true` ⇒ 必须进聚合目录，否则它的
+    //    模型**永不进聚合、静默不可见**。
+    //
+    // ⚠️⚠️ **本数组只是第一道门**（模型层归并）。决定「在不在候选表里」的是
+    //    `aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS` —— 而 qiniu **刻意不进
+    //    那张表**：七牛云**没有余额端点**（用量只在控制台可见）⇒ 折算恒
+    //    `UNUSABLE`，与 cline / raccoon / gemini 同格。它已登记在
+    //    `expiry-runtime-parity.spec.ts` 的 `NOT_EXPIRY_WIRED` 豁免表里，
+    //    由「豁免理由被验证」那条用例钉住。
+    'qiniu',
     // officeace（2026-10-12）：华为 MaaS 云端直连渠道，`channel: true`
     // ⇒ 必须进聚合目录，否则它的模型**永不进聚合、静默不可见**。
     // ⚠️ 本数组**只是第一道门**（模型层归并）。真正决定「在不在候选表里」的是
@@ -1365,11 +1375,6 @@ export class AggregateAdapter extends LlmAdapter {
     //    且症状静默（无报错、无日志）。现两处都补齐。
     'accio',
     'autoclaw',
-    // ⚠️ astudio 有意**不进** AGGREGATE_CHANNELS（2026-10-16 定案，沿用先前取证结论）：
-    //    本家的模型目录来自上游动态 catalog，额度与失效语义（HTTP 200 + 业务 code 80000
-    //    归「需人工重新登录」终态）与聚合渠道不同；且上方注释已实证「只加本数组而不补
-    //    aggregate-expiry 的 WIRED_EXPIRY_PROVIDERS」是无效接线。两处均未补齐 ⇒ 本轮保持
-    //    不接入聚合渠道，此处不新增成员，仅留此说明防止后人误以为漏接。
     // ⚠️ AutoClaw 国际版（2026-10-20）：`channel: true` ⇒ 必须进聚合目录，
     //    否则它的模型**永不进聚合、静默不可见**（同款陷阱已复发四次：
     //    cline → accio → officeace → autoclaw）。
@@ -1378,6 +1383,37 @@ export class AggregateAdapter extends LlmAdapter {
     //    ⚠️ `provider-expiry.ts` 里必须传 `AUTOCLAW_INTL` —— 传国内版会用国内
     //    基址查国际账号余额（410000）⇒ 折算恒 `UNUSABLE` ⇒ 又回到静默不可见。
     'autoclawintl',
+    // ⚠️ **AStudio**（讯飞 AstronStudio，2026-10-20 **改判**）
+    //
+    // 原注释（2026-10-16 定案）写着「有意**不进** AGGREGATE_CHANNELS」，三条理由
+    // 在 2026-10-20 用户报障后逐条复核，**全部不成立或已不适用**：
+    //
+    // | 原理由 | 复核结论 |
+    // |---|---|
+    // | 「模型目录来自上游动态 catalog」 | 与是否接入聚合无关 —— `aggregate-adapter` 读的是 `listModels()`（本家适配器已实现），不关心它内部怎么取 |
+    // | 「额度语义不同」 | **当时是没查证**。实测 `/points/balance` 三池各带 `*NextExpireTime`（赠送池实测 `"2026-11-20T01:50:14"`），与 buddy 系同形，`sharedPackageExpiry` 直接适用 |
+    // | 「失效语义不同（HTTP 200 + code 80000 = 需重登）」 | 只影响**额度读数失败时**的文案分流（`fetchAstudioBalanceDetailed` 的 terminal 判定），与「该渠道何时作废」的折算无关 |
+    //
+    // ⚠️ 第 4 条原理由是「两处均未补齐」—— 那是**当时的实现状态**，不是设计约束。
+    //    本次三处同时补齐：本数组 + `WIRED_EXPIRY_PROVIDERS` + `createProviderExpiry()`
+    //    的 `astudioExpiry`（缺任一处都静默失效，见上面 accio/autoclaw 的教训）。
+    //
+    // ⚠️⚠️ **只加本数组是无效接线**（2026-10-13 合并审计实测）：决定候选可见性的
+    //    是 `WIRED_EXPIRY_PROVIDERS` —— 本文件有 4 处按它过滤。用户报障
+    //    「astudio 缺永久/长期/临期三档」的直接成因之一就是这条「有意不接入」。
+    'astudio',
+    // ⚠️ **Codely**（Unity，2026-10-22 A6）：推理 / 目录 / 余额 / 签到 / 续期全部已接线，
+    //    `channel` 已翻 `true` ⇒ **必须进本数组**，否则它的模型**永不进聚合目录**。
+    //    ⚠️ 但**不进** `WIRED_EXPIRY_PROVIDERS`：它的余额端点**不下发任何到期时间**
+    //    （`expiredTime` 是空串），而候选表的第一判据就是临期档 ⇒ 它的候选
+    //    会被那 4 处 `WIRED_EXPIRY_PROVIDERS` 过滤剔掉（**与 minimax 系列当前行为一致**）。
+    //    ⇒ 目录层有它、轮换候选层没它；上游一旦开始下发到期时间，
+    //    补一个折算原语 + 两处登记即可。
+    'codely',
+    // ⚠️ Magicrew（超级麦吉，2026-10-29）：与 accio / officeace / autoclaw 同款，
+    //    **只加本数组不够** —— 决定候选表可见性的是 `aggregate-expiry.ts` 的
+    //    `WIRED_EXPIRY_PROVIDERS`，漏了它 ⇒ 折算恒 UNUSABLE ⇒ 该渠道静默消失。
+    'magicrew',
     'orcaterm',
   ])
 

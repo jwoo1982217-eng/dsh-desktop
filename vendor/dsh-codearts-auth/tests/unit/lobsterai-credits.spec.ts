@@ -15,6 +15,40 @@ import type { LobsteraiCredential } from '../../src/lobsterai.js'
 
 const CLIENT_VERSION = '2026.9.4'
 
+/**
+ * ⚠️⚠️ **资源包到期时间必须是「远未来」，不能写死近期绝对日期**（2026-10-23 实测）。
+ *
+ * 原先这几处写死 `'2026-10-23T01:21:23'` / `` `2026-10-2${i + 4}T00:00:00` ``，
+ * 那是 2026-09-29 抓包时的**真实未来时间**。而 `fetchLobsteraiCreditBalance`
+ * 会按 `Date.now()` 判 `active`（见 `src/lobsterai-credits.ts` 的
+ * `active: !(… Date.now() >= Date.parse(expiresAt))`），面值推断又**只对
+ * `active` 包生效**（`if (!pkg.active) continue`）。
+ *
+ * ⇒ 时间一过 2026-10-23T01:21:23，fixture 里的包全部变成「已过期」⇒
+ * `faceValueByGroup` 永远为空 ⇒ `total` 停在 0 ⇒ 用例报
+ * `expected { remaining: 50 } to match { remaining: 50, total: 50 }`。
+ *
+ * 本机实测（假时钟对照，同一份 fixture、只改 `Date.now()`）：
+ *
+ * | 系统时间 | `active` | `total` |
+ * |---|---|---|
+ * | `2026-10-23T00:00` | `true` | **50** |
+ * | `2026-10-23T18:25` | `false` | **0** ← 变红 |
+ *
+ * ⇒ 这不是被测逻辑的缺陷，是**用例自己的定时炸弹**（「日期炸弹」）。
+ *
+ * ## ⚠️ 为什么用固定的 `2099` 而不是 `Date.now() + 1 天`
+ *
+ * 第一版修法用了 `new Date(Date.now() + 86_400_000)` 的**模块级常量**，被探针
+ * 当场证伪：常量在**模块加载时**求值（取真实 now），而任何用 `vi.setSystemTime()`
+ * 把时钟拨到远未来的用例都会让它重新变成「过去」⇒ 换了个方向复发同一个炸弹。
+ * 固定 `2099` 与本文件既有写法（「已过期的包」那条用的就是 `'2099-01-01 00:00:00'`）
+ * 一致，且对任何合理时钟都免疫。
+ */
+const FUTURE_EXPIRY = '2099-01-01 00:00:00'
+/** 比 {@link FUTURE_EXPIRY} 更晚（同一组包、不同批次到期，用于多包场景）。 */
+const FUTURE_EXPIRY_LATER = '2099-12-31 00:00:00'
+
 function makeCredential(): LobsteraiCredential {
   return {
     access_token: 'AT', refresh_token: 'RT',
@@ -343,7 +377,7 @@ describe('fetchLobsteraiCreditBalance', () => {
       data: {
         totalCreditsRemaining: 692.73,
         creditItems: [
-          { type: 'campaign', label: '每日登录奖励', creditsRemaining: 92.73, expiresAt: '2026-10-23T01:21:23' },
+          { type: 'campaign', label: '每日登录奖励', creditsRemaining: 92.73, expiresAt: FUTURE_EXPIRY },
         ],
       },
     }), { status: 200 }))
@@ -357,10 +391,10 @@ describe('fetchLobsteraiCreditBalance', () => {
       data: {
         totalCreditsRemaining: 692.73,
         creditItems: [
-          { type: 'campaign', label: '每日登录奖励', creditsRemaining: 92.73, expiresAt: '2026-10-23T01:21:23' },
+          { type: 'campaign', label: '每日登录奖励', creditsRemaining: 92.73, expiresAt: FUTURE_EXPIRY },
           ...Array.from({ length: 6 }, (_, i) => ({
             type: 'campaign', label: '每日登录奖励',
-            creditsRemaining: 100, expiresAt: `2026-10-2${i + 4}T00:00:00`,
+            creditsRemaining: 100, expiresAt: FUTURE_EXPIRY_LATER,
           })),
         ],
       },
@@ -381,7 +415,7 @@ describe('fetchLobsteraiCreditBalance', () => {
       data: {
         totalCreditsRemaining: 50,
         creditItems: [
-          { type: 'campaign', label: '每日登录奖励', creditsRemaining: 50, expiresAt: '2026-10-23T01:21:23' },
+          { type: 'campaign', label: '每日登录奖励', creditsRemaining: 50, expiresAt: FUTURE_EXPIRY },
         ],
       },
     }), { status: 200 }))

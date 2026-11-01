@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import {
   RACCOON,
-  RACCOON_IMAGE_CAPABILITY_OVERRIDES,
+  RACCOON_TEXT_ONLY_MODELS,
   raccoonProductById,
   raccoonSupportsImage,
+  raccoonSupportsImageWith,
 } from '../../src/raccoon-product.js'
 
 describe('RACCOON 产品配置', () => {
@@ -78,7 +79,7 @@ describe('兜底模型表', () => {
   /**
    * ⚠️ 本条**曾经锁死了缺陷行为**（断言 `sn-deepseek-v4-1-flash` 为 `false`），
    * 改动前务必先读 `src/raccoon-product.ts` 的
-   * {@link RACCOON_IMAGE_CAPABILITY_OVERRIDES} 的注释 —— 那里有 6/6 带图实测证据。
+   * {@link RACCOON_TEXT_ONLY_MODELS} 的注释 —— 那里有 6/6 带图实测证据。
    *
    * 结论：远端 `tags` 里的 `vision` 是**客户端选模偏好**，不是能力契约。
    * 6 个可见模型实测**全部**能读图，含两个不带 `vision` 标签的。
@@ -114,62 +115,53 @@ describe('raccoonProductById', () => {
 })
 
 /**
- * 2026-10-03 真实缺陷的回归段。
+ * 图片能力判定（2026-10-21 策略翻转：**默认支持**，只把纯文本模型显式禁掉）。
  *
- * 用户报障「给 DeepSeek-V4.1-Flash 发图，提示不支持」。根因是我们把远端
- * `tags` 里的 `vision` 当成了服务端能力契约，而它是客户端选模偏好。
- * 详见 `src/raccoon-product.ts` 的 {@link RACCOON_IMAGE_CAPABILITY_OVERRIDES}。
+ * 历史两起漏判：
+ * - 2026-10-03：把远端 `tags.vision` 当能力契约 ⇒ `sn-deepseek-v4-1-flash` 被判 text；
+ * - 2026-10-21：白名单按精确 id 枚举 ⇒ 新 id `...-1017` 又被打回 text。
+ *
+ * ⇒ 判据改为「默认 image + {@link RACCOON_TEXT_ONLY_MODELS} 黑名单」，
+ * 详见 `src/raccoon-product.ts` 的注释（含 6/6 与 1017 的带图实测证据）。
  */
-describe('图片能力判定（tags 不是能力契约）', () => {
-  it('白名单恰好覆盖那两个 tags 不含 vision、但实测能看图的模型', () => {
-    expect([...RACCOON_IMAGE_CAPABILITY_OVERRIDES].sort()).toEqual([
-      'sn-deepseek-v4-1-flash',
-      'sn-glm-5-3-flash',
-    ])
+describe('图片能力判定（默认支持，纯文本模型显式禁掉）', () => {
+  it('默认对任何模型都声明 image（含 tags 不含 vision 的、未知的、带版本后缀的）', () => {
+    expect(raccoonSupportsImage('sn-deepseek-v4-1-flash')).toBe(true)
+    expect(raccoonSupportsImage('sn-glm-5-3-flash')).toBe(true)
+    expect(raccoonSupportsImage('sn-deepseek-v4-1-flash-1017')).toBe(true)
+    // 远端将来新上架的模型：默认放行，不再依赖 tags
+    expect(raccoonSupportsImage('some-brand-new-model')).toBe(true)
+    expect(raccoonSupportsImage('some-brand-new-model-1101')).toBe(true)
   })
 
-  it('白名单命中时无视 tags（这正是修复前的漏判）', () => {
-    // 修复前这条恒为 false ⇒ 报「模型不支持图片输入」
-    expect(raccoonSupportsImage('sn-deepseek-v4-1-flash', [])).toBe(true)
-    expect(raccoonSupportsImage('sn-glm-5-3-flash', [])).toBe(true)
+  it('纯文本集合里的模型被禁（含带版本后缀的同族 id）', () => {
+    const textOnly = new Set(['sn-text-only'])
+    expect(raccoonSupportsImageWith(textOnly, 'sn-text-only')).toBe(false)
+    // 同族滚版本也必须禁（否则新版会漏禁）
+    expect(raccoonSupportsImageWith(textOnly, 'sn-text-only-1017')).toBe(false)
+    // 不影响集合外的模型
+    expect(raccoonSupportsImageWith(textOnly, 'sn-deepseek-v4-1-flash')).toBe(true)
+    // 后缀不是纯 4 位数字 ⇒ 不剥，避免误禁 `-next` / `-text` 变体
+    expect(raccoonSupportsImageWith(textOnly, 'sn-text-only-next')).toBe(true)
+    expect(raccoonSupportsImageWith(textOnly, 'sn-text-only-12345')).toBe(true)
   })
 
-  it('tags 含 vision 时仍为 true（不回归原有能力）', () => {
-    expect(raccoonSupportsImage('sn-glm-5-3', ['general', 'vision'])).toBe(true)
-  })
-
-  it('别名 image / image-understanding 仍被认（远端可能改用这两种写法）', () => {
-    expect(raccoonSupportsImage('some-model', ['image'])).toBe(true)
-    expect(raccoonSupportsImage('some-model', ['image-understanding'])).toBe(true)
-  })
-
-  it('既不在白名单、tags 又无视觉标记时为 false（不得无条件放行）', () => {
-    expect(raccoonSupportsImage('some-unknown-model', ['general', 'code'])).toBe(false)
-    expect(raccoonSupportsImage('some-unknown-model', [])).toBe(false)
+  it('生产集合当前为空（目录里没有实测确认的纯文本模型）', () => {
+    // ⚠️ 新增条目必须先有「带图被明确拒绝」的实测证据，见 product 注释的「代价」。
+    expect([...RACCOON_TEXT_ONLY_MODELS]).toEqual([])
   })
 
   /**
-   * **两个真相源必须一致**：兜底表（本地）vs 远端 tags 判定。
+   * **两个真相源必须一致**：兜底表（本地）vs 远端判定。
    *
-   * ⚠️ 本条是防止「只修一条通道」的关键 —— raccoon 有远端目录与本地兜底表
+   * ⚠️ 本条是防止「只改一条通道」的关键 —— raccoon 有远端目录与本地兜底表
    * 两条路径，二者曾给出互相矛盾的答案。
-   * ⚠️ 反向验证：把兜底表任一条改回 `false`（或把白名单清空）→ 本条立即变红。
+   * ⚠️ 反向验证：把兜底表任一条改回 `false`（或把该 id 加进纯文本集合）→ 本条立即变红。
    */
-  it('兜底表的图片能力与「远端实测 tags 判定」逐条一致', () => {
-    /** 2026-10-03 实拉 model_catalog 的 tags（逐条抄录，不凭印象）。 */
-    const REMOTE_TAGS: Record<string, string[]> = {
-      'sn-sensenova-6-8-flash': ['general', 'chat', 'rewrite', 'summary', 'fast', 'vision', 'fast'],
-      'sn-sensenova-6-8-flash-lite': ['general', 'chat', 'rewrite', 'summary', 'fast', 'vision', 'fast'],
-      'sn-glm-5-3': ['general', 'office', 'code', 'vision', 'debug', 'analysis', 'html', 'reasoning'],
-      'sn-kimi-k3': ['general', 'office', 'code', 'vision', 'debug', 'analysis', 'html', 'reasoning'],
-      'sn-glm-5-3-flash': ['general', 'chat', 'rewrite', 'summary', 'fast'],
-      'sn-deepseek-v4-1-flash': ['general', 'code', 'html', 'analysis', 'reasoning', 'auto'],
-    }
+  it('兜底表的图片能力与远端判定逐条一致', () => {
     for (const model of RACCOON.fallbackModels) {
-      const tags = REMOTE_TAGS[model.id]
-      expect(tags, `缺少 ${model.id} 的实测 tags`).toBeDefined()
       expect(
-        raccoonSupportsImage(model.id, tags!),
+        raccoonSupportsImage(model.id),
         `${model.id}：兜底表(${model.supportsImage}) 与远端判定不一致`,
       ).toBe(model.supportsImage)
     }

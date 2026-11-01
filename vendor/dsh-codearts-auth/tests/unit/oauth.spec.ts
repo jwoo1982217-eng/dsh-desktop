@@ -112,6 +112,47 @@ describe('requestToken / exchangeAuthorizationCode', () => {
       .rejects.toBeInstanceOf(RefreshTokenExpiredError)
   })
 
+  /**
+   * ★ **STS5.1806 必须是终态**（2026-10-27 实测事故）。
+   *
+   * 华为 STS 的 refresh_token 一次性轮换，被兑换过就永久作废，回
+   * `{"error_code":"STS5.1806","error_msg":"invalid refresh token: 'the refresh
+   * token has been used'"}`。把它当普通错误（非终态）的后果是：
+   * `refreshAll` 不写 `refreshable:false`，而另一条终态判据要求「本地 exp 已过」
+   * ——该账号 exp 还剩 29 天 ⇒ 两条都不成立 ⇒ 池内 `refreshable` 永远停在 true，
+   * 面板照常显示「自动续期」，实际每 30 分钟静默失败一次，直到用户主动查询
+   * 才看到 `HTTP 400 APIG.0602`。
+   *
+   * ⚠️⚠️ **两条腿必须各用一条用例、且报文措辞互不重叠**（反向验证实测）：
+   * 首版把真实报文同时喂给两条腿，删掉 `error_code` 那条后测试**仍然全绿** ——
+   * msg 兜底把它完全遮住，于是「一条腿被删」在测试里不可见。现在：
+   * - error_code 腿：msg 用**不含 `has been used`** 的措辞；
+   * - msg 腿：故意**不带** error_code（模拟上游改字段名）。
+   * 这样删任一条腿都会让对应用例变红（已实测）。
+   */
+  it('★ STS5.1806 error_code 是终态（msg 措辞不含兜底关键字，避免遮盖本腿）', async () => {
+    const fetcher = vi.fn(async () =>
+      new Response(JSON.stringify({
+        error_code: 'STS5.1806',
+        // ⚠️ 刻意不含 "has been used"，否则 msg 那条腿会兜住，本腿被删也不变红。
+        error_msg: 'invalid refresh token',
+      }), { status: 400 }))
+    const pair = await generateDpopKeyPair()
+    await expect(exchangeRefreshToken('RT', 'VERIFIER', pair, fetcher as unknown as typeof fetch))
+      .rejects.toBeInstanceOf(RefreshTokenExpiredError)
+  })
+
+  it('★ 仅凭 error_msg 的「refresh token has been used」也归终态（字段名变更兜底）', async () => {
+    const fetcher = vi.fn(async () =>
+      new Response(JSON.stringify({
+        // 刻意不给 error_code —— 模拟上游改了错误码字段名
+        error_msg: 'invalid refresh token: the refresh token has been used',
+      }), { status: 400 }))
+    const pair = await generateDpopKeyPair()
+    await expect(exchangeRefreshToken('RT', 'VERIFIER', pair, fetcher as unknown as typeof fetch))
+      .rejects.toBeInstanceOf(RefreshTokenExpiredError)
+  })
+
   it('throws a plain Error on other failures', async () => {
     const fetcher = vi.fn(async () => new Response('boom', { status: 500 }))
     const pair = await generateDpopKeyPair()

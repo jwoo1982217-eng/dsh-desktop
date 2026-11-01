@@ -24,6 +24,7 @@ export interface BuddyLoginFlowResult {
 }
 /** runBuddyLoginFlow 接受的选项。 */
 export interface BuddyLoginFlowOptions {
+    signal?: AbortSignal;
     /** 使用的 fetch 实现；默认为全局 fetch。 */
     fetcher?: typeof fetch;
     /** 在浏览器中打开登录 URL；默认使用平台打开器。 */

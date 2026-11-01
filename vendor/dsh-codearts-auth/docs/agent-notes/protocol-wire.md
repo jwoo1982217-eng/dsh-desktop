@@ -629,6 +629,9 @@ const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<…>)
 - **账户类型检测**：`package.is_credit_package === true` 即积分账户（文档要求「已升级到积分计费模式」）。领取第一步就判它，非积分账户回 `inactive` 而非 `failed`
 - **幂等**：本协议无幂等键、无「今天已签到」业务码，唯一保护是活动列表的 `claimable` / `status` 预检（`status` ∈ {CLAIMED, CONFIRMED, CONSUMED} → `already-claimed`）
 - ⚠️ **`refresh_token` 一次性轮换**：用一次即作废（`STS5.1806 the refresh token has been used`）。任何刷新都必须**立刻回写**新凭据；E2E 凭据读取（`tests/e2e/codearts-credential.ts`）**只读不刷新**
+- ⚠️⚠️ **`STS5.1806` 必须归终态**（2026-10-27 实测事故，`src/oauth.ts` 的 `requestToken`）。它是「一次性 token 已被消费」的专属码，重试一万次也还是同一报文。原先漏判的连锁后果：`refreshAll` 走非终态分支 ⇒ **不写 `refreshable:false`**；而另一条终态判据要求「本地 `refresh_token.exp` 已过」，该账号 exp 还剩 29 天 ⇒ 也不成立 ⇒ **池内 `refreshable` 永远停在 `true`**、面板照常显示「自动续期」，实际每 30 分钟静默失败，直到用户主动查积分才看到 `HTTP 400 APIG.0602`
+- ⚠️ **判据要带 `error_msg` 兜底**：真实报文 `error_code` 与 `error_msg` 都带，但上游若改字段名，`/refresh\s*token\s+has\s+been\s+used/i` 那条腿能接住（已由 `tests/unit/oauth.spec.ts` 的两条用例分别锁住）
+- ⚠️ **续期是否轮换的判据（实测踩过）**：看 `refresh_token` 的 `iat` 或 AK 是否变化；**不能用 `exp`** —— 华为 STS 的 `refresh_token.exp` **恒等于「登录时刻 + 30 天」且续期不延长它**，换新 token 后 exp 仍是原值
 - `statistics/plugin` 是**裸对象**响应（无 `{code,data}` 包装），而 `ops/*` 有 —— 解析必须兼容两种信封
 - ⚠️ **`/v1/ops/delivery` 的字段类型/名字与直觉不符**（实测 2026-09-18，两个坑叠加导致「1 个失败」）：
   - **`campaignId` 是数字**（`1`），不是字符串 → 必须用 `readIdentifier`（兼容数字/字符串），用只收字符串的 `readString` 会得到空串并判 `failed`「活动缺少 campaignId」
@@ -2698,3 +2701,29 @@ e2e：`tests/e2e/image-burst-cross-provider.e2e.spec.ts`（跨家探测 + 腾讯
 （两份实现必然漂移，是本仓库反复告诫的形状），而它两条独特断言
 （buddy 的 `CONTEXT_WINDOW_EXCEEDED` 归类、缩放后仍可辨认）都已搬过去，
 且现在两站都覆盖（原来只测 buddy，**workbuddy 从未被端到端验证过**）。
+
+---
+
+## ⚠️ 凭据入库登记（2026-10-21 敏感信息审计）
+
+审计用 `scripts/audit-repo-secrets.mjs`（真实凭据反查 + 形态扫描）确认：
+**入库文件里没有「意外泄漏的凭据」**（P0 的 233 条命中逐条核实后**全部是形态
+误报**），但有**两条真实凭据是仓库所有者主动决定入库的**。登记在此，
+免得它们继续是「无人知晓的静默事实」。
+
+| 凭据 | 位置 | 性质 | 决定 |
+|---|---|---|---|
+| 讯飞 Loomy `AccessKeySecret`（+ `AccessKeyId`） | `src/loomy-product.ts:341-342` | 从 Loomy 客户端 `resources/.env.prod` **解密提取**的凭据本体；`src/loomy-sign.ts:135` 用它做 HMAC-SHA1 签名发往 `account.xfinfr.com` | **仓库所有者已明确决定明文入库**（决策记录在本地 `docs/loomy-protocol-notes.md`，该文件已 gitignore）。安全边界：只用于讯飞**账号**端点（短信/微信登录），与推理端点无关；讯飞官方自身也是「随客户端分发 + AES 混淆」。⚠️ **它仍在公开仓库里可检索** —— 若要收回，改为运行时从本机解密读取（代价：未装 Loomy 桌面端就不能登录） |
+| Cline WorkOS `refresh_token`（+ `account_id` / 邮箱） | `tests/unit/cline-adapter.spec.ts` 等 6 个文件 | 真实抓取值（24 位无字典词随机串），注释自承「实测凭据形态」 | ⚠️ **建议轮换**（用户侧），并把 6 处换成构造样例。⚠️ 关联的邮箱是**仓库所有者自己的**（值见 `tests/unit/cline-adapter.spec.ts`，此处不复述 —— 文档里再写一遍等于把它抄进第二处） |
+
+⚠️ **守卫的覆盖缺口**（本次一并修好，见 `tests/unit/repo-pii-guard.spec.ts`）：
+- 原守卫**豁免整个 `tests/`** ⇒ 上面第二条（在 `tests/` 里）抓不到；
+- 原守卫只拦「完整 11 位手机号」与「邮箱」⇒ 上面两条**都抓不到**
+  （它们既不是手机号也不是邮箱）；
+- ⇒ 现补四条判据：**PEM 私钥** / **`sk-` 密钥** / **JWT** /
+  **「凭据字段名 + 高熵字面量」**（最后这条是**唯一**能抓到上面两条的判据）。
+  凭据类判据**连 `tests/` 一起扫**（手机号/邮箱仍豁免 —— 它们是断言输入）。
+
+⚠️ 上面两条**已逐条登记进白名单**（`CREDENTIAL_CONSTRUCTOR_SAMPLES`）——
+白名单是**逐条列出**的（不用「含 test 字样就放过」这类启发式）⇒ 将来任何
+**新的**真实凭据都会当场变红。

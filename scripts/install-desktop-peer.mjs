@@ -36,7 +36,7 @@ export async function installDesktopPeer(profile, modules) {
   let old = false, installed = false;
   try {
     await mkdir(staging, { mode: 0o700 });
-    const files = ['package.json', 'cordis.patch.yml', 'index.mjs', 'protocol.mjs', 'relay.mjs', 'tunnel.mjs', 'proxy.mjs', 'ui-reuse.mjs', 'browser-session.mjs', 'config-sync.mjs', 'page.html'];
+    const files = ['package.json', 'cordis.patch.yml', 'index.mjs', 'protocol.mjs', 'relay.mjs', 'tunnel.mjs', 'lan-link.mjs', 'lan-network.mjs', 'transport-proxy.mjs', 'remote-service.mjs', 'proxy.mjs', 'ui-reuse.mjs', 'browser-session.mjs', 'config-sync.mjs', 'model-catalog-availability.mjs', 'page.html'];
     for (const name of files) await cp(path.join(root, 'peer', name), path.join(staging, name));
     await cp(path.join(root, 'peer/vendor'), path.join(staging, 'vendor'), { recursive: true });
     await cp(path.join(root, 'peer/agent-cards'), path.join(staging, 'agent-cards'), { recursive: true });

@@ -540,7 +540,7 @@ describe('积分余额查询', () => {
     await fetchCreditBalance(makeCredential(), CODEBUDDY, fetcher)
     await fetchCreditBalance(makeCredential(), WORKBUDDY, fetcher)
 
-    expect(seen[0]).toBe('https://copilot.tencent.com/v2/billing/meter/get-user-resource')
+    expect(seen[0]).toBe('https://www.workbuddy.cn/v2/billing/meter/get-user-resource')
     expect(seen[1]).toBe('https://www.workbuddy.ai/v2/billing/meter/get-user-resource')
   })
 

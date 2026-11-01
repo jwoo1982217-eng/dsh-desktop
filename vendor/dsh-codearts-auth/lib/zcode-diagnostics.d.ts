@@ -200,6 +200,19 @@ export declare function hasZcodeUnusualActivity(body: string): boolean;
  */
 export declare function looksLikeZcodeHtmlPage(body: string): boolean;
 /**
+ * 响应是否来自**阿里云 ESA**（ZCode 的上游边缘 CDN）。
+ *
+ * ## 为什么抽成独立导出（2026-10-25，issue IKQ4B4）
+ *
+ * 这个判据原先**内联**在 {@link formatZcodeEdgePageHint} 里，而
+ * `describeUpstreamError` 需要区分「ESA 专属措辞」与「405 风控措辞」
+ * —— 两处都要用同一个判据。若在 `describeUpstreamError` 里再抄一份正则，
+ * 就是「同一语义两套判据」（本仓库红线），将来改一处必漏另一处。
+ *
+ * 特征：`data-spm` 是 ESA 的埋点属性名，`aliyuncs.com` 是它的资源域名。
+ */
+export declare function looksLikeZcodeEsaPage(body: string): boolean;
+/**
  * 边缘/CDN 错误页的**文案** —— 与 {@link looksLikeZcodeHtmlPage} 同源同批维护。
  *
  * ## 三条写作要求（都是被真实事故逼出来的）

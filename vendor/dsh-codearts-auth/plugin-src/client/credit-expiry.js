@@ -116,16 +116,70 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
    *      但**不**与倒计时并排显示 —— 那正是误导的来源。
    */
   let earliestExpiringAmount = 0;
+  /**
+   * **独立池**的剩余量（`> 0` 时才填）。
+   *
+   * ⚠️ 为什么单独摘出来（2026-10-21 用户报障「没标注星火专属」）：
+   *    本家（AStudio）服务端给**两个互不相通**的池 —— 主池（会员/购买/赠送）
+   *    与星火池。星火那 25000 混进 `permanent` 桶后，主行只显示「永久 25000」，
+   *    用户会以为那是**能随便用的通用积分**，而它其实只能用于特定场景。
+   *    「能不能通用」这个信息只存在于**池名**里（`buildAstudioBalance` 起的名字
+   *    就叫「星火积分（独立池，不参与主池合计）」），而分桶按金额聚合、天然丢池名。
+   *
+   * ⚠️ 判据是**池名含「独立池」**，不是 provider 白名单：那个名字由
+   *    `src/astudio-credits.ts` 单一持有（上游自己写明了「不参与主池合计」），
+   *    认名字就不必为本仓每一种多池渠道各加一个分支。
+   */
+  let exclusivePoolRemaining = 0;
   for (const pkg of packages) {
     // 失效包跳过：服务端仍会返回它的余额，但那部分扣不到。
     if (!pkg || pkg.active !== true) continue;
     const remaining = Number(pkg.remaining);
     if (!Number.isFinite(remaining) || remaining <= 0) continue;
-    const end = Number(pkg.deductionEndTime);
-    const known = Number.isFinite(end) && end > 0;
+    // ⚠️⚠️ 必须走 {@link packageExpiryMs}（`deductionEndTime` > `expiredTime` 兜底），
+    //    不能直接读 `pkg.deductionEndTime` —— 本仓红线「同一语义不得两套判据」：
+    //    AStudio 的包**只给 `expiredTime`**（字符串，未归一化），直读会让全部包
+    //    落进 `permanent` 桶 ⇒ astudio 的分桶行整条不渲染（用户报障：
+    //    「25000 星火积分不显示」）。而 `formatPackageExpiry` / 包列表**排序**
+    //    早就走 packageExpiryMs，两边不一致会出现「显示说 11/01 到期、分桶说永久」。
+    // ⚠️ 独立池**先摘出再分桶**：它不参与三档中的任何一档（否则「永久 25000」
+    //    会被读成通用积分）。顺序必须在分桶之前 —— 摘出来后仍要 `continue`。
+    if (isExclusivePool(pkg)) {
+      exclusivePoolRemaining += remaining;
+      continue;
+    }
+    const end = packageExpiryMs(pkg);
+    const known = end !== null;
     if (!known) {
-      // 服务端没给到期时间 ⇒ 真·永久（保守方向：宁可少用，不可误烧长期积分）。
-      permanent += remaining;
+      /**
+       * 服务端没给到期时间 ⇒ 默认是**真·永久**（保守方向：宁可少用，
+       * 不可误烧长期积分）。
+       *
+       * ⚠️ **但 CodeArts 的赠送包是例外**（2026-10-20）：它没有逐笔到期
+       * 时刻，上游只在该分类 metric 上给一个「其中 N 即将到期」的标量。
+       * 那个标量被解析到 `pkg.expiringRemaining` ⇒ 拆开算：
+       *
+       * ```
+       * 临期桶 += expiringRemaining
+       * 永久桶 += remaining - expiringRemaining
+       * ```
+       *
+       * 不拆的话，那 25000 分（含 2000 快作废的）会整包进永久桶，卡片上
+       * 「永久 25000」与「另有 2000 即将到期」同时出现、互相矛盾
+       * （用户 2026-10-20 报障：「2000+500临期不应该是2500嘛」）。
+       *
+       * ⚠️ 这类包**没有倒计时**（上游不给日期，绝不编一个）⇒ 不参与
+       * `earliestExpiringAt` 的选取。
+       */
+      const expiringPart = Number(pkg.expiringRemaining);
+      const hasExpiring = Number.isFinite(expiringPart) && expiringPart > 0;
+      if (hasExpiring) {
+        const capped = Math.min(expiringPart, remaining);
+        expiring += capped;
+        permanent += remaining - capped;
+      } else {
+        permanent += remaining;
+      }
       continue;
     }
     if (end - at < windowMs) {
@@ -137,7 +191,6 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
       //    **整段倒计时消失**，尽管桶里还有一笔钱几天后作废。
       //    ⚠️ 可达性不是假设：TRAE 的 `active` 是**硬编码 true**
       //    （`trae-credits.ts`），压根不反映是否过期。
-      //    `trae-credits.ts`），压根不反映是否过期。
       //    方向：宁可少显示倒计时，不可显示一个错的。
       if (end > at && (earliestExpiringAt === null || end < earliestExpiringAt)) {
         // ⚠️ 出现**更早**的批次 ⇒ 该量取代之前的（两批不是同一批，不能相加）。
@@ -151,7 +204,7 @@ export function splitCreditsByExpiry(packages, windowDays, now) {
       longTerm += remaining;
     }
   }
-  return { expiring, longTerm, permanent, earliestExpiringAt, earliestExpiringAmount };
+  return { expiring, longTerm, permanent, earliestExpiringAt, earliestExpiringAmount, exclusivePoolRemaining };
 }
 
 /** 这个包属于哪一桶的中文标签（tooltip 前缀用）。 */
@@ -200,11 +253,9 @@ export function formatExpirySplitLine(split, format) {
   const expiring = split.expiring > 0 ? format(split.expiring) : null;
   if (permanent !== null) parts.push(`永久 ${permanent}`);
   if (longTerm !== null) parts.push(`长期 ${longTerm}`);
-  // ⚠️ 与 `expirySplitParts` 同口径：临期显示**最早那批**的量
-  //    （这条字符串版本不带倒计时，故仍用窗口内总额更合适 —— 它表达的是
-  //     「窗口内共有多少会作废」，不含「何时」）。
-  //    ⇒ 两者语义刻意不同：字符串版是「总量」（无时间承诺），
-  //      分段版是「最早那批」（与倒计时配对）。见 `expirySplitParts` 的注释。
+  // ⚠️ 临期显示**窗口内总额**（「窗口内共有多少会作废」）。
+  //    与 `expirySplitParts` 同口径 —— 两者都必须是总额，否则三档合计
+  //    不等于 `total`，用户一加就发现数字丢了（2026-10-21 报障）。
   if (expiring !== null) parts.push(`临期 ${expiring}`);
   return parts.length === 0 ? null : parts.join(' · ');
 }
@@ -229,7 +280,11 @@ export function expirySplitParts(split, format, now) {
   const parts = [];
   const permanent = split.permanent > 0 ? format(split.permanent) : null;
   const longTerm = split.longTerm > 0 ? format(split.longTerm) : null;
-  const expiring = split.expiring > 0 ? format(split.expiring) : null;
+  // ⚠️ 数值与格式化文本分成两个变量：临期段要用**数值**做比较
+  //    （`earliestAmount < expiringAmount`）。拿格式化后的字符串做 `<`
+  //    依赖隐式转换 —— 一旦 `format` 带上千分位（`"3,500"` → `NaN`）就静默出错。
+  const expiringAmount = split.expiring > 0 ? split.expiring : 0;
+  const expiring = expiringAmount > 0 ? format(expiringAmount) : null;
   if (permanent !== null) parts.push({ key: 'permanent', text: `永久 ${permanent}`, tone: 'ok' });
   if (longTerm !== null) parts.push({ key: 'longTerm', text: `长期 ${longTerm}`, tone: 'warn' });
   if (expiring !== null) {
@@ -237,20 +292,59 @@ export function expirySplitParts(split, format, now) {
     const countdown = typeof at === 'number' && Number.isFinite(at) && at > 0
       ? expiryCountdown(at, now)
       : '';
-    // ⚠️ **数字与倒计时必须指向同一批**（2026-10-20 用户报障修正）：
-    //    `split.expiring` 是窗口内**所有**临期批次之和，而倒计时指向最早那批
-    //    ⇒ 并排显示会误导成「这 X 会在倒计时后一起掉」。
-    //    故这里取 `earliestExpiringAmount`（最早那批的量）与倒计时配对。
-    // ⚠️ 回退方向：拿不到该量（老后端没回传）时退回 `expiring`（总额），
-    //    宁可数字偏大，不可不显示临期。
-    const shown = Number.isFinite(split.earliestExpiringAmount) && split.earliestExpiringAmount > 0
+    /**
+     * ★ **临期段的数字必须是 `expiring` 总额，不能只取「最早那批」**
+     *   （2026-10-21 用户报障：CodeArts 卡片显示
+     *   `积分 25500 / 永久 22000 · 临期 500（5 天 20 小时）`，
+     *   22000 + 500 = 22500 ≠ 25500，**差的 3000 在任何地方都没出现**）。
+     *
+     * ## 那个 3000 是什么
+     *
+     * 真实数据（`CODEARTS_ACCOUNT_A3294816`，`GET /snap-manager/v1/statistics/plugin`）：
+     *
+     * | 包 | remaining | `deductionEndTime` | `expiringRemaining` |
+     * |---|---|---|---|
+     * | 基础积分包 | 500 | 1793059200000（10-27） | — |
+     * | 赠送积分包 | 25000 | **无** | **3000** |
+     *
+     * ⇒ `expiring` = 500 + 3000 = **3500**，`permanent` = 25000 - 3000 = 22000，
+     *   合计 25500 = `total`（这是 `0dd86f8` 立的硬不变量）。
+     *
+     * 但 `earliestExpiringAmount` 只统计**带 `deductionEndTime`** 的那批
+     * （设计使然：它要与倒计时 `earliestExpiringAt` 配对），而赠送包那 3000
+     * **没有日期**、不参与倒计时 ⇒ 它没被算进去。
+     *
+     * ## 修复方向：数字用总额，倒计时降级成「其中」限定语
+     *
+     * 上一版为了修「临期 20856（4 天 20 小时）让用户以为全部同时到期」
+     * （2026-10-20 报障），直接把数字换成「最早那批」—— 这修了误读，
+     * 却**引入了数字丢失**：三档不再等于 `total`，用户一算就发现少了。
+     *
+     * ⇒ 两个约束同时满足的唯一形态：数字 = 总额（合计守恒），
+     *   倒计时明确限定它只覆盖其中一部分：
+     *
+     * ```
+     * 临期 3500（其中 500 于 5 天 20 小时后到期）   ← 混合批次
+     * 临期 3500（5 天 20 小时）                    ← 倒计时覆盖全部临期时
+     * 临期 3000                                    ← 全无日期（不编造倒计时）
+     * ```
+     *
+     * ⚠️ 「其中」只在**倒计时那批量 < 临期总额**时出现 —— 否则
+     *    「其中 3500 于…」里的「其中」是废话（它本来就是全部）。
+     */
+    const earliestAmount = Number.isFinite(split.earliestExpiringAmount) && split.earliestExpiringAmount > 0
       ? split.earliestExpiringAmount
-      : expiring;
+      : 0;
+    // 倒计时那批没覆盖全部临期（含「完全无日期的批次」）⇒ 必须限定。
+    const partial = earliestAmount > 0 && earliestAmount < expiringAmount;
+    const countdownText = countdown.length === 0
+      ? ''
+      : partial ? `其中 ${format(earliestAmount)} 于 ${countdown}后到期` : countdown;
     parts.push({
       key: 'expiring',
-      text: `临期 ${format(shown)}`,
+      text: `临期 ${expiring}`,
       tone: 'error',
-      ...(countdown.length > 0 ? { countdown } : {}),
+      ...(countdownText.length > 0 ? { countdown: countdownText } : {}),
     });
   }
   return parts;
@@ -395,6 +489,61 @@ export function formatNamedPoolLine(packages, format) {
 }
 
 /**
+ * 这个包是不是**独立池**（不参与主池合计）。
+ *
+ * ⚠️ 判据是池名含「独立池」—— 该名字由 `src/astudio-credits.ts` 的
+ * `buildAstudioBalance` 单一持有（上游原话「独立池，不参与主池合计」）。
+ * 认名字而不是 provider 白名单：将来别家也有独立池时，只要后端照这个口径
+ * 命名就自动生效，不必为每家加分支。
+ *
+ * @param pkg - 资源包。
+ * @returns 是独立池则为 `true`。
+ */
+export function isExclusivePool(pkg) {
+  const name = pkg && typeof pkg.name === 'string' ? pkg.name : '';
+  return name.includes('独立池');
+}
+
+/**
+ * 独立池的剩余量（`> 0` 时才值。
+ *
+ * ## ⚠⚠⚠ 为什么要单独抽出一个函数（2026-10-21 合并审计发现）
+ *
+ * * 三处同义（前端 `splitCreditsByExpiry`、设置页 `CreditBalanceRow`、
+ * *   徽标弹窗 `splitParts`）各写了一份独立池的汇总，而判据很接近但**不完全相同**：
+ * *   `split` 用 `pkg.active === true` 且跳过 `remaining <= 0`；
+ * *   两处渲染用 `pkg.active !== false`（一个 `undefined` 就算有效）且**不过滤负余额**
+ * *   （autoclaw 的冲正 / 退款会下发负数）。
+ * * 
+ * * ⚠ 实测：`packages: [{active:undefined, remaining:-5}, {active:true, remaining:100}]`
+ * *   → `split.exclusivePoolRemaining` = 100，而两处渲染的 reduce = 95 → **同一屏上两个数**。
+ * *
+ * * ⇒ 本函数是**唯一一份判据**；三处都调它 ⇒ 不可能再分开。
+ * *
+ * * ## 为什么不直接用 `split.exclusivePoolRemaining`
+ * *
+ * * `split` **可能为 `null`**（无 `windowDays` 时整体返回 `null`）⇒ 独立池段会整段不渲染。
+ * * ⇒ 独立池的显示**不应该被窗口天数带走** ⇒ 本函数独立计算。
+ * *
+ * * @param packages - `balance.packages`
+ * * @returns 独立池的剩余量（非正数归 0）。
+ * */
+export function exclusivePoolRemainingOf(packages) {
+  if (!Array.isArray(packages)) return 0;
+  let sum = 0;
+  for (const pkg of packages) {
+    // ⚠ 判据与 `splitCreditsByExpiry` 的循环**逐格同款**：
+    // `active === true`（不是 `!== false`）且 `remaining > 0`。
+    if (!pkg || pkg.active !== true) continue;
+    if (!isExclusivePool(pkg)) continue;
+    const remaining = Number(pkg.remaining);
+    if (!Number.isFinite(remaining) || remaining <= 0) continue;
+    sum += remaining;
+  }
+  return sum;
+}
+
+/**
  * 取出包的到期时刻（毫秒）；**拿不到返回 null**（= 没有到期概念）。
  *
  * ⚠️ 这是 `formatPackageExpiry` 与包列表**排序**共用的唯一判据来源 ——
@@ -402,6 +551,45 @@ export function formatNamedPoolLine(packages, format) {
  *
  * 来源优先序：`deductionEndTime`（毫秒，各 provider 后端已归一化）>
  * `expiredTime`（字符串，如 "2026-11-01 00:00:00"，给未归一化的包兜底）。
+ *
+ * ## ⚠️⚠️ **架构性缺口（2026-10-21 第二轮审计登记，未修）**：`expiredTime` 兜底**不认哨兵**
+ *
+ * `deductionEndTime` 那条由**各个后端**在写入前过滤永久哨兵（Qoder 的
+ * `isPermanentSentinelMs`、codearts 的「有 `deductionEndTime` 就不写 `expiredTime`」），
+ * 但**本函数自己的 `expiredTime` 兜底路径没有任何哨兵判据**。实测后果：
+ * ```
+ * { expiredTime: '9999-12-31T00:00:00.000Z' }
+ *   → packageExpiryMs    = 253402214400000
+ *   → formatPackageExpiry = "9999-12-31（2912150 天后）"
+ * ```
+ * 而**目前仍有多个渠道会把上游字符串原样透传到 `expiredTime`**（2026-10-21 全仓清点，
+ * `grep 'expiredTime:'` 后逐格判断「是否来自已归一的 `deductionEndTime`」）：
+ *
+ * | 来源 | 是否可能带哨兵 |
+ * |---|---|
+ * | `astudio-credits.ts` **星火池**（`readAstudioLocalTime(...)`） | ✅ 上游原样串 |
+ * | `lobsterai-credits.ts`（`expiredTime: expiresAt`） | ✅ 上游原样串 |
+ * | `jet-hub-rpc.ts`（officeace 的 `group.expiresAt`） | ✅ 上游原样串 |
+ * | `provider-credits.ts` 两处（`bucket.expiresAt` / `result.expiresAt`） | ✅ 上游原样串 |
+ * | `codearts-credits.ts`（`new Date(deductionEndTime).toISOString()`） | ❌ 从已过滤的 `deductionEndTime` 反推 |
+ * | `minimax-credits.ts`（`new Date(expires).toISOString()`） | ❌ 同理（`expire_at_ms` 非哨兵形态） |
+ * | `qoder-credits.ts`（`expIsPermanent ? '' : raw`） | ❌ 已在本轮修复时过滤 |
+ *
+ * ⚠️ **初版这段注释只写了「两个渠道」**（astudio / lobsterai），那是**漏数** ——
+ * 只看了 `src/*-credits.ts`，漏掉了 `jet-hub-rpc.ts` 与 `provider-credits.ts`。
+ * 「数一遍」必须覆盖**全仓**，不能只看命名符合直觉的那些文件。
+ *
+ * **当前是否可达**：**不可达** —— 上述上游实测都**不发** 9999 哨兵
+ *（astudio 的 `*NextExpireTime` 实测形如 `"2026-11-20T01:50:14"`；
+ * lobsterai / officeace 的 `expiresAt` 实测是当年的 ISO 串）。
+ * 所以这是**前向防御缺口**，不是现存缺陷（如实标注，不夸大）。
+ *
+ * **为什么现在不改本函数**：它是**所有 provider 共用**的显示判据（不只是
+ * `usesExpiryWindow` 那 13 家 —— 任何带 `expiredTime` 的包都会走到这里），
+ * 在这里加「年份 >= 9999 就当没有到期」会**改变全部渠道**的展示语义，
+ * 且那种「遥远处到期」在别的渠道可能是**真实**的。正确修法是**在写
+ * `expiredTime` 的那几个调用点各自过滤**（与 Qoder 的 `isPermanentSentinelMs`
+ * 同型 —— 一份判据、多个入口）。已登记，待上游取证后处理。
  *
  * @param pkg - 资源包。
  * @returns 毫秒时间戳；`null` = 没有到期时间（显示「长期」）。
@@ -423,8 +611,14 @@ export function packageExpiryMs(pkg) {
  * ⚠️ 到期时间取自 {@link packageExpiryMs}（与排序同一判据）。
  *
  * ⚠️ 「长期」的判据是**服务端没给任何到期字段**。Qoder 的套餐额度/资源包
- * 就没有独立到期（统一"领取后 30 天"是活动规则而非包字段），显示"长期"
- * 比编造一个错误日期好。
+ * 就是这种情形 —— 显示"长期"比编造一个错误日期好。
+ *
+ * ⚠️ **`qoderUsage.expiresAt` 不算「给了到期字段」**（2026-10-20 真机取证订正）：
+ * 那个字段确实在 `userQuota` 那一层存在，但个人版实测恒为永久哨兵
+ * `253402214400000`（= `9999-12-31`）。若把它透出成 `deductionEndTime`，
+ * 本函数会渲染成「9999-12-31（约 2900000 天后）」—— 也就是说**闸门在
+ * `null` 这一侧**：哨兵必须被后端挡掉、不写进 `deductionEndTime`，
+ * 才轮到这里正确地显示「长期」。两条判据缺一不可。
  */
 export function formatPackageExpiry(pkg, now) {
   const end = packageExpiryMs(pkg);

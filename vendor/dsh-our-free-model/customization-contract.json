@@ -1,0 +1,202 @@
+{
+  "format": 1,
+  "id": "dsh-owner-managed-channels-mobile-v1",
+  "requiredProviders": [
+    "codearts",
+    "buddy",
+    "workbuddy",
+    "lobsterai",
+    "qoder",
+    "qodercn",
+    "trae",
+    "cline",
+    "loomy",
+    "raccoon",
+    "zcode",
+    "minimax",
+    "minimaxintl",
+    "gemini",
+    "officeace",
+    "accio",
+    "autoclaw",
+    "autoclawintl",
+    "modelscope",
+    "astudio",
+    "magicrew",
+    "codely",
+    "qiniu",
+    "orcaterm"
+  ],
+  "criticalFiles": {
+    "src/host-channels.js": "266be2ac2d5b16138d10bc96604d314977303ee6e9e8829eba6a545690224312",
+    "src/open-external.js": "5b5d9193b8bb0f4fd9a18218e2e2c2abfecf2ed0ab92b5675a7a83e2dede4cc5",
+    "src/customization-guard.js": "ce9c1731a0fc742e213987b56ee6c0d298a35888150024880a02f29cf7bd1cc7",
+    "client.js": "8adcd2ea74c596a0b08c36461123143e3b322434235bfb92ca14880bdf8daf7b",
+    "vendor/channel-pack/pack.js": "0a04a35051a8e8aa5b23314fc98680756383c92d1dcb43b6c0777d49d4967a9f"
+  },
+  "note": "Locally managed customization contract; not an official upstream release signature. Changes to pinned mobile/shared-backend interfaces require host review.",
+  "criticalSections": [
+    {
+      "file": "client.js",
+      "name": "useEacLogin",
+      "start": "    function useEacLogin(",
+      "end": "\n    }",
+      "sha256": "f3f0936f934d44b0a7c079b7b6876af6a8f8a4aaf456fd5cf6c90834dc136b7a"
+    },
+    {
+      "file": "client.js",
+      "name": "EacAuth",
+      "start": "    function EacAuth(",
+      "end": "\n    }",
+      "sha256": "aa66855e01bf701e49c609f33819c5634facaef48876cd8f5c1eaeabf1f9ee7b"
+    },
+    {
+      "file": "client.js",
+      "name": "useChannelRpc",
+      "start": "    function useChannelRpc(",
+      "end": "\n    }",
+      "sha256": "4b2cda2b671e4996d7f2233d13fad3a229e91e18bc5f390c00f924cd5fe25e6c"
+    },
+    {
+      "file": "client.js",
+      "name": "sharedPushSource",
+      "start": "    function sharedPushSource(",
+      "end": "\n    }",
+      "sha256": "14f228c068c8597547c8f7c8c250267cc0f6419ff4aa8b1d2557ca32b39b02ec"
+    },
+    {
+      "file": "index.js",
+      "name": "shared-channel-mount",
+      "start": "  let channelPack = { state: 'pending', error: '' }",
+      "end": "\n  const logAdmissionRejection",
+      "sha256": "60de1e4e10a1a88698660b242d89e29fb586a82e95d82973f4a3a582941fe192"
+    },
+    {
+      "file": "client.js",
+      "name": "ChannelCard",
+      "start": "    function ChannelCard(",
+      "end": "\n    }",
+      "sha256": "058b206035a33c89383760b3b39a6e1c809fcd8057918719d00c5b200ef68b69"
+    }
+  ],
+  "requiredCapabilities": [
+    {
+      "id": "shared-host-backend",
+      "checks": [
+        {
+          "file": "src/host-channels.js",
+          "markers": [
+            "mountHostChannels",
+            "mode: 'shared'"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "native-phone-login",
+      "checks": [
+        {
+          "file": "client.js",
+          "markers": [
+            "__dshOrcaTermLogin",
+            "__dshMagicrewLogin",
+            "dsh-phone://",
+            "astudioLoginMethod",
+            "autoclawMode"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "signed-instance-transport",
+      "checks": [
+        {
+          "file": "vendor/channel-pack/pack.js",
+          "markers": [
+            "withSignedRequestSignal",
+            "creditsTableRef",
+            "codeartsFetcher"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "account-queue-rotation",
+      "checks": [
+        {
+          "file": "vendor/channel-pack/pack.js",
+          "markers": [
+            "withQueueAccountRotation",
+            "checkQueuedResponse",
+            "onQueueAccountSwitch"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "token-saving-and-benchmarks",
+      "checks": [
+        {
+          "file": "src/token-saver.js",
+          "markers": [
+            "saverConfig"
+          ]
+        },
+        {
+          "file": "src/benchmark.js",
+          "markers": [
+            "runBenchmark"
+          ]
+        },
+        {
+          "file": "src/combos.js",
+          "markers": [
+            "comboChain"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "upstream-2.8-free-lane-shaping",
+      "checks": [
+        {
+          "file": "src/o2a.js",
+          "markers": [
+            "clientToolWireName"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "phone-account-save-and-cancel",
+      "checks": [
+        {
+          "file": "vendor/channel-pack/pack.js",
+          "markers": [
+            "pendingNativeLogins",
+            "login.cancel",
+            "importManualCredential",
+            "desktopCredentialImportAvailable"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "reviewed-host-sdk-peers",
+      "checks": [
+        {
+          "file": "package.json",
+          "markers": [
+            "0.2.1-alpha.1",
+            "0.2.1-alpha.4",
+            "^0.2.0-rc.1"
+          ]
+        }
+      ]
+    }
+  ],
+  "reviewedHostSdkVersions": [
+    "0.2.1-alpha.1",
+    "0.2.1-alpha.4"
+  ]
+}

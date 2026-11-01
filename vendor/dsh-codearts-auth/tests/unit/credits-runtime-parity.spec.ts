@@ -417,8 +417,25 @@ describe('★ windowDays 由 registry 的 usesExpiryWindow 驱动（不是「是
     //    数据源，真机取证 28/28 带值且守恒），批次包归一化到 `deductionEndTime`。
     // ⚠️ autoclawintl 2026-10-20 加入：与 autoclaw **同源**（同一份 credits 实现），
     //    实测国际站批次同样带 `deductionEndTime`（3000→10/21、10000→10/27）。
+    // ⚠️ codearts 2026-10-20 加入（PR !123）：**只有基础积分包**带
+    //    `deductionEndTime`（取自套餐周期 `end_date`）；赠送/按需包没有逐包到期
+    //    字段，走 `expiringTotal` 聚合提示。它**不**开 `permanentLock`。
+    // ⚠️ qoder / qodercn 2026-10-20 加入：`/sash/api/v2/me/usage` 的
+    //    `usage.expiresAt` 是**永久哨兵**（`253402214400000` = `9999-12-31`）时
+    //    **不写** `deductionEndTime`（未知到期 ⇒ 落永久桶）；真实时间戳才写。
+    //    ⚠️ `addOnQuota` 只给聚合标量、**任何日期字段都没有** ⇒ 恒落永久桶。
     const withWindow = PROVIDER_REGISTRY.filter((d) => d.usesExpiryWindow === true).map((d) => d.id).sort()
-    expect(withWindow).toEqual(['autoclaw', 'autoclawintl', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
+    // ⚠️ astudio 2026-10-20 加入：`/points/balance` 的 member / buy / activity
+    //    三池各带 `*NextExpireTime`（不带时区的本地时间串），由
+    //    `astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到 `deductionEndTime`。
+    // ⚠️ minimax / minimaxintl 2026-10-20 加入：`/minimax-cloud/api/v1/credit/details`
+    //    的每条 `details[]` 带 `expire_at_ms`（**毫秒时间戳**，无需换算），
+    //    直接写进 `deductionEndTime` —— 与 astudio 那条的形态差异是本条的价值所在
+    //    （两种输入形态都能落进同一个分桶判据）。
+    expect(withWindow).toEqual([
+      'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'codearts', 'lobsterai',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
+    ])
   })
 })
 
@@ -460,7 +477,79 @@ describe('特例的**优先级**：必须在查表之前短路', () => {
     expect(row.balance?.total, 'qoder 走了 credits 表 —— 特例没有短路').not.toBe(9999)
     // 查不到时**带原因**，不显示成 0（与其它 provider 同约定）。
     expect(row.balance).toBeNull()
-    expect(row.error).toBe('积分查询失败（凭据失效或响应异常）')
+    // ⚠️ 2026-10-21 改：原断言是把文案写死成
+    //    「积分查询失败（凭据失效或响应异常）」。那句文案**本身就是缺陷**——
+    //    它把「网络出不去 / 401 / 服务端 5xx / 企业版无数字」四种完全不同的
+    //    处境压成一句，用户据此只能做错事（反复重新登录）。
+    //    现在 qoder 分支改用带原因的 `fetchQoderBalanceDetailed`，故改判：
+    //    ① 必须**带状态码**（本例是 404）② 不许再是那句把原因抹平的话。
+    expect(row.error).toContain('404')
+    expect(row.error, '不得退回「凭据失效或响应异常」这种无信息量的统一话术')
+      .not.toBe('积分查询失败（凭据失效或响应异常）')
+  })
+
+  /**
+   * ⚠️⚠️ **qoder 多账号余额必须并发查询**（2026-10-21 报障「一直读取中」）。
+   *
+   * ## 这条用例守的是一个**耗时**属性，不是文案
+   *
+   * 原实现 `for (const account of accounts) { await fetchBalanceDetailed(...) }`
+   * 是**串行**：墙外时单账号 10.7s 才失败（undici 的 connect timeout 先于
+   * `AbortSignal.timeout(15s)`），两个账号 **22s**；前端 `callManagementRpc`
+   * 不设超时 ⇒ 整段时间面板只显示「读取中…」。
+   *
+   * ## 为什么用「窗口内完成」而不是量总毫秒
+   *
+   * 直接断言 `elapsed < 15s` 在慢 CI 上会 flaky。这里让**每个账号的 fetch
+   * 各挂 200ms**，断言「3 个账号总共 < 400ms」——既是并发（串行至少 600ms）、
+   * 又留了一倍余量，不依赖机器快慢。
+   *
+   * ⚠️ 顺带守住**失败隔离**与**输出顺序**：并发改造最容易踩的两个坑。
+   */
+  it('★★ qoder 多账号余额必须并发查询（串行 = 面板「一直读取中」22 秒）', async () => {
+    const { call, pool, credentials } = makeRpc()
+    await seed(pool, 'qoder', 'q-a', 'QODER_ACCOUNT_A')
+    await seed(pool, 'qoder', 'q-b', 'QODER_ACCOUNT_B')
+    await seed(pool, 'qoder', 'q-c', 'QODER_ACCOUNT_C')
+    for (const ref of ['QODER_ACCOUNT_A', 'QODER_ACCOUNT_B', 'QODER_ACCOUNT_C']) {
+      await credentials.set(ref, JSON.stringify({ access_token: `AT-${ref}` }))
+    }
+    /** 每个账号的响应延迟（串行 ⇒ 总和 600ms；并发 ⇒ 约 200ms）。 */
+    const PER_ACCOUNT_MS = 200
+    vi.stubGlobal('fetch', async (_input: string | URL | Request, init?: RequestInit) => {
+      await new Promise((resolve) => setTimeout(resolve, PER_ACCOUNT_MS))
+      // ⚠️ 鉴权头在**第二参**（`fetch(url, { headers })`），不在 URL 上。
+      // ⚠️ b 号故意 401：既验失败隔离（不连累 a/c），也验原因分档。
+      const headers = (init?.headers ?? {}) as Record<string, string>
+      if (headers.Authorization === 'Bearer AT-QODER_ACCOUNT_B') {
+        return new Response('unauthorized', { status: 401 })
+      }
+      return new Response(JSON.stringify({
+        displayMode: 'qoder',
+        qoderUsage: {
+          expiresAt: 253402214400000,
+          userQuota: { total: 0, used: 0, remaining: 0, unit: 'credits' },
+          addOnQuota: { total: 100, used: 0, remaining: 100, unit: 'credits' },
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+
+    const startedAt = Date.now()
+    const result = await call('credits.balances', { provider: 'qoder' })
+    const elapsed = Date.now() - startedAt
+
+    expect(result.ok).toBe(true)
+    // 并发判据：3 × 200ms 串行 = 600ms；并发应约 200ms。400ms 是留一倍余量的阈值。
+    expect(elapsed, `3 个账号查询耗时 ${elapsed}ms —— 串行会 ≥600ms`).toBeLessThan(400)
+    // 失败隔离：b 号失败不影响 a/c。
+    const rows = result.value.accounts as Array<{ accountId: string; balance: { total: number } | null; error?: string }>
+    expect(rows.map((r) => r.accountId), '输出顺序必须与账号池顺序一致').toEqual(['q-a', 'q-b', 'q-c'])
+    expect(rows[0]!.balance?.total).toBe(100)
+    expect(rows[1]!.balance).toBeNull()
+    expect(rows[2]!.balance?.total).toBe(100)
+    // 原因分档：401 指向「重新登录」，不是代理，也不是抹平话术。
+    expect(rows[1]!.error).toContain('401')
+    expect(rows[1]!.error).not.toContain('HTTPS_PROXY')
   })
 })
 
@@ -508,10 +597,15 @@ const BALANCE_PATH_OF: Readonly<Record<string, string>> = {
   //    （主机由 `AUTOCLAW_INTL.apiBase` 决定）。实测 2026-10-20：
   //    国际站该路径返回 `code=0`、`total_balance=13000`。
   autoclawintl: '/agent-assetmgr/api/v2/wallets',
+  // ⚠️ 超级麦吉（Magicrew，2026-10-29）：`GET /api/v1/model-gateway/tokens`（`MAGICREW_POINTS_PATH`）。
+  magicrew: '/api/v1/quota/points/total',
   // ⚠️ **本 fork 独有**（魔搭，2026-10-17）：魔粒余额端点。
   //    ⚠️ 只写**路径片段**（与本表其余项同口径）：域名在 product 的 `balanceUrl`
   //    里，而它**刻意不是** `baseUrl` 那个 host（见 modelscope-product.ts 的字段注释）。
   modelscope: '/openapi/v1/magicubes/balance',
+  // ⚠️ **本 fork 独有**（Codely/Unity，2026-10-19）：积分余额端点（真凭据实测 200，
+  //    `remaining_points` 是字符串；同域 /api/user/info 等候选均已 404）。
+  codely: '/api/user/usage/summary',
 }
 
 /**
@@ -536,6 +630,11 @@ describe('★★ 逐家余额都走自己的上游端点（源码文本断言的
     zcode_jwt: 'jwt', device_mid: 'mid', app_version: '3.14.4',
     uid: 'uid-spec', user_id: 'uid-spec', machine_id: 'm-1',
     expires_at: '2099-01-01T00:00:00.000Z',
+    // ⚠️ 超级麦吉（Magicrew，2026-10-29）只认 `jwt` + `organizationCode` 两个字段
+    //    （其 `credits` 条目的 `fetchBalance` 在 jwt 缺失时会**早退不发请求**，
+    //    那是刻意的不浪费 —— 故共享 fixture 必须带上它们，否则本表那条
+    //    「余额请求打到自己端点」会对 magicrew 恒读过）。
+    jwt: 'j.w.t', organization_code: 'org1',
   })
 
   it('手写端点清单与 registry 逐项对齐（漏一家即红并点名）', () => {
@@ -598,7 +697,10 @@ describe('★★ 生产积分表的内容（源码文本断言的行为替代）
     //    `/openapi/v1/magicubes/balance`（带 API Key 返 200、随消耗下降）。
     // ⚠️ 2026-10-20 autoclawintl（AutoClaw 国际版，与国内同端点、只差主机）：16 → 17。
     //    ⚠️ 合并上游时**不要**改回 13。
-    expect(expected.length).toBe(17)
+    // ⚠️ 2026-10-19 **本 fork** 并入 codely（Unity，usage/summary）⇒ 15 → 16。
+    //    它是全仓首例 balance:true + channel:false（登录/余额均为自由函数，
+    //    无 auth 服务；runtime 守卫只查已注册 runtime，codely 被跳过）。
+    expect(expected.length).toBe(19)
     // ⚠️ **关键集合判据必须对「生产真正调用的那种形态」也成立**（2026-10-08 复审 C1）：
     //    上面那次是 `createProviderCredits()`（无 deps），而端点与 `index.ts` 调的
     //    都是 `createProviderCredits({ loomy, raccoon, zcode })`。deps 只应影响**实现**，

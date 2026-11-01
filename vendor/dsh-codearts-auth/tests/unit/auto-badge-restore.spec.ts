@@ -237,7 +237,7 @@ describe('★ 旧 auto 的徽标链路：宿主侧（上游 ba10f4f 回归的恢
      * ⇒ 原断言（位置参数形态）已不成立，改为断言命名对象形态。
      * 本 PR 的核心约定**未变**：auto 始终经 `modelAdapters` 按 id 传入、不占 auth 槽位。
      */
-    expect(INDEX).toMatch(/registerJetHubRpc\(ctx, pool, \{[\s\S]*?\}, modelAdapters\)/)
+    expect(INDEX).toMatch(/registerJetHubRpc\(ctx, pool, \{[\s\S]*?\}, modelAdapters, \{ codeartsFetcher: signedNetwork\.fetch, balanceCache \}\)/)
   })
 
   it('★ autoState 由适配器自己提供（调用方拿不到「new 一个」的机会）', () => {
@@ -297,7 +297,7 @@ describe('★ 旧 auto 的徽标链路：宿主侧（上游 ba10f4f 回归的恢
      * ⇒ 原断言（位置参数形态）已不成立，改为断言命名对象形态。
      * 本 PR 的核心约定**未变**：auto 始终经 `modelAdapters` 按 id 传入、不占 auth 槽位。
      */
-    expect(INDEX).toMatch(/registerJetHubRpc\(ctx, pool, \{[\s\S]*?\}, modelAdapters\)/)
+    expect(INDEX).toMatch(/registerJetHubRpc\(ctx, pool, \{[\s\S]*?\}, modelAdapters, \{ codeartsFetcher: signedNetwork\.fetch, balanceCache \}\)/)
   })
 
   it('★ autoState 由适配器自己提供（调用方拿不到「new 一个」的机会）', () => {

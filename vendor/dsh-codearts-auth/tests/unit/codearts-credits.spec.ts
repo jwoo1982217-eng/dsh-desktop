@@ -19,10 +19,10 @@ import type { CodeArtsCredential } from '../../src/types.js'
  *
  * 1. **两种响应信封**：`ops/*` 是 `{code,message,data}`，而 `statistics/plugin`
  *    是**裸对象**。只支持其中一种会让另一端点恒判失败。
- * 2. **账户类型门控**：Token 计费账户必须判为 `inactive` 而不是 `failed`
- *    —— 前者是正常业务状态，后者会让用户去排查并不存在的故障。
- * 3. **幂等预检**：本协议没有幂等键、也没有「今天已签到」业务码，
- *    唯一的保护就是 `claimable` / `status` 预检；漏了会重复发领取请求。
+ * 2. **账户类型不是门禁**：`is_credit_package=false` 的体验版账号实测照样能签到
+ *    （活动列表说了算）；账户类型只用来修饰「没有可领取活动」时的文案。
+ * 3. **幂等**：`claimable` / `status` 预检 + 服务端重复领取业务码 `40001`
+ *    都要判成「今天已领取」，不能报 failed。
  */
 
 const CREDENTIAL: CodeArtsCredential = {
@@ -54,6 +54,8 @@ function packageInfoBody(options: {
   isCredit?: boolean
   isToken?: boolean
   metrics?: unknown[]
+  /** 套餐周期结束日（顶层 `end_date`，纯日期）。省略则不带该字段。 */
+  endDate?: string
 } = {}): Record<string, unknown> {
   return {
     package: {
@@ -64,6 +66,7 @@ function packageInfoBody(options: {
       is_credit_package: options.isCredit ?? true,
       is_token_package: options.isToken ?? false,
     },
+    ...options.endDate === undefined ? {} : { end_date: options.endDate },
     metrics: options.metrics ?? [
       { name: 'usageTotalPackageCredit', package_credit_amount: 5000, package_credit_used: 1200, package_credit_remain: 3800 },
       { name: 'usageBasicPackageCredit', package_credit_amount: 3000, package_credit_used: 1200, package_credit_remain: 1800 },
@@ -129,6 +132,332 @@ describe('fetchCodeArtsAccountInfo（账户类型检测）', () => {
     }))
     const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
     expect(info?.credit).toBeUndefined()
+  })
+
+  /**
+   * ## 「即将到期」额度（`package_credit_expiring_amount`）
+   *
+   * 用户 2026-10-20 报障（附华为云「套餐及积分包」网页截图）：
+   * 「CodeArts 积分也有到期时间，也应当有三档分档与永久锁功能」。
+   *
+   * **实测结论：做不出三档分档**。`statistics/plugin` 只下发一个**聚合标量**
+   * `package_credit_expiring_amount`，不说哪几笔、不说哪天到期：
+   *
+   * ```
+   * {"name":"usageTotalPackageCredit","package_credit_amount":25500,
+   *  "package_credit_remain":25500,"package_credit_expiring_amount":2000}
+   * {"name":"usageBonusPackageCredit","package_credit_amount":25000,
+   *  "package_credit_remain":25000,"package_credit_expiring_amount":2000}
+   * ```
+   *
+   * 逐包/逐笔端点在上游**不存在**：探了 85+ 个候选路径全 404，且解包
+   * `D:\CodeArts\resources\app.asar` 后全量枚举只有 27 条 `/v1/*` 路径，
+   * 其中唯一的积分端点是 `/v1/ops/credit/usage?type=msg|session`，
+   * 返回 `{credits, cacheHitRatio}` —— 是**单次对话消耗**，不是余额明细。
+   *
+   * ⇒ 只如实透出这个标量（`expiringTotal`），**不**伪造 `deductionEndTime`
+   * 去凑三档。下面三条用例把这三个边界钉死。
+   */
+  describe('即将到期额度（expiringTotal）', () => {
+    it('取总额 metric 上的标量，不累加分类（否则凭空翻倍）', async () => {
+      // 实测真实响应：总额与赠送**同时**带 2000。累加会得到 4000。
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 25500, package_credit_used: 0, package_credit_remain: 25500, package_credit_expiring_amount: 2000 },
+            { name: 'usageBasicPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 25000, package_credit_used: 0, package_credit_remain: 25000, package_credit_expiring_amount: 2000 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      expect(info?.credit?.expiringTotal, '只能取一次总额 metric 上的值').toBe(2000)
+      expect(info?.credit?.total).toBe(25500)
+    })
+
+    it('缺失该字段时 expiringTotal 为 undefined（≠ 0）', async () => {
+      // 基础包/按需包都没有这个键；没有它 = 上游没给这个口径，
+      // 而不是「有 0 分即将到期」。混用会让界面多出一句「0 即将到期」。
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      expect(info?.credit?.expiringTotal).toBeUndefined()
+      expect(info?.credit?.total).toBe(500)
+    })
+
+    it('值为 0 时也不写该字段（无临期额度与无此口径等价呈现）', async () => {
+      // 实测第二个账号：expiring=0 且总额/赠送都在。
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 6500, package_credit_used: 0, package_credit_remain: 6500, package_credit_expiring_amount: 0 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 6000, package_credit_used: 0, package_credit_remain: 6000, package_credit_expiring_amount: 0 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      expect(info?.credit?.expiringTotal).toBeUndefined()
+    })
+
+    it('★ 绝不伪造 deductionEndTime 去凑三档分档', async () => {
+      // 这是本改动的**核心约束**：三档分档（永久/长期/临期）与「锁定永久积分」
+      // 都读 `packages[].deductionEndTime`。上游不给逐包到期时刻 ⇒ 该字段必须
+      // 保持 undefined（= 到期时间未知 ⇒ 落永久桶），而不是拿套餐 end_date
+      // 或「即将到期」标量去编一个日期。编了会让永久锁按假日期做决策。
+      //
+      // ⚠️ 2026-10-20 更新：**基础积分包**现在**合法地**带 `deductionEndTime`
+      //    （取自套餐周期 `end_date`，那是真实存在的到期时刻）。故断言改为
+      //    「只有基础包有，赠送/按需包没有」。
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          endDate: '2026-10-27',
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 25500, package_credit_used: 0, package_credit_remain: 25500, package_credit_expiring_amount: 2000 },
+            { name: 'usageBasicPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 25000, package_credit_used: 0, package_credit_remain: 25000, package_credit_expiring_amount: 2000 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      const packages = info?.credit?.packages ?? []
+      expect(packages.length).toBeGreaterThan(0)
+      for (const pkg of packages) {
+        if (pkg.name === '基础积分包') {
+          expect(pkg.deductionEndTime, '基础包随套餐周期到期，应有确切时刻').toBe(Date.parse('2026-10-27'))
+          expect(pkg.expiredTime, '基础包的 expiredTime 应与 deductionEndTime 同源').toBe('2026-10-27T00:00:00.000Z')
+        } else {
+          expect(pkg.deductionEndTime, `${pkg.name} 不得有编造的到期时间`).toBeUndefined()
+          expect(pkg.expiredTime, `${pkg.name} 的 expiredTime 应为空串`).toBe('')
+        }
+      }
+    })
+  })
+
+  /**
+   * ## ★ 赠送包的「即将到期」拆到包上（`expiringRemaining`）
+   *
+   * 用户 2026-10-20 报障（逐字）：`2000+500临期不应该是2500嘛`。
+   *
+   * 报障前的实现：把 2000 只放在 `CreditBalance.expiringTotal`，分档仍把
+   * 赠送包整包 25000 算进永久桶 ⇒ 卡片显示「永久 25000 · 临期 500」
+   * 旁边再补一句「另有 2000 即将到期」，三个数字互相矛盾。
+   *
+   * 正确做法：拆到包上 —— 临期桶 += `expiringRemaining`，
+   * 永久桶 += `remaining - expiringRemaining` ⇒ 临期 = 500 + 2000 = 2500。
+   *
+   * ⚠️ 实测依据：`总额 expiring - 赠送 expiring = 0` ⇒ 总额那个标量
+   * 就是各分类之和，逐包读取不会重复计数。
+   */
+  describe('赠送包即将到期额度（expiringRemaining）', () => {
+    it('★ 赠送包带上自己那部分 expiring（基础包不带 —— 它已有真实时刻）', async () => {
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          endDate: '2026-10-27',
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 25500, package_credit_used: 0, package_credit_remain: 25500, package_credit_expiring_amount: 2000 },
+            { name: 'usageBasicPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 25000, package_credit_used: 0, package_credit_remain: 25000, package_credit_expiring_amount: 2000 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      const byName = new Map((info?.credit?.packages ?? []).map((p) => [p.name, p]))
+      expect(byName.get('赠送积分包')?.expiringRemaining).toBe(2000)
+      expect(byName.get('基础积分包')?.expiringRemaining, '基础包有真实到期时刻，不该再读标量').toBeUndefined()
+      expect(info?.credit?.expiringTotal, '总额口径保留用于交叉校验').toBe(2000)
+    })
+
+    it('★ 各包 expiringRemaining 之和 == expiringTotal（不重复计数）', async () => {
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          endDate: '2026-10-27',
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 25500, package_credit_used: 0, package_credit_remain: 25500, package_credit_expiring_amount: 2000 },
+            { name: 'usageBasicPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 25000, package_credit_used: 0, package_credit_remain: 25000, package_credit_expiring_amount: 2000 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      const sum = (info?.credit?.packages ?? [])
+        .reduce((acc, p) => acc + (p.expiringRemaining ?? 0), 0)
+      expect(sum).toBe(info?.credit?.expiringTotal)
+    })
+
+    it('expiring 超过 remain 时夹到 remain（不让三档合计超过 total）', async () => {
+      // 上游若给超（不该发生），宁可少算临期也不让「永久 + 临期」超包。
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 100, package_credit_used: 0, package_credit_remain: 100, package_credit_expiring_amount: 999 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 100, package_credit_used: 0, package_credit_remain: 100, package_credit_expiring_amount: 999 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      const bonus = info?.credit?.packages.find((p) => p.name === '赠送积分包')
+      expect(bonus?.expiringRemaining).toBe(100)
+    })
+
+    it('expiring 为 0 时不写该字段（≠ 写 0）', async () => {
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 6500, package_credit_used: 0, package_credit_remain: 6500, package_credit_expiring_amount: 0 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 6000, package_credit_used: 0, package_credit_remain: 6000, package_credit_expiring_amount: 0 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      expect(info?.credit?.packages.find((p) => p.name === '赠送积分包')?.expiringRemaining).toBeUndefined()
+      expect(info?.credit?.expiringTotal).toBeUndefined()
+    })
+  })
+
+  /**
+   * ## 套餐周期（`end_date`）→ 基础积分包的 `deductionEndTime`
+   *
+   * 用户 2026-10-20 追加要求：`套餐积分也应当设置临期`。
+   *
+   * 依据：华为官方计费文档 + 截图实测 —— 个人订阅套餐 2026/09/26 → 2026/10/26
+   * 23:59，**基础积分包 500 分同期作废**（截图里那一行「个人订阅套餐 500 分」
+   * 的到期时间正是套餐结束日）。故基础包有确切到期时刻，可参与三档分档。
+   *
+   * ⚠️ **但绝不能套到赠送/按需包上**：签到积分逐笔「发放日 +30 天」
+   * （每条各不相同），按需包按消费实时结算。套套餐周期就是编造。
+   */
+  describe('套餐周期 → 基础积分包到期时间', () => {
+    it('★ 基础包带上套餐 end_date 的毫秒值', async () => {
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          endDate: '2026-10-27',
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 25500, package_credit_used: 0, package_credit_remain: 25500 },
+            { name: 'usageBasicPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 25000, package_credit_used: 0, package_credit_remain: 25000 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      const basic = info?.credit?.packages.find((p) => p.name === '基础积分包')
+      expect(basic?.deductionEndTime).toBe(Date.parse('2026-10-27'))
+    })
+
+    it('★ 赠送包 / 按需包**不**套套餐周期（各自到期规则不同）', async () => {
+      // 签到积分是逐笔「发放日 +30 天」，按需包实时结算 —— 都不随套餐周期作废。
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          endDate: '2026-10-27',
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 25500, package_credit_used: 0, package_credit_remain: 25500 },
+            { name: 'usageBasicPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+            { name: 'usageOnDemandPackageCredit', package_credit_amount: 100, package_credit_used: 0, package_credit_remain: 100 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 25000, package_credit_used: 0, package_credit_remain: 25000 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      const byName = new Map((info?.credit?.packages ?? []).map((p) => [p.name, p]))
+      expect(byName.get('赠送积分包')?.deductionEndTime).toBeUndefined()
+      expect(byName.get('按需积分包')?.deductionEndTime).toBeUndefined()
+      expect(byName.get('基础积分包')?.deductionEndTime).toBe(Date.parse('2026-10-27'))
+    })
+
+    it('缺 end_date 时基础包也不带到期时间（不猜）', async () => {
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+            { name: 'usageBasicPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      const basic = info?.credit?.packages.find((p) => p.name === '基础积分包')
+      expect(basic?.deductionEndTime).toBeUndefined()
+      expect(basic?.expiredTime).toBe('')
+    })
+
+    it('end_date 无法解析时也不带到期时间（不拿 now 兜底）', async () => {
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          endDate: 'not-a-date',
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+            { name: 'usageBasicPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      expect(info?.credit?.packages.find((p) => p.name === '基础积分包')?.deductionEndTime).toBeUndefined()
+    })
+  })
+
+  /**
+   * ## ★ 汇总包不进 `packages`（否则三档分档凭空翻倍）
+   *
+   * 真实响应里 `usageTotalPackageCredit` 是「基础 + 按需 + 赠送」的**汇总行**，
+   * 与三个分类是同一批积分的两种视图。把两者一起 push 会让 `packages` 求和
+   * **翻倍**（实测 2026-10-20：总包 25500 + 基础 500 + 赠送 25000 = 51000，
+   * 而 `total` 是 25500）。
+   *
+   * 那不只是数字难看：三档分档是按 `packages` 逐包累加的，重复计数会让
+   * 「永久桶」凭空多出一倍 ⇒ 锁定时误判「还有大量永久额度」而继续烧临期额度。
+   */
+  describe('汇总包去重', () => {
+    it('★ packages 求和等于 total（不含汇总行）', async () => {
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          endDate: '2026-10-27',
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 25500, package_credit_used: 0, package_credit_remain: 25500 },
+            { name: 'usageBasicPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 25000, package_credit_used: 0, package_credit_remain: 25000 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      const credit = info?.credit
+      expect(credit?.total).toBe(25500)
+      const sum = (credit?.packages ?? []).reduce((acc, p) => acc + p.remaining, 0)
+      expect(sum, '分类求和必须等于总额，重复计数会让三档分档翻倍').toBe(25500)
+    })
+
+    it('汇总行不出现在 packages 里（按名字断言）', async () => {
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 25500, package_credit_used: 0, package_credit_remain: 25500 },
+            { name: 'usageBasicPackageCredit', package_credit_amount: 500, package_credit_used: 0, package_credit_remain: 500 },
+            { name: 'usageBonusPackageCredit', package_credit_amount: 25000, package_credit_used: 0, package_credit_remain: 25000 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      const names = (info?.credit?.packages ?? []).map((p) => p.name)
+      expect(names).not.toContain('总积分包')
+      expect(names).toContain('基础积分包')
+      expect(names).toContain('赠送积分包')
+    })
+
+    it('只有汇总行时 total 仍正确、packages 为空', async () => {
+      // 边界：上游只给了汇总、没给任何分类（或分类额度全为 0 被过滤）。
+      const { fetcher } = jsonFetcher(() => ({
+        body: packageInfoBody({
+          metrics: [
+            { name: 'usageTotalPackageCredit', package_credit_amount: 800, package_credit_used: 0, package_credit_remain: 800 },
+          ],
+        }),
+      }))
+      const info = await fetchCodeArtsAccountInfo(CREDENTIAL, fetcher)
+      expect(info?.credit?.total).toBe(800)
+      expect(info?.credit?.packages).toEqual([])
+    })
   })
 
   it('查询失败返回 null（与「非积分账户」严格区分）', async () => {
@@ -393,20 +722,76 @@ describe('claimCodeArtsDailyCheckin（领取）', () => {
     if (outcome.kind === 'claimed') expect(outcome.credit).toBe(1000)
   })
 
-  it('Token 计费账户判为 inactive（不是 failed）', async () => {
-    // 这是账户类型门控的核心断言：非活动范围的账户是**正常业务状态**，
-    // 报 failed 会让用户去排查并不存在的故障。
+  it('Token 计费账户（体验版）有可领取活动时照样领取 —— isCreditPackage 不是门禁', async () => {
+    // 真实缺陷回归（2026-10-08 第三重根因）：体验版账号
+    // （spec=codearts.agent.trial、is_credit_package=false、is_token_package=true）
+    // 的 statistics/plugin 里没有任何积分 metric，但同一凭据下
+    // GET /v1/ops/delivery 明确返回 USER_LOGIN 且 claimable:true，
+    // POST /v1/ops/claim 实测 HTTP 200 并真发 1000 积分。
+    // 旧的 `!isCreditPackage ⇒ inactive` 提前返回是假阴性：凭据修好了也永远
+    // 显示「Token 计费账户，不在积分活动范围」，用户永远看不到签到成功。
     const { fetcher, calls } = claimFetcher({ isCredit: false, isToken: true })
     const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
+    expect(
+      outcome.kind,
+      'isCreditPackage=false 的账号被提前判 inactive：签到永远领不到',
+    ).toBe('claimed')
+    expect(calls.some((call) => call.url.includes('/v1/ops/claim'))).toBe(true)
+  })
+
+  it('非积分非 Token 账户有可领取活动时同样领取', async () => {
+    const { fetcher } = claimFetcher({ isCredit: false, isToken: false })
+    const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
+    expect(outcome.kind).toBe('claimed')
+  })
+
+  it('Token 计费账户且无每日签到活动 → inactive，文案指出账户类型', async () => {
+    // 账户类型降级为**文案修饰**：服务端确实没给每日签到活动时，
+    // 用 isTokenPackage 给出比「未找到每日签到活动」更具体的原因。
+    const { fetcher, calls } = claimFetcher({
+      isCredit: false,
+      isToken: true,
+      items: [{ campaignId: 'c-9', type: 'INVITE_USER', title: '邀请', claimable: true, status: 'ENTRY' }],
+    })
+    const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
     expect(outcome.kind).toBe('inactive')
-    // 且不应发出领取请求
+    if (outcome.kind === 'inactive') {
+      expect(outcome.message).toBe('Token 计费账户，不在积分活动范围')
+    }
     expect(calls.some((call) => call.url.includes('/v1/ops/claim'))).toBe(false)
   })
 
-  it('非积分非 Token 的账户同样判为 inactive', async () => {
-    const { fetcher } = claimFetcher({ isCredit: false, isToken: false })
+  it('积分账户且无每日签到活动 → inactive「未找到每日签到活动」', async () => {
+    const { fetcher } = claimFetcher({
+      items: [{ campaignId: 'c-9', type: 'INVITE_USER', title: '邀请', claimable: true, status: 'ENTRY' }],
+    })
     const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
     expect(outcome.kind).toBe('inactive')
+    if (outcome.kind === 'inactive') {
+      expect(outcome.message).toBe('未找到每日签到活动')
+    }
+  })
+
+  it('重复领取的业务码 40001 判为 already-claimed（不是 failed）', async () => {
+    // 实测：领取成功后活动列表的 claimable 会在一段时间内仍是 true，
+    // 再发一次 POST /v1/ops/claim ⇒ HTTP 200
+    // {"code":40001,"message":"尚未到达权益刷新时间，暂时无法领取","data":null}。
+    // 这是「今天已经领过」，不是故障；判成 failed 会让用户看到一个并不存在的错误。
+    const { fetcher } = claimFetcher({
+      claimBody: { code: 40001, message: '尚未到达权益刷新时间，暂时无法领取', data: null },
+    })
+    const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
+    expect(outcome.kind).toBe('already-claimed')
+    if (outcome.kind === 'already-claimed') {
+      expect(outcome.message).toBe('今天已领取')
+    }
+  })
+
+  it('其它业务码仍判为 failed 并带出服务端文案（40001 不是万能兜底）', async () => {
+    const { fetcher } = claimFetcher({ claimBody: { code: 40002, message: '活动已结束' } })
+    const outcome = await claimCodeArtsDailyCheckin(CREDENTIAL, fetcher)
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind === 'failed') expect(outcome.code).toBe(40002)
   })
 
   it('已领取状态（CLAIMED）判为 already-claimed，且不发领取请求', async () => {

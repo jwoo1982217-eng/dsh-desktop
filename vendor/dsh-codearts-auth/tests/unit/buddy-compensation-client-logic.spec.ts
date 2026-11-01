@@ -7,6 +7,7 @@ import {
   claimAllCompensation,
   compensationHeadline,
   compensationHint,
+  shouldShowCompensation,
 } from '../../plugin-src/client/compensation-panel-logic.js'
 import { unwrapRpcResult } from '../../plugin-src/management-rpc.mjs'
 
@@ -220,7 +221,7 @@ describe('补偿面板逻辑：文案如实性', () => {
     expect(state.total).toBe(0)
   })
 
-  it('全部已领取 ⇒ 显示已领取', async () => {
+  it('全部已领取 ⇒ 主文案仍如实说已领取（但卡片本身会被隐藏）', async () => {
     const state = toCompensationState(await scanCompensation(ACCOUNTS, async () => CLAIMED))
     expect(compensationHeadline(state)).toBe('补偿积分已领取')
   })
@@ -233,5 +234,66 @@ describe('补偿面板逻辑：文案如实性', () => {
   it('null 状态 ⇒ 空文案（卡片不渲染）', () => {
     expect(compensationHeadline(null)).toBe('')
     expect(compensationHint(null)).toBe('')
+  })
+})
+
+describe('★ 领取后隐藏（用户 2026-10-26：「常驻改为领取后隐藏」）', () => {
+  it('★★ 全部已领取 ⇒ 不渲染', async () => {
+    const state = toCompensationState(await scanCompensation(ACCOUNTS, async () => CLAIMED))
+    expect(state.claimedCount).toBe(2)
+    expect(shouldShowCompensation(state), '领完之后还常驻一条「已领取」是纯占位').toBe(false)
+  })
+
+  it('★★ 活动结束且无人领 ⇒ 也不渲染（没有待办，也没有坏消息）', async () => {
+    const state = toCompensationState(await scanCompensation(ACCOUNTS, async () => NONE))
+    expect(shouldShowCompensation(state)).toBe(false)
+  })
+
+  it('★★ 没有账号 ⇒ 不渲染（账号区本身已空，再挂一张是重复提示）', async () => {
+    const state = toCompensationState(await scanCompensation([], async () => ACTIVE))
+    expect(shouldShowCompensation(state)).toBe(false)
+  })
+
+  it('有待领 ⇒ 渲染', async () => {
+    const state = toCompensationState(await scanCompensation(ACCOUNTS, async () => ACTIVE))
+    expect(shouldShowCompensation(state)).toBe(true)
+  })
+
+  it('查询失败 ⇒ 必须渲染（否则用户以为「没有补偿」，实际是没查到）', () => {
+    const state = toCompensationState({
+      scanned: 2, claimableCount: 0, claimedCount: 0, total: 0, endTime: null,
+      errorCount: 2, firstError: '凭据失效',
+    })
+    expect(state.error).toBe('凭据失效')
+    expect(shouldShowCompensation(state)).toBe(true)
+  })
+
+  it('★ error 单独非空时也必须渲染（不依赖 errorCount —— 那是两条独立判据）', () => {
+    // ⚠️ 生产路径上 `toCompensationState` 只在 `errorCount > 0` 时透出 error
+    //   ⇒ 这条分支目前是冗余的。但**冗余不等于可删**：它守的是「将来有人放宽
+    //   toCompensationState 的 error 口径（比如改成部分失败也透出）时，
+    //   卡片不会因为 errorCount 为 0 就静默不显示」。
+    //   构造方式就是直接给 state，绕开 toCompensationState。
+    expect(shouldShowCompensation({
+      scanned: 2, claimableCount: 0, claimedCount: 0, total: 0, endTime: null,
+      error: '凭据失效', errorCount: 0,
+    })).toBe(true)
+  })
+
+  it('★ 部分账号没查到 ⇒ 渲染（结论不完整必须透出）', async () => {
+    const state = toCompensationState({
+      scanned: 2, claimableCount: 0, claimedCount: 1, total: 0, endTime: null,
+      errorCount: 1, firstError: '超时',
+    })
+    expect(shouldShowCompensation(state)).toBe(true)
+  })
+
+  it('★★ 已领完时副文案不得再印「限时活动…活动已结束」', async () => {
+    const state = toCompensationState(await scanCompensation(ACCOUNTS, async () => CLAIMED))
+    expect(compensationHint(state), '这条说明只对「还没领」的人有意义').toBe('')
+  })
+
+  it('null ⇒ 不渲染', () => {
+    expect(shouldShowCompensation(null)).toBe(false)
   })
 })

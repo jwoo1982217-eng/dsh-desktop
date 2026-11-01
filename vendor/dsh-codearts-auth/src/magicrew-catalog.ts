@@ -1,0 +1,91 @@
+// src/magicrew-catalog.ts
+/**
+ * 拉 `GET /api/v1/flows/models` 并归一成适配器要的形状。
+ *
+ * ⚠️ 该端点**不返回** ctx / 档位（实测 27 条全字段确认）⇒ 本模块只负责
+ * id / 名称 / vision 三项，其余由静态表补。
+ */
+
+import type { MagicrewProduct } from './magicrew-product.js'
+import { MAGICREW, MAGICREW_MODELS_PATH } from './magicrew-product.js'
+
+export interface MagicrewCatalogModel {
+  readonly id: string
+  readonly name: string
+  readonly vision: boolean
+}
+
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+  + '(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36'
+
+export async function fetchMagicrewCatalogModels(params: {
+  jwt: string
+  organizationCode: string
+  product?: MagicrewProduct
+  fetchImpl?: typeof fetch
+}): Promise<readonly MagicrewCatalogModel[]> {
+  const product = params.product ?? MAGICREW
+  const fetchImpl = params.fetchImpl ?? fetch
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${params.jwt}`,
+    'content-type': 'application/json',
+    accept: 'application/json',
+    'user-agent': USER_AGENT,
+    origin: product.webOrigin,
+  }
+  // ⚠️ 只在非空时带：国内站不强制，国际站强制（缺了回 HTTP 500 + 裸文本）。
+  if (params.organizationCode.length > 0) headers['organization-code'] = params.organizationCode
+  /**
+   * ⚠️⚠️ **目录 GET 必须有超时**（2026-10-29 审查）：`product.requestTimeoutMs` 此前
+   * 在 `src/` 里**零读者** ⇒ 这一段只靠 undici 默认（约 300s）。目录是**每条消息**
+   * 都会走的前置请求（`prepareCall` → `resolveModel`）⇒ 网关卡住时整条会话一起卡。
+   * 与推理侧的分工：这里用 `requestTimeoutMs`（一次性请求），推理侧「等头」用
+   * `chatHeaderTimeoutMs`、字节间用 `chunkTimeoutMs`。
+   */
+  const controller = new AbortController()
+  const timer = setTimeout(
+    () => controller.abort(new Error(`模型目录请求超时（${product.requestTimeoutMs}ms）`)),
+    product.requestTimeoutMs,
+  )
+  let response: Response
+  try {
+    response = await fetchImpl(`${product.host}${MAGICREW_MODELS_PATH}`, {
+      headers,
+      signal: controller.signal,
+    })
+  } catch (error) {
+    // ⚠️ 本控制器超时 ⇒ 抛可读的「超时」错误（否则调用方只看到 `AbortError`，
+    //    与「用户取消」「网关重置」同形，分类全靠猜）。
+    if (controller.signal.aborted) throw controller.signal.reason
+    throw error
+  } finally {
+    clearTimeout(timer)
+  }
+  const text = await response.text()
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw new Error(`模型目录返回的不是 JSON：${text.slice(0, 200)}`)
+  }
+  const envelope = parsed as { code?: unknown, data?: { models?: unknown } }
+  // ⚠️ 没有 `code` 键时**不抛**（交给后续判定）。
+  if (typeof envelope.code === 'number' && envelope.code !== 1000) {
+    throw new Error(`模型目录业务码 ${envelope.code}`)
+  }
+  const models = Array.isArray(envelope.data?.models) ? envelope.data.models : []
+  const out: MagicrewCatalogModel[] = []
+  for (const raw of models) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const item = raw as Record<string, unknown>
+    const id = typeof item.value === 'string' ? item.value : ''
+    // ⚠️ 缺 value 的条目直接跳过，不产生空 id 条目。
+    if (id.length === 0) continue
+    // ⚠️ 上游真实形态带**前导空格**（`" DeepSeek V4.1 Flash"`）⇒ 必须 trim。
+    const label = typeof item.label === 'string' ? item.label.trim() : ''
+    // ⚠️ vision 判据是严格布尔：上游可能给 `1` / `"true"`，宽松判会误报能力。
+    out.push({ id, name: label.length > 0 ? label : id, vision: item.vision === true })
+  }
+  return out
+}

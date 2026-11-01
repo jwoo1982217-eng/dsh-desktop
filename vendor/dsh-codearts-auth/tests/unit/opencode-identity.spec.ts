@@ -49,10 +49,10 @@ describe('opencodeHeaders（V2）', () => {
     }
     expect(headers['x-opencode-request']).toBeUndefined()
     expect(headers['x-opencode-client']).toBe('cli')
-    expect(headers['user-agent']).toBe('opencode/latest/2.0.29/cli')
+    expect(headers['user-agent']).toBe('opencode/latest/2.1.1/cli')
   })
   it('UA 缺省与旧本机版本都回落 V2，不能降级协议', () => {
-    expect(opencodeUserAgent()).toBe('opencode/latest/2.0.29/cli')
+    expect(opencodeUserAgent()).toBe('opencode/latest/2.1.1/cli')
     expect(opencodeUserAgent('opencode/1.19.0')).toBe(opencodeUserAgent())
     expect(opencodeUserAgent('opencode/2.0.30')).toBe('opencode/latest/2.0.30/cli')
     expect(opencodeUserAgent('opencode/latest/2.0.30/cli')).toBe('opencode/latest/2.0.30/cli')

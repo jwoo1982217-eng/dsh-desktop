@@ -638,8 +638,18 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     expect(start, '未找到 JetHubAuths 接口').toBeGreaterThan(-1)
     const end = rpcSource.indexOf('}', start)
     expect(end).toBeGreaterThan(start)
+    /**
+     * ⚠️⚠️ 正则必须允许**可选键** `readonly x?:`（2026-10-22 A6）。
+     *
+     * 旧写法 `/readonly (\w+):/` 对 `readonly codely?: CodelyAuth` **不匹配**
+     * （`?` 不在 `(\w+)` 里）⇒ 可选键被**静默当成不存在**
+     * ⇒ 下面那条「Set 里的每一个 id 都必须在 JetHubAuths 里有对应键」
+     * 会把**真实存在的**键报成「假 id（会抛 Unknown provider）」。
+     * ⚠️ 这正是本仓库记过的「判据漏一格 ⇒ 假红/假绿」形态：守卫自己的
+     * 正则也要跟着契约的形状走。
+     */
     return new Set(
-      [...rpcSource.slice(start, end).matchAll(/readonly (\w+):/g)].map((m) => m[1]!),
+      [...rpcSource.slice(start, end).matchAll(/readonly (\w+)\??:/g)].map((m) => m[1]!),
     )
   }
 
@@ -657,6 +667,9 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     AUTOCLAW: 'autoclaw',
     // ⚠️ AutoClaw 国际版（2026-10-20）：常量名带下划线，与 id 不同形（同 MINIMAX_INTL）。
     AUTOCLAW_INTL: 'autoclawintl',
+    // ⚠️ Codely（Unity，2026-10-22 A6）：常量名 `CODERLY` 与 id `codely` 不同形
+    //    （源码里叫 CODERLY、provider id 叫 codely）—— 同样不能靠大写推。
+    CODERLY: 'codely',
   }
 
   /**
@@ -686,11 +699,19 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     // ⚠️ 判据「有没有 refresh 端点」与「余额能不能读」是**两件事**：
     //    正因为余额现在能读了，才更需要显式说明「仍不进 Set」的理由。
     ['modelscope', '无 refresh 端点：凭据是长期有效的静态 API Key（expires_at 可选、实测默认不过期）⇒ 没有「快过期」，自愈链无事可做（余额能读不等于能续期，两件事）'],
+    // ⚠️ **本 fork 独有**（qiniu，2026-10-29）：理由比 modelscope 更**彻底** ——
+    //    ① 凭据是长期有效的静态 API Key（官方明示 `sk-` 开头、无过期语义、
+    //       无 refresh 端点）⇒ 没有「快过期」；
+    //    ② `credits.balance: false`（七牛云**没有余额端点**，用量只在控制台可见）
+    //       ⇒ 积分端点压根不会为它触发自愈链。
+    //    两层独立理由都指向「无事可做」。⚠️ 必须显式登记：本表是**反向守卫**
+    //    （`JetHubAuths` 每个键都必须在自愈表或本表里），漏登记即红。
+    ['qiniu', '无 refresh 端点 + 无余额端点：凭据是长期有效的静态 API Key（sk- 开头、默认不过期）⇒ 没有「快过期」；credits.balance: false ⇒ 积分端点也不会为它触发自愈链'],
   ])
 
   it('★ Set 里的字面量恰好是 codearts / buddy / workbuddy（多一个少一个都红）', () => {
     const { literals } = selfHealSetParts()
-    expect(literals.slice().sort()).toEqual(['buddy', 'codearts', 'workbuddy'])
+    expect(literals.slice().sort()).toEqual(['buddy', 'codearts', 'magicrew', 'workbuddy'])
   })
 
   it('★ Set 里的 `.id` 常量恰好是登记的那些家（逐家点名，不写魔数阈值）', () => {
@@ -700,8 +721,9 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     //    回头改数字）—— 快照式数字必然腐坏（本仓库既有教训）。
     const { constants } = selfHealSetParts()
     expect(constants.slice().sort()).toEqual([
-      'ACCIO', 'ASTUDIO', 'AUTOCLAW', 'AUTOCLAW_INTL', 'CLINE', 'GEMINI', 'LOBSTERAI',
-      'MINIMAX', 'MINIMAX_INTL', 'OFFICEACE', 'QODER', 'QODER_CN', 'RACCOON', 'TRAE',
+      'ACCIO', 'ASTUDIO', 'AUTOCLAW', 'AUTOCLAW_INTL', 'CLINE', 'CODERLY', 'GEMINI',
+      'LOBSTERAI', 'MINIMAX', 'MINIMAX_INTL', 'OFFICEACE', 'QODER', 'QODER_CN', 'RACCOON',
+      'TRAE',
     ])
   })
 
@@ -709,9 +731,9 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     const { literals, constants } = selfHealSetParts()
     const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
     expect([...inSet].sort()).toEqual([
-      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'cline', 'codearts', 'gemini',
-      'lobsterai', 'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon',
-      'trae', 'workbuddy',
+      'accio', 'astudio', 'autoclaw', 'autoclawintl', 'buddy', 'cline', 'codearts', 'codely',
+      'gemini', 'lobsterai', 'magicrew', 'minimax', 'minimaxintl', 'officeace', 'qoder',
+      'qodercn', 'raccoon', 'trae', 'workbuddy',
     ])
     // 反向：两家没有 refresh 端点，必须**静默跳过**而非尝试续期。
     expect(inSet.has('loomy')).toBe(false)
@@ -757,8 +779,21 @@ describe('SELF_HEAL_REFRESHABLE_PROVIDERS 与真实分派的一致性', () => {
     const { literals, constants } = selfHealSetParts()
     const inSet = new Set([...literals, ...constants.map((c) => ID_OF[c] ?? c)])
 
+    /**
+     * ⚠⚠ **判据不得再用 `d.channel`**（2026-10-22 对抗审计 M-2）。
+     *
+     * 旧写法 `.filter((d) => d.channel && d.credits.balance === true …)` 把
+     * 「该不该自愈」挂在 `channel` 上，而 `channel` 是**目录可见性 / 是否参与聚合**的
+     * 声明，与「凭据能不能续」是**两件事**。codely 当时 `channel: false`
+     * ⇒ 被这条判据**自动豁免**，而本表存在的**唯一理由**就是
+     * 「拓展新 provider 时漏登记会变红」（accio 就是这样漏的）—— 用错字段等于
+     * 把守卫变成**恒真**。
+     *
+     * ⇒ 改成「有余额能力 && 不在显式豁免表」，不看 `channel`。
+     *   ⚠️ 虚拟渠道（`aggregate` / `auto`）已在 `NO_REFRESH_ENDPOINT` 里逐条登记理由。
+     */
     const expected = PROVIDER_REGISTRY
-      .filter((d) => d.channel && d.credits.balance === true && !NO_REFRESH_ENDPOINT.has(d.id))
+      .filter((d) => d.credits.balance === true && !NO_REFRESH_ENDPOINT.has(d.id))
       .map((d) => d.id)
       .sort()
 

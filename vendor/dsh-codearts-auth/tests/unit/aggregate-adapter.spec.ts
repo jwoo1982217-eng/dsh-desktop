@@ -77,19 +77,28 @@ function makePool() {
  *
  * ## 当前豁免项
  *
- * - `astudio`（2026-10-16 定案，沿用先前四次取证结论）：**有意不进聚合渠道**。
- *   理由：它的模型目录来自上游动态 catalog，额度/失效语义（HTTP 200 + 业务
- *   `code=80000` 归「需人工重新登录」终态）与聚合渠道不同；且生产侧已实证
- *   「只进 `AGGREGATE_CHANNELS` 而不补 `aggregate-expiry.ts` 的
- *   `WIRED_EXPIRY_PROVIDERS`」是**无效接线**（候选表那道闸门会把它剔掉，症状静默、
- *   无报错无日志），两处均未补齐 ⇒ 本轮保持不接入。
- *   留痕位置：`src/aggregate-adapter.ts` 的 `AGGREGATE_CHANNELS` 中 `'accio', 条目
- *   之后的说明注释（生产侧同步登记了这个决定，两边一致）。
- *   ⚠️ 将来若要把 astudio 接进聚合，**必须同时**补 `src/aggregate-expiry.ts` 的
- *   `WIRED_EXPIRY_PROVIDERS`（并同步 `expiry-runtime-parity.spec.ts`），**并清空
- *   本豁免集** —— 只改一边都会被上面 ③ 拦下。
+ * **（空集）** —— 2026-10-20 起没有任何豁免项。
+ *
+ * ### 历史：`astudio` 曾在此登记，现已接入
+ *
+ * 2026-10-16 曾定案「`astudio` 有意不进聚合」，理由两条：①模型目录来自上游动态
+ * catalog、额度/失效语义（HTTP 200 + 业务 `code=80000` 归「需人工重新登录」终态）
+ * 与聚合渠道不同；②生产侧已实证「只进 `AGGREGATE_CHANNELS` 而不补
+ * `aggregate-expiry.ts` 的 `WIRED_EXPIRY_PROVIDERS`」是**无效接线**（候选表那道
+ * 闸门会把它剔掉，症状静默、无报错无日志）。
+ *
+ * **2026-10-20 改判**（用户报障 AStudio 积分有到期时间却不区分永久/长期/临期）：
+ * - 理由 ① 被实测推翻 —— `/points/balance` 的 member / buy / activity 三池各带
+ *   `*NextExpireTime`（不带时区的本地时间串），与 buddy 系**同形**，已由
+ *   `src/astudio-credits.ts` 的 `astudioLocalTimeMs` 归一化到 `deductionEndTime`；
+ *   `code=80000` 只影响**额度读数失败文案的分流**，与临期折算无关。
+ * - 理由 ② 描述的是**当时的实现状态**（两处都没补），不是设计约束。
+ * - 用户报障正是这条「有意不接入」的直接后果：面板不显示三档，
+ *   聚合候选里也永远看不到它。
+ * ⇒ 三处**同时**补齐：`AGGREGATE_CHANNELS` + `WIRED_EXPIRY_PROVIDERS` +
+ *   `createProviderExpiry()`，并把本豁免集清空。
  */
-const AGGREGATE_EXEMPT_PROVIDER_IDS: ReadonlySet<string> = new Set(['astudio'])
+const AGGREGATE_EXEMPT_PROVIDER_IDS: ReadonlySet<string> = new Set()
 
 /**
  * 把目录预热到「已折算」状态，**之后**再断言 `listModels` 的过滤/命名行为。
@@ -226,8 +235,15 @@ describe('★★ 聚合渠道白名单与 registry 对齐（漏一家即红并�
         `src/aggregate-expiry.ts 的 WIRED_EXPIRY_PROVIDERS 并清空本豁免集`,
       ).toBe(false)
     }
-    // 反向防恒真：豁免集非空，且必须是 channel 全集的**真子集**。
-    expect(AGGREGATE_EXEMPT_PROVIDER_IDS.size).toBeGreaterThan(0)
+    // 反向防恒真：豁免集必须是 channel 全集的**真子集**。
+    //
+    // ⚠️ 2026-10-20 起**空集是合法状态**（astudio 接入后全部 channel 都在聚合里），
+    //    故不再要求 `size > 0` —— 那条断言在「所有渠道都接入」时是**错误约束**，
+    //    会逼着人往豁免集里塞一个不该豁免的项来凑数。
+    //    真正防恒真的是下面这条：豁免集不得等于 channel 全集。
+    //    （若它等于全集，上面 ③ 的循环会遍历全部 channel 并对每家都断言
+    //     「不在聚合拉取列表里」，而聚合实际上拉了全部 ⇒ 必然红。故哪怕空集时
+    //     ③ 退化为「不遍历」，`AGC ∪ 豁免 == channel 全集` 这条等式守卫仍在守。）
     expect(
       AGGREGATE_EXEMPT_PROVIDER_IDS.size,
       '豁免集不应等于 channel 全集 —— 那会让上面两条一起变成恒真断言',

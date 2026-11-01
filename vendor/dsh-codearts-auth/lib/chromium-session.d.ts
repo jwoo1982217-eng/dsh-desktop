@@ -29,6 +29,200 @@
  * 它们回答的是「哪个 chromium 可用」「怎么让它别打扰用户」，同属浏览器设施。
  */
 /**
+ * 从 `PATH` 里的 scoop shim 反推 scoop 的**真实根目录**（Gitee issue IKQ4JN）。
+ *
+ * ## ⚠️⚠️ 为什么需要它（真实缺陷，报障人实测）
+ *
+ * scoop 的根目录有**四档**解析顺序（`apps/scoop/current/lib/core.ps1`）：
+ *
+ * ```powershell
+ * $scoopdir = $env:SCOOP, (get_config ROOT_PATH), "$PSScriptRoot\..\..\..\..",
+ *             "$([System.Environment]::GetFolderPath('UserProfile'))\scoop" |
+ *             Where-Object { $_ } | Select-Object -First 1 | Get-AbsolutePath
+ * ```
+ *
+ * 而 {@link windowsBrowserCandidates} 原先**只抄了第 1 档与第 4 档**，
+ * 跳过了第 2 档（`ROOT_PATH`，即 `<root>\config.json` 里的 `root_path`）
+ * 与第 3 档（scoop 自身安装位置）。
+ *
+ * ⇒ **用 `root_path` 把根挪到别的盘（`D:\System_Tools\Scoop`）的机器上，
+ * 环境变量是空的、`~/scoop` 也不存在，两条腿同时落空 ⇒ 一个 chromium 都找不到**，
+ * 而报错被包装成「设备信誉不足」（见 `zcode-auth.ts` 的 captcha 退避），
+ * 用户会去查完全无关的方向。
+ *
+ * ## 为什么从 `PATH` 反推，而不是直接读 `<root>\config.json`
+ *
+ * 读 config 需要**先知道 root**（鸡生蛋），而 scoop 的配置可能落在两处：
+ * 默认 `~/.config/scoop/config.json`、便携布局 `<root>\config.json`。
+ * 反过来，**scoop 的 shims 目录一定在 `PATH` 里**（否则 `scoop` 命令都用不了），
+ * 且它恒为 `<root>\shims` ⇒ 这是唯一「不需要先知道 root」的入口。
+ *
+ * ## 判据为什么要求 `scoop.cmd` / `scoop.ps1` 存在
+ *
+ * 只按目录名 `shims` 匹配会误命中**任意**叫 `shims` 的目录（例如某些 SDK 的
+ * `shims` 子目录）。要求该目录里真有 scoop 自己的 shim，才认它是 scoop 根。
+ *
+ * ## ⚠️ 这是本模块**唯一**读文件系统的候选来源
+ *
+ * {@link browserCandidates} 的其余部分都是纯字符串计算（可跨平台断言），
+ * 本函数却必须 `existsSync`。故它**单独成一个函数**、且入参可注入 `env`，
+ * 让「PATH 里有没有 shims」这一格能在任何平台上被单测锁住。
+ *
+ * @param env 环境（注入以便单测；`PATH` 与 `Path` 都认 —— Windows 上两者都出现过）
+ * @param exists 存在性判据（注入以便单测，默认 `existsSync`）
+ */
+export declare function scoopRootFromPath(env: Record<string, string | undefined>, exists?: (path: string) => boolean): string | undefined;
+/**
+ * Windows「App Paths」里登记的 Chromium 可执行文件（**带缓存**）。
+ *
+ * ⚠️ **缓存只对默认查询器生效**（注入了 `query` 的调用点 —— 即单测 ——
+ * 走的是**未缓存**那条路，保留确定性）。
+ */
+export declare function windowsRegisteredBrowserPathsCached(nowMs?: number): string[];
+/** 清掉注册表查询缓存（**仅供单测**，避免用例之间互相污染）。 */
+export declare function resetRegistryPathsCache(): void;
+/**
+ * Windows「App Paths」里登记的 Chromium 可执行文件。
+ *
+ * ⚠️⚠️⚠️ **编码是本函数最容易错的一格**（2026-10-30 四路审计 P0 D-01 定案）：
+ *
+ * `reg.exe` 的输出**不是 UTF-8**，而是**系统 OEM 代码页**
+ * （中文 Windows = **GBK/CP936**，英文 = CP1252）。旧实现写死
+ * `encoding: 'utf8'` ⇒ 路径里的中文被解成 **U+FFFD**（**不可逆**）⇒
+ * 拼出**不存在的目录** ⇒ 「便携版已修好」在中文路径下**从未成立**。
+ *
+ * 实测取证（本机中文 Windows，写入临时 HKCU 键后删除）：
+ * ```
+ * stdout hex: …28 c4 ac c8 cf 29…  REG_SZ  …44 3a 5c d6 b5 c5 eb…
+ *              ↑↑↑↑↑↑↑↑ GBK 的「默认」二字    ↑↑↑↑↑↑ GBK 的「我的工具」
+ * utf8 解码 => "…    (Ĭ��)    REG_SZ    D:\�ҵĹ���\Chrome\App\chrome.exe"
+ * gbk  解码 => "…    (默认)    REG_SZ    D:\我的工具\Chrome\App\chrome.exe"  ✅
+ * ```
+ *
+ * ⇒ 修法：**取原始字节**（`encoding: 'buffer'`）再按**系统代码页**解码。
+ * ⚠️ 代码页**必须按系统语言选**（见 {@link registryCodePage}）——
+ * **不能无条件先试 `gb18030`**（英文 Windows 上会把 1252 的字节解成别的字符）。
+ * ⚠️ Node 内置 `TextDecoder` 支持 `gb18030` / `windows-1252`（实测 Node 22 可用）。
+ *
+ * ⚠️ **更稳的替代**：`reg export` 输出 **UTF-16LE**（无代码页歧义）⇒
+ * 用 `TextDecoder('utf-16le')` 解即可。本实现**不用**它是因为 `reg export`
+ * 需要导出整棵子树、输出体积大得多；`/ve` 单值查询 + 代码页解码已足够，
+ * 且**存在性过滤**（见下）会把解错的路径直接筛掉。
+ */
+export declare function windowsRegisteredBrowserPaths(query?: (key: string) => {
+    status: number | null;
+    stdout: string;
+}): string[];
+/**
+ * 本机 `reg.exe` 输出用的**代码页**（`'gb18030'` 或 `'windows-1252'`）。
+ *
+ * ⚠️⚠️⚠️ **不能无条件先试 `gb18030`**（2026-10-30 第二轮审计发现并修）：
+ * 两个解码器**都能解任何字节序列**（`fatal: false`）⇒ 「先试 gb18030」在
+ * **英文 Windows**（代码页 1252）上会把 1252 的字节解成**别的字符**：
+ * ```
+ * 路径 C:\Users\José\Chrome
+ *   gb18030    ⇒ "C:\Users\Jos閈\Chrome"   ← 错了
+ *   windows-1252 ⇒ "C:\Users\José\Chrome"  ✅
+ * ```
+ * ⇒ 在英文系统上，路径被解错 ⇒ **存在性过滤把它筛掉** ⇒ 整条注册表腿
+ * **静默失效**（比「解成 U+FFFD」更难发现，因为它至少还是有效文本）。
+ *
+ * ⚠️⚠️⚠️ **判据源必须是「注册表里的 OEMCP」，不能是 `Intl` 的 locale**
+ * （2026-10-30 第二轮审计 P1-1 修）：第一版按 `Intl.DateTimeFormat()
+ * .resolvedOptions().locale` 判「CJK ⇒ GBK」⇒ **ja / ko / zh-TW 全错**：
+ * - 日文 Windows 的 OEMCP 是 **932（Shift-JIS）** ⇒ `gb18030` 会把 `あ`(82 A0)
+ *   解成 `偁`；
+ * - 韩文是 **949（EUC-KR）**；
+ * - **繁体中文是 950（Big5）** ⇒ `gb18030` 会把 `中` 解成 `い`。
+ * ⚠️ 而且 `Intl` 的 locale 是**用户区域格式**、**不一定等于 UI 语言**
+ * （「英文 UI + 中文区域格式」的机器会分叉）。
+ *
+ * ⇒ 修法：读**权威**的 OEM 代码页
+ * `HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 的 `OEMCP` 值
+ * （实测本机 = **936**；命令形态是 `reg query <key> /v OEMCP`）。
+ * ⇒ 一次覆盖 936 / 932 / 949 / 950 / 1252 / 65001 六档，且**不依赖语言**。
+ */
+export type RegistryEncoding = 'gb18030' | 'shift_jis' | 'euc-kr' | 'big5' | 'windows-1252' | 'utf-8';
+/**
+ * OEM 代码页数值 → `TextDecoder` 的编码名。
+ *
+ * ⚠️ 只列**实测会用到的**几档（其余一律退回 `windows-1252` —— 存在的
+ * 后果只是「解错 ⇒ 存在性过滤筛掉 ⇒ 找不到」，**安全降级**，不会误命中）。
+ */
+export declare function encodingForOemCodePage(codePage: number): RegistryEncoding;
+/** `HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 里 `OEMCP` 值的路径。 */
+export declare const OEM_CODEPAGE_REG_KEY = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage\\OEMCP";
+/**
+ * 读本机的 **OEM 代码页**（权威来源）。
+ *
+ * ⚠️ 读不出来时返回 `undefined` ⇒ 调用方退回 locale 启发式（再退回 1252）。
+ */
+export declare function readOemCodePage(query?: (key: string, args: readonly string[]) => {
+    status: number | null;
+    stdout: string;
+}): number | undefined;
+/**
+ * 本机 `reg.exe` 输出用的**代码页**。
+ *
+ * ⚠️ **优先读注册表的 OEMCP**（权威、与 UI 语言一致）；
+ * ⚠️ 读不到时退回 **locale 启发式**（次优，但比「无条件先试 gb18030」好得多）。
+ */
+export declare function registryCodePage(oemCodePage?: number, locale?: string): RegistryEncoding;
+/**
+ * 把 `reg.exe` 的原始输出字节按**系统 OEM 代码页**解码成文本。
+ *
+ * ⚠️ 中文 Windows 的 OEM 代码页是 **936（GBK）**；英文是 **1252**。
+ * ⚠️ **不能**用 UTF-8（中文会变 U+FFFD，不可逆）—— 见
+ * {@link windowsRegisteredBrowserPaths} 的头部注释。
+ * ⚠️ **也不能**无条件先试 `gb18030`（英文系统上会解错）—— 见
+ * {@link registryCodePage}。
+ *
+ * @param raw - `reg.exe` 的原始输出字节（`encoding: 'buffer'` 拿到的）。
+ * @param encoding - 代码页（缺省按 {@link registryCodePage} 判定）。
+ */
+export declare function decodeRegistryOutput(raw: Buffer | string | undefined, encoding?: RegistryEncoding): string;
+/**
+ * 把 `reg.exe` 的原始输出字节解码成文本，**并在首选编码解出 U+FFFD 时重试**。
+ *
+ * ⚠️⚠️ **为什么需要重试**（2026-10-30 第二轮审计）：首选编码**猜错**时，
+ * `TextDecoder`（`fatal: false`）**不会抛** ⇒ 只会产出 **U+FFFD** ⇒ 路径被
+ * 存在性过滤筛掉 ⇒ 整条注册表腿静默失效。
+ *
+ * ⇒ 判据：「解出来的文本含 U+FFFD」⇒ 说明这个编码**大概率不对** ⇒
+ * 依次试**其它**候选编码，取**第一个不含 U+FFFD** 的。
+ *
+ * ⚠️⚠️ **但 U+FFFD 也不够**（2026-10-30 第二轮审计）：`gb18030` 解 1252 的 `é`(0xE9)
+ * 得到的是 `闈`（U+95C8）——一个「合法」字符，**不含 U+FFFD**！
+ * ⇒ 判据必须再加一条：「**备选解码的结果与首选不同**」⇒ 首选可疑 ⇒ 取那个。
+ *
+ * ⚠️ 候选顺序：首选（权威 OEMCP）→ 1252 → 936 → 932 → 949 → 950 → UTF-8。
+ * ⚠️ ⚠️ **纯 ASCII 的输出**（路径里没有非 ASCII）⇒ 任何编码都解得出**同样**
+ * 的结果 ⇒ 第一个候选直接命中 ⇒ **零额外开销**（这是绝大多数情况）。
+ */
+export declare function decodeRegistryOutputWithFallback(raw: Buffer | string | undefined, preferred?: RegistryEncoding): string;
+/**
+ * 已登记浏览器的默认与便携版 User Data 目录。
+ *
+ * ⚠️⚠️ **布局不能硬编码「两级」**（2026-10-30 四路审计 P0 D-02 修）：
+ * 旧实现用 `dirname(dirname(executable))` —— 它只对 `<install>/App/chrome.exe`
+ * 这一种布局成立：
+ * ```
+ * <install>/App/chrome.exe       → dirname(dirname) = <install>       ✅
+ * <install>/chrome.exe           → dirname(dirname) = <install> 的父级 ❌ 高一级
+ * <install>/Chrome/App/chrome.exe→ dirname(dirname) = <install>/Chrome ✅（恰好）
+ * ```
+ * ⇒ 高一级 ⇒ 拼出 `<父级>/Data` ⇒ **永远读不到** ⇒ 静默 0 结果。
+ *
+ * ⇒ 修法：**逐级向上探测**，取**存在** `Data/Default` 或 `User Data/Default`
+ * 的那一级（最多 4 级）。`existsSync` 判据同时把「解错的路径」筛掉。
+ *
+ * ⚠️ 便携版 Chrome **不注册 App Paths**（那是**安装器**的行为）⇒ 这条腿
+ * 在**最需要它的场景**下恒不产出；真兜底是 `MAGICREW_CHROME_USER_DATA`
+ * （见 `src/magicrew-local-browser.ts`）。本函数仍值得保留：① 少数工具
+ * 确实会登记；② `Data` 候选对**已注册**的绿色版软件仍然有效。
+ */
+export declare function registeredBrowserUserDataRoots(paths?: readonly string[]): string[];
+/**
  * 浏览器可执行文件的**候选链**（按优先级，`ZCODE_CHROME_PATH` 恒排第一）。
  *
  * ## 为什么抽成**纯函数**
@@ -68,6 +262,15 @@ export declare function browserCandidates(input?: {
     platform?: NodeJS.Platform;
     env?: Record<string, string | undefined>;
     home?: string;
+    /**
+     * 存在性判据（**仅** Windows 分支的 scoop PATH 反推用得上，见
+     * {@link scoopRootFromPath}）。
+     *
+     * ⚠️ 注入它是为了让「PATH 里有没有 scoop shims」这一格能**跨平台单测** ——
+     * 本仓库 CI 与开发机都是 Windows，但 darwin / linux 分支也必须可断言
+     * （IKJKNT 的教训：不可测的分支会静默烂掉）。
+     */
+    exists?: (path: string) => boolean;
 }): string[];
 /** 在候选链里挑第一个**存在**的绝对路径。 */
 export declare function findBrowserExecutable(): string | undefined;
@@ -84,8 +287,28 @@ export declare function findBrowserExecutable(): string | undefined;
  *
  * ⚠ 第二个参数（环境变量名）是抽到共享模块时加的，**默认值保持 zcode 的
  * 原样文案**；库库AI 传自己的变量名，用户看到的出路才不会指错。
+ *
+ * ## ⚠️⚠️ 第三参 `detail`：把「已尝试什么」与「本进程看到什么」摊开（IKQ4JN 附带建议 1/3）
+ *
+ * 原文案只说**类别名**（「已尝试 scoop chromium / Chrome / …」），于是：
+ *
+ * - 用户不知道自己机器上的 `~/scoop` 到底解析成了什么；
+ * - 设了 `ZCODE_CHROME_PATH` 却「还是找不到」时，无法判断是**变量没生效**
+ *   （从旧终端重启 ⇒ 新进程继承旧环境快照）还是**路径写错**。
+ *   —— 这一条会让用户陷入死循环（他以为设了，插件以为没设）。
+ *
+ * ⇒ 调用方把 {@link findBrowserExecutable} 的**完整候选数组**与本进程读到的
+ * 变量值传进来，两者一起回显。**只回显，不参与任何判据** —— 判据仍在
+ * `findBrowserExecutable` 一处。
+ *
+ * ⚠️ 省略 `detail` ⇒ 输出与修复前**逐字节相同**（老调用方与既有用例不受影响）。
  */
-export declare function browserNotFoundMessage(platform?: NodeJS.Platform, overrideEnvName?: string): string;
+export declare function browserNotFoundMessage(platform?: NodeJS.Platform, overrideEnvName?: string, detail?: {
+    /** 本次实际尝试过的候选（原样顺序）。 */
+    tried?: readonly string[];
+    /** 本进程读到的 override 值（`undefined` = 变量不存在）。 */
+    overrideValue?: string | undefined;
+}): string;
 /**
  * 该可执行文件是否是**系统 Edge**（候选链的最后几档）。
  *
@@ -106,6 +329,49 @@ export declare function browserNotFoundMessage(platform?: NodeJS.Platform, overr
  * —— 那会把 `Brave Browser` 之类的路径误伤。
  */
 export declare function isEdgeExecutable(executable: string): boolean;
+/**
+ * **浏览器部署错误**：本机没配好（找不到可执行文件 / 起不来），
+ * 重试一万次也不会成功。
+ *
+ * ## ⚠️⚠️ 为什么需要把它与其它错误区分开（Gitee issue IKQ4JN 根因②）
+ *
+ * 上层（`zcode-auth.ts`）把 captcha 产出失败记进**设备信誉退避**
+ * （{@link CaptchaBackoff}）—— 那是对的：`mintOnPage` 抛错说明本机产出能力
+ * 出了问题，继续试只会更糟。
+ *
+ * 但**「找不到浏览器」不是产出能力问题，是部署问题**。原实现一视同仁，
+ * 于是第 3 次点击就进入 60s 冷却，用户看到的是
+ * 「captcha 产出处于冷却中…这通常意味着**设备信誉不足**」
+ * —— 把「本机没装浏览器」说成「设备信誉不足」，方向完全相反。
+ * 报障人原话：「本次排查最耗时的就是这一步：我一开始真去查了设备信誉」。
+ *
+ * ## 为什么用**带标记的错误类**而不是字符串匹配
+ *
+ * 本仓库明列「判据必须打在行为上，源码/文案正则有假红假绿」。message 会随
+ * 文案微调漂移（而文案本来就要为可读性改），类与字段不会。
+ *
+ * ## ⚠️ 本模块**不** import `captcha-backoff.ts`
+ *
+ * 那样会让「通用浏览器模块」反向依赖 zcode 的 captcha 语义，且 `captcha-backoff`
+ * 将来若 import 别的东西就可能成环。⇒ 这里只抛一个**自带 `deployKind` 标记**
+ * 的错误，由上层（`zcode-auth.ts`）判它是否要计入退避 —— 判据落在上层，
+ * 本模块保持平台中立。
+ */
+export declare class BrowserDeploymentError extends Error {
+    /** 机器可读细分类（不参与任何文案判据，仅供上层分流与日志聚合）。 */
+    readonly deployKind: 'browser-not-found' | 'browser-spawn-failed';
+    constructor(message: string, deployKind: 'browser-not-found' | 'browser-spawn-failed');
+}
+/**
+ * 该错误是否属于「浏览器部署错误」。
+ *
+ * ⚠️ 判据用 **`deployKind` 字段**而不是 `instanceof`：跨模块副本（两个不同
+ * 路径的包各有一份模块实例）时 `instanceof` 会因类身份不同而**假红**
+ * —— 本仓库记过这条教训。字段判据对副本免疫。
+ *
+ * ⚠️ 但仍然要求 `name` 也对，避免恰好也叫 `deployKind` 的第三方错误误判。
+ */
+export declare function isBrowserDeploymentError(error: unknown): boolean;
 /**
  * 把窗口从**任务栏**移除（按平台分派；整体失败静默）。
  *
@@ -154,6 +420,7 @@ export declare function hideWindowFromTaskbar(pid: number, log?: (message: strin
  * | 移到 -32000 | `set position … to {-32000,-32000}` | **偶发 `F001`**（窗口离屏时 SDK 取证帧偶尔拿到空 canvas） |
  * | 1×1 缩到角 | `set size … to {2,2}` | 偶发 F001（同上，渲染尺寸过小触发 SDK 重试） |
  * | `--headless=new` | （启动参数） | 一律 `F001`，**不可用** |
+ * | `chrome-headless-shell.exe` | （候选） | 一律 `F001`（issue IKQ4JN 实测），**不可加进候选链** |
  *
  * 结论：macOS 上**最小化是唯一同时满足「不挡屏幕」与「mint 稳定」**的做法。
  * 最小化后窗口缩到屏幕右下角（Dock 区），肉眼几乎不可见，且不破坏 captcha。
@@ -339,6 +606,30 @@ export declare class ChromiumSession {
     get debugPort(): number;
     /** 浏览器主进程 pid（清理与诊断用）。 */
     get pid(): number | undefined;
+    /**
+     * 本次会话的临时 profile 目录（即传给 chromium 的 `--user-data-dir`）。
+     *
+     * ⚠️ 存在的唯一用途：**从**这个目录里读登录态。`magicrew` 的网页版登录
+     * （`magicrew-browser-login.ts`）必须把 `readMagicrewLocalCreds` 的 `roots`
+     * 指到这里 —— 它缺省扫**用户真实浏览器**的目录，而本会话用的是
+     * `mkdtempSync` 出来的一次性目录，不去指就是「恒读不到 + 完全静默」。
+     *
+     * ⚠️ `undefined` = 还没启动（或已被 {@link dispose} 收掉）。本 getter **只读**：
+     * 目录的创建与删除仍由 {@link launch} / {@link dispose} 独占，
+     * 别在外部 `rmSync` 它（`dispose()` 里那套退避重试是真实缺陷换来的）。
+     */
+    get userDataDir(): string | undefined;
+    /**
+     * 浏览器进程是否**已经退出**（含用户自己关掉了窗口）。
+     *
+     * ⚠️ 判据是「`child` 已置空**且** `spawnFailure` 已就位」——`launch()` 的 `'exit'`
+     * 监听只在**它自己**退出时同时满足这两条（主动 `kill()` 会先把 `child` 置空，
+     * 那一刻 `spawnFailure` 仍是 `undefined`；启动前两者也都为空）。
+     *
+     * 用途：登录类流程（`magicrew-browser-login.ts`）据它**提前**结束等待 ——
+     * 用户关窗后若还耗满 4 分钟预算，用户看到的是「明明关掉了却还在转圈」。
+     */
+    get exited(): boolean;
     /**
      * 浏览器级 WebSocket。
      *

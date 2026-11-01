@@ -74,7 +74,7 @@ import {
   GATEWAY_SOURCE_KIND,
   convertTools,
   createGatewayMessage,
-  gatewayToolResultBlock,
+  createGatewayToolMessage,
   parseModelRoute,
   partsFromContent,
   textFromContent,
@@ -580,8 +580,7 @@ async function toMessages(
       const callId = nonEmptyString(raw.call_id)
       if (callId === undefined) throw new OpenAiGatewayError('function_call_output requires call_id')
       if (!callIds.kept.has(callId) && callIds.dropped.has(callId)) continue
-      messages.push(createGatewayMessage('tool', await outputParts(raw.output, bridge, limits),
-        { kind: 'tool', callId: callId as never }))
+      messages.push(createGatewayToolMessage(callId, await outputParts(raw.output, bridge, limits)))
       continue
     }
     if (type === 'reasoning') {

@@ -45,6 +45,7 @@ import {
   consumeOpenAiSse,
 } from './openai-compat.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
+import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
 
 export interface AutoclawAdapterOptions {
@@ -56,22 +57,48 @@ export interface AutoclawAdapterOptions {
   probeCredential?: () => Promise<AutoclawCredential | undefined>
   /** 覆盖默认的 fetch（测试注入）。 */
   fetchImpl?: typeof fetch
-  /** 凭据刷新回调。 */
-  refresh?: () => Promise<void>
-  /** 黑名单模型过滤。 */
-  disabledModels?: () => ReadonlySet<string>
   /**
-   * 「该供应商**整体关闭**」探测（Gitee issue IKP8OF）。
+   * 凭据续期回调。
    *
-   * ⚠️ **与 {@link disabledModels} 是两条腿，不可互相替代**：
-   * 后者是「这些具体 id 被关着」（有界集合），而本回调回答的是
-   * 「用户要求整个供应商关着吗」—— 它能覆盖**关闭之后才出现的模型**，
-   * 那些 id 从未进过黑名单，`disabledModels` 永远看不到它们。
+   * ## ⚠️⚠️ 签名为什么带参数（2026-10-27 审计修的 P1）
    *
-   * 本家不走共享骨架（`model-catalog.ts`），故必须在这里显式判一次；
-   * 缺失时按「未整体关闭」处理（老接线 / 单测替身的行为逐字不变）。
+   * 修前是**零参** `refresh()`，调用方（`index.ts`）只能自己再问池要一个账号
+   * （`pool.getAvailableAccount(provider, '')`）。而请求实际用的凭据来自
+   * `resolveCredential` → `createCredentialResolver`，本家接了
+   * `balance: { kind: 'buddy' }` ⇒ **用哪个号由余额分档决定**，与
+   * `getAvailableAccount` 的「手动序第一个」**是两套规则**：
+   *
+   * | 判据 | 分档（请求用） | `getAvailableAccount`（续期用） |
+   * |---|---|---|
+   * | 排序 | 按到期档位（`pickBuddyAccount`） | 用户手动序第一个 |
+   * | 限流过滤 | 按**真 modelId** | 传 `''` ⇒ **整体短路**（`account-pool.ts` 的 `modelId.length === 0`） |
+   *
+   * 实测（真跑 `createCredentialResolver` + 复刻池逻辑）：请求用 B 号，
+   * 续期却续 A 号 ⇒ **续了 A、重发仍用 B 的旧 token** ⇒ 401 原样复现，
+   * 而 A 被白轮换一把 RT。端到端三次请求的结果是 `["AUTH","AUTH","AUTH"]`。
+   *
+   * ⇒ 现在把**本次实际用的凭据**交给回调，并允许它**直接返回续好的新凭据**：
+   *   ① 续的必定是刚才那次请求用的那个号（不再二次选号）；
+   *   ② 重发用的就是返回值，**不再** `resolveCredential`（那会重新选号，
+   *      即使续对了也可能挑回另一个号）。
+   *
+   * ⚠️ 返回值保持**可选**（`void | AutoclawCredential`）：既有的零参实现、
+   *   `probeById` 里的 `refresh: async () => {}` 都仍然合法 —— 返回 `undefined`
+   *   时退回旧行为（重新 `resolveCredential`），不破坏任何调用方。
    */
-  providerClosed?: () => boolean
+  refresh?: (used?: AutoclawCredential) => Promise<void | AutoclawCredential>
+  /**
+   * 账号池（**黑名单、关闭意图、目录门控的唯一数据源**）。
+   *
+   * ⚠️⚠️ **2026-10-23 迁移**：本家此前手写 `listModels`，黑名单与关闭意图靠
+   * `disabledModels` / `providerClosed` 两个**选项回调**传进来。那两个字段
+   * 已随迁移删除 —— 现在统一由共享骨架（`model-catalog.ts`）从本池读取。
+   *
+   * ⚠️ 省略时（单测 / 嵌入方）行为退回「不过滤、不判关闭意图」；
+   * **生产接线必须传**（`index.ts` 负责，且 `ikp8of-provider-closed.spec.ts`
+   * 会逐家点名）。
+   */
+  accountPool?: import('./account-pool.js').AccountPool
   /**
    * 读取图片附件字节（**图片通路必需**，2026-10-17 审计 P0 修复）。
    *
@@ -105,6 +132,11 @@ export interface AutoclawAdapterOptions {
 export class AutoclawAdapter extends LlmAdapter {
   private readonly product: AutoclawProduct
   private readonly warnImpl: (message: string) => void
+  /**
+   * 共享目录骨架（`model-catalog.ts`）——**黑名单 / 关闭意图 / 目录门控 /
+   * 映射**的唯一实现处（2026-10-23 迁移，见 `listModels` 的注释）。
+   */
+  private readonly skeletonCatalog: ModelCatalog
   private announced = false
   /**
    * 远端模型规格缓存（2026-10-17 审计 P1 修复）。
@@ -123,6 +155,21 @@ export class AutoclawAdapter extends LlmAdapter {
     super()
     this.product = options.product ?? AUTOCLAW
     this.warnImpl = options.warn ?? ((message: string) => { console.warn(message) })
+    // ⚠️⚠️ **`accountPool` 必须是真池**（2026-10-23 迁移）：骨架里
+    //    `deps.accountPool?.disabledModelsFor` 与 `providerClosedFor?.(...)`
+    //    全靠它；传 `{}` 或 `undefined` 会让 `?.` 变成静默 no-op
+    //    （Gitee IKP8OF 实测过的形态：关掉的模型照样可选、关整个供应商也无效）。
+    this.skeletonCatalog = createModelCatalog(
+      this.options.accountPool === undefined ? {} : { accountPool: this.options.accountPool },
+      {
+        product: this.product,
+        loadCatalog: () => this.loadCatalogEntries(),
+        syncCatalog: () => this.syncCatalogEntries(),
+        // ⚠️ 未知 id **保守报 `['text']`**（与本文件 `resolveModel` 的取向一致：
+        //    未知模型的 `inputModalitiesOf(undefined)` 也是 text）。
+        unknownModelInputModalities: () => ['text'] as const,
+      },
+    )
   }
 
   private async resolveCredential(modelId?: string): Promise<AutoclawCredential | undefined> {
@@ -204,47 +251,84 @@ export class AutoclawAdapter extends LlmAdapter {
     }))
   }
 
+  /**
+   * 模型选择器的目录 —— **委托共享骨架**（`model-catalog.ts`）。
+   *
+   * ## ⚠️⚠️ 2026-10-23 迁移（用户要求：实体 provider 一律走共享骨架）
+   *
+   * 迁移前本方法**手写**了四件事：判 `providerClosed`、过滤 `disabledModels`、
+   * 凭据探活门控、手工 map 成 `LlmModelInfo`。其中「关闭意图 / 黑名单 /
+   * `provider` 回填」与其余 13 家**逐字同义** ⇒ 各写一份正是 Gitee IKP8OF
+   * 那类漂移缺陷的温床。
+   *
+   * 现在那三条由骨架承担，**本家独有的两条**放进 `loadCatalog`
+   * （`loadCatalogEntries`）：
+   * - **凭据探活门控**（`probeCredential()` 拿不到凭据 ⇒ 隐藏整个分组）；
+   * - 探活成功后**真读远端规格**（`loadRemoteMeta()`）+ 广播（`announceLater`）。
+   *
+   * ⚠️ **门控口径变更（刻意，已与用户确认）**：骨架额外要求「账号池里有已登录
+   * 账号」（`providerCatalogVisible`）。对本家而言这比原来的单凭据探活更贴近
+   * 用户预期 —— 池里没有账号时那个 provider 本就没有可用号，显示出来只会让
+   * 用户选中一个必然失败的模型。
+   */
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    // ⚠️⚠️ 「供应商整体关闭」⇒ 一条都不播（Gitee issue IKP8OF）。
-    // 必须在**任何上游请求之前**：关闭态下没必要再探活/拉目录，
-    // 且此时目录里可能有黑名单从未见过的 id（关闭之后才新增的）。
-    if (this.options.providerClosed?.() === true) return []
-    const disabled = this.options.disabledModels?.() ?? new Set<string>()
+    return await this.skeletonCatalog.listModels(_provider)
+  }
+
+  /**
+   * 异步读目录并转成骨架的中间结构。
+   *
+   * ⚠️⚠️ **本家独有门控全在这里**：
+   * ① 凭据探活（拿不到 ⇒ `[]` ⇒ 隐藏分组）；
+   * ② 探活成功 ⇒ 真读远端规格并广播（原 `listModels` 的主体）。
+   */
+  private async loadCatalogEntries(): Promise<readonly CatalogEntry[]> {
+    // ⚠️ 先探活：无凭据 ⇒ 空目录（隐藏整个 provider 分组，**不抛错** ——
+    //    抛错会多一条 provider 级报错，UI 表现为「供应商加载失败」）。
     const credential = await this.probeCredential()
     if (!credential) return []
 
     this.announceLater()
 
     // ⚠️⚠️ **一次调用即完成「探活 + 真读目录」**（2026-10-17 审计 P1 修复）。
-    //   原先这里是两段独立逻辑：`probe()`（只判 `r.ok`，**丢弃响应体**）
-    //   + 返回编译期兜底表 ⇒ 远端改规格 / 增删模型**永远不会反映到目录**，
-    //   而 PR 描述声称「官方配置端点实测锁定」读起来像接了远端。
-    // ⚠️ `probe()` 已删除：它与 `loadRemoteMeta()` 逐字段重复（同端点、同头），
-    //   两份实现必然漂移 —— 实测就漂移出了「一个发 X-Authorization、一个发
-    //   Authorization」的分裂（见 `fetchRemoteModelMeta` 的注释）。
-    // ⚠️ 远端挂掉时它内部返回 `undefined` 并回落兜底表（**不抛错**）：
+    //   远端挂掉时它内部返回 `undefined` 并回落兜底表（**不抛错**）：
     //   目录是只读展示面，不该因上游抖动整体失败。
     await this.loadRemoteMeta()
 
-    return this.product.fallbackModels
-      .filter((m) => !disabled.has(m.id))
-      .map((m) => ({
-        provider: this.product.id,
-        id: m.id,
-        name: m.name,
-        // ⚠️⚠️ **必须复用 `inputModalitiesOf`，不得在此硬编码**
-        // （2026-10-17 审计 P0 修复）。原写法是全模型一刀切 `['text']`，
-        // 而 `resolveModel` 按 `supportsImage` 给 `['text','image']`
-        // ⇒ **同一个模型在两个入口对宿主说了两套相反的话**：
-        //   • 宿主拿 `resolveModel` 的那份做**请求前门禁**
-        //     （`dsh-llm/lib/index.js:2311`：不声明 image 就把图片投影成文本占位符）
-        //   • `listModels` 的那份进模型选择器与聚合目录
-        // ⇒ 对 `zai_auto-fast`（`supportsImage: true`）而言，用户在选择器看到
-        // 「支持图片」，而门禁那格放行后 `stream()` 必然抛错。
-        // ⚠️ 传入**远端校正后**的条目 ⇒ 远端若改模态，两处仍**同向**。
-        inputModalities: inputModalitiesOf(this.entryOf(m.id)),
-        isFree: m.isFree === true,
-      }))
+    return this.product.fallbackModels.map((m) => this.toCatalogEntry(m))
+  }
+
+  /** **同步**全量目录（`listAllModels()` 用；同样读已缓存的远端校正值）。 */
+  private syncCatalogEntries(): readonly CatalogEntry[] {
+    return this.product.fallbackModels.map((m) => this.toCatalogEntry(m))
+  }
+
+  /**
+   * 本家私有形状 → 骨架的 `CatalogEntry`（**唯一**转换点）。
+   *
+   * ⚠️⚠️ **必须复用 `entryOf` + `inputModalitiesOf`，不得硬编码 `['text']`**
+   * （2026-10-17 审计 P0 修复）。原写法全模型一刀切 `['text']`，而
+   * `resolveModel` 按 `supportsImage` 给 `['text','image']` ⇒ **同一模型在两个
+   * 入口对宿主说了两套相反的话**：
+   *   • 宿主拿 `resolveModel` 那份做**请求前门禁**（不声明 image 就把图片投影成占位符）
+   *   • `listModels` 那份进模型选择器与聚合目录
+   * ⇒ 对 `zai_auto-fast`（`supportsImage: true`）用户在选择器看到「支持图片」，
+   *   而门禁放行后 `stream()` 必然抛错。
+   * ⚠️ 走 `entryOf`（**远端校正后**的条目）⇒ 远端若改模态，两处仍**同向**。
+   */
+  private toCatalogEntry(m: AutoclawFallbackModel): CatalogEntry {
+    const resolved = this.entryOf(m.id) ?? m
+    return {
+      id: m.id,
+      name: m.name,
+      inputModalities: inputModalitiesOf(resolved),
+      // ⚠️⚠️ **必须显式给 `isFree`（含 `false`），不得只在 true 时写**
+      //（2026-10-23 迁移第一版就踩到了：`expected undefined to be false`）。
+      // 理由：`listAllModels()` 的契约是把目录条目**原样摊给设置页**，而
+      // 徽标那侧按 `isFree === true` 分免费桶。省略 false 会与「从未声明」同形
+      // ⇒ `autoclaw.spec.ts` 的「实测每次扣约 1 点 ⇒ 不得标成免费」当场变红。
+      isFree: m.isFree === true,
+    }
   }
 
   /**
@@ -579,8 +663,22 @@ export class AutoclawAdapter extends LlmAdapter {
 
     if (!response.ok && (response.status === 401 || response.status === 403) && this.options.refresh) {
       try {
-        await this.options.refresh()
-        const refreshed = await this.resolveCredential(model)
+        /**
+         * ⚠️⚠️ **把「本次实际用的凭据」交给回调，并优先用它的返回值重发**
+         * （2026-10-27 审计修的 P1，详见 `AutoclawAdapterOptions.refresh`）。
+         *
+         * 修前是 `await this.options.refresh()` 然后**重新** `resolveCredential`：
+         * ① 回调内部自己问池要号（与请求用的号是两套规则）；
+         * ② 重发前又选一次号（即使续对了也可能挑回另一个号）。
+         * 实测三次 401 ⇒ 三次 `AUTH`，被白轮换的是**无关账号**的 RT。
+         */
+        const renewed = await this.options.refresh(credential)
+        // ⚠️ 只有「形状可用」的返回值才采信：空 token 等于没续，
+        //    交给下面的 `resolveCredential` 兜底（与旧行为一致）。
+        const refreshed = renewed !== undefined && typeof renewed.access_token === 'string'
+          && renewed.access_token.length > 0
+          ? renewed
+          : await this.resolveCredential(model)
         if (refreshed && refreshed.access_token.length > 0) {
           credential = refreshed
           const retryHeaders = buildAutoclawHeaders({
@@ -597,8 +695,26 @@ export class AutoclawAdapter extends LlmAdapter {
             signal: controller.signal,
           })
         }
-      } catch {
-        // 忽略重试失败，交由下方错误检测
+      } catch (error) {
+        /**
+         * ⚠️⚠️ **绝不能完全静默**（2026-10-27 第二轮审计打穿）。
+         *
+         * 修前这里是裸 `catch {}`，注释写着「忽略重试失败，交由下方错误检测」。
+         * 而「下方错误检测」只会看见**第一次** response 的 401 并如实报 `AUTH`
+         * —— 于是「续期为什么没成功」这条**唯一能指路的信息**彻底消失。
+         *
+         * 实测的后果链（P0）：`index.ts` 的 refresh 闭包在「反查不到本次使用的账号」
+         * 时会**显式抛错**，那个错误被这里吃掉 ⇒ **一次上游都不发、用户看到 401、
+         * 日志零字**，比修复前的「静默空转」更难查（修前至少还会试一次
+         * `defaultCredentialRef`）。
+         *
+         * ⇒ 现在留一条 warn。**仍然不外抛**（重试失败不该改变主路径的错误分类：
+         * 用户该看到的是第一次那个 401 的语义），但日志里必须能查到**为什么**没重发。
+         */
+        this.warnImpl(
+          `[autoclaw] 401 后的续期/重发失败，本次不重发（将按首次响应报错）：`
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
       }
     }
 

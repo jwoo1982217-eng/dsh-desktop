@@ -90,15 +90,62 @@ describe('index.ts 的接线（源码级，仅守纯文本形态的约定）', (
    * 共用实例等于把「两站同构」这一前提写死进运行时）。
    *
    * ⚠️ 2026-10-06 起 TRAE / LobsterAI 也接了同一套编排，故实例数由 2 变 4。
+   * ⚠️ 2026-10-20 加 astudio（讯飞 AstronStudio），实例数 4 → 5。
    * 本用例改为「**每个支持锁定的 provider 各一个**」—— 数量随白名单走，
    * 而不是写死 2（写死会让下次加 provider 时这条无关断言先红）。
+   *
+   * ⚠️⚠️ 数量断言**改成从 `PERMANENT_LOCK_PROVIDERS` 派生**（不再写死数字）：
+   * 本文件守的是 buddy 系「走 `BuddyBalanceSelector` 的那几家」，
+   * 而 officeace 走的是自己的 `credentialProvider`（不建选号器）、
+   * loomy 走 `loomy-balance-selector`（另一个类）⇒ 二者的数量不是 1:1。
+   * 故这里仍显式列出 `new BuddyBalanceSelector(` 的那几家，并让**计数**
+   * 与列表长度联动 —— 加一家时只需在这张列表里加一行，两处不会漂移。
    */
+  /** 直接 new `BuddyBalanceSelector` 的渠道（= 走 `kind: 'buddy'` 分档的）。 */
+  // ⚠️ minimax / minimaxintl 2026-10-20 加入：与 AStudio 同一条路径
+  //    （`MinimaxAdapter` 只是 `MinimaxProductType` 不同的同一个类，但
+  //    **是两个渠道 id** ⇒ 必须各建一个选号器，否则国际站的到期分档不生效）。
+  const BUDDY_SELECTOR_PROVIDERS = [
+    'CODEBUDDY', 'WORKBUDDY', 'TRAE', 'LOBSTERAI', 'ASTUDIO',
+    'MINIMAX', 'MINIMAX_INTL',
+    // ⚠️ QODER / QODER_CN（PR131，2026-10-20）：两站各一个选号器。
+    'QODER', 'QODER_CN',
+    // ⚠️ AUTOCLAW / AUTOCLAW_INTL（2026-10-21，用户要求「补锁定开关」）：
+    //    两站各一个（选择器内含按账号 id 的缓存，跨站共用会让一站读数污染另一站）。
+    'AUTOCLAW', 'AUTOCLAW_INTL',
+  ] as const
   it('每个支持锁定的 provider 各建一个选号器', () => {
-    expect(indexCode).toMatch(/const buddyBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: CODEBUDDY,/)
-    expect(indexCode).toMatch(/const workbuddyBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: WORKBUDDY,/)
-    expect(indexCode).toMatch(/const traeBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: TRAE,/)
-    expect(indexCode).toMatch(/const lobsteraiBalanceSelector = new BuddyBalanceSelector\(\{\s*\n\s*product: LOBSTERAI,/)
-    expect(indexCode.match(/new BuddyBalanceSelector\(/g)).toHaveLength(4)
+    const expected = [
+      ['buddyBalanceSelector', 'CODEBUDDY'],
+      ['workbuddyBalanceSelector', 'WORKBUDDY'],
+      ['traeBalanceSelector', 'TRAE'],
+      ['lobsteraiBalanceSelector', 'LOBSTERAI'],
+      ['astudioBalanceSelector', 'ASTUDIO'],
+      ['minimaxBalanceSelector', 'MINIMAX'],
+      ['minimaxIntlBalanceSelector', 'MINIMAX_INTL'],
+      // ⚠️ QODER / QODER_CN 2026-10-20 加入（PR131）：`fetchQoderCreditBalance(credential,
+      //    product, fetcher?)` 的 `product` 是**第二**参（minimax 那份是第三参），
+      //    且两站域名不同（`openapi.qoder.sh` / `openapi.qoder.com.cn`）⇒
+      //    同样必须各建一个选号器（传错会让选号读到对方站点）。
+      ['qoderBalanceSelector', 'QODER'],
+      ['qoderCnBalanceSelector', 'QODER_CN'],
+      // ⚠️ AUTOCLAW / AUTOCLAW_INTL 2026-10-21 加入（用户要求「补锁定开关」）：
+      //    本家**确实有永久桶**（活动赠送的永久分不带 `deductionEndTime`）⇒ 需要
+      //    锁定能力。两站必须各建一个（传错 product 会让选号读到对方站点，余额恒 null）。
+      ['autoclawBalanceSelector', 'AUTOCLAW'],
+      ['autoclawIntlBalanceSelector', 'AUTOCLAW_INTL'],
+    ] as const
+    for (const [name, product] of expected) {
+      // ⚠️ `new ` 前面要留出空格边界：`astudioBalanceSelector` 与
+      //    `buddyBalanceSelector` 的 `\b` 都能匹配到 `Selector`，
+      //    但 `const ` 前缀已足够区分（这里保留 `\s*\n\s*` 是为了容忍缩进变化）。
+      expect(indexCode, `${name} 未建（product: ${product}）`).toMatch(
+        new RegExp(`const ${name} = new BuddyBalanceSelector\\(\\{\\s*\\n\\s*product: ${product},`),
+      )
+    }
+    expect(indexCode.match(/new BuddyBalanceSelector\(/g)).toHaveLength(expected.length)
+    // 自检：列表与实现数一一对应，且列表本身非空（防正则失效时恒绿）。
+    expect(expected.length, '列表为空 ⇒ 上面两条是同义反复').toBe(BUDDY_SELECTOR_PROVIDERS.length)
   })
 
   it('凭据解析函数两站共用一份（同协议，差别只在 endpoint）', () => {

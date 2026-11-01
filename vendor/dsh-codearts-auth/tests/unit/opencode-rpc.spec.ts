@@ -41,7 +41,12 @@ interface Result { ok: boolean; value?: unknown; error?: { message: string } }
  */
 function harness() {
   const ctx = {
-    credentials: { set: vi.fn(async () => {}) },
+    credentials: {
+      set: vi.fn(async () => {}),
+      // ⚠️ `resolve` 是 P1-1 修复（「凭据读不到 ⇒ 必须覆盖写」）承重的那条腿：
+      // 默认返回 undefined（= 还没有凭据），要模拟「凭据完好」的用例自己 mock。
+      resolve: vi.fn(async () => undefined as { value: string; source: string } | undefined),
+    },
     logger: { info: () => {}, warn: () => {} },
   }
   const pool = {
@@ -108,20 +113,157 @@ describe('分派归属（真实事故 2026-10-02）', () => {
 })
 
 const VALID_KEY = `sk-${'a'.repeat(48)}`
+/**
+ * opencode 2026-10-22 起签发的新形态（Gitee **IKPLRU**）。
+ * ⚠️ 这个 fixture 的**判据必须是「被接受」**，不是「被拒绝」——
+ * 上游改前缀不是缺陷，插件的形状闸跟着它一起改才是。
+ */
+const OC_SK_KEY = `oc_sk_1a2b3c4d5e6f${'0'.repeat(24)}`
 
 describe('opencode.addAccount', () => {
   it('key 形状非法时拒绝且不写池', async () => {
     const { call, pool } = harness()
     const r = await call('opencode.addAccount', { apiKey: 'not-a-key' })
     expect(r.ok).toBe(false)
-    expect(r.error?.message).toContain('sk-')
+    // ⚠️ 断言**不再**点名某个前缀（`sk-`）——文案里点名就等于把判据绑回前缀。
+    expect(r.error?.message).toContain('形状不对')
     expect(pool.addAccount).not.toHaveBeenCalled()
   })
 
-  it('key 过短拒绝（sk- 后至少 20 位）', async () => {
+  it('key 过短拒绝（不足 20 位）', async () => {
     const { call, pool } = harness()
     expect((await call('opencode.addAccount', { apiKey: 'sk-short' })).ok).toBe(false)
     expect(pool.addAccount).not.toHaveBeenCalled()
+  })
+
+  it('⚠️ IKPLRU：新形态 `oc_sk_` key 必须被接受（前缀判据不得绑死 sk-）', async () => {
+    const { call, pool, ctx } = harness()
+    const r = await call('opencode.addAccount', { apiKey: OC_SK_KEY, nickname: '新形态' })
+    expect(r.ok, `oc_sk_ key 被拒：${JSON.stringify(r)}`).toBe(true)
+    expect(ctx.credentials.set).toHaveBeenCalledTimes(1)
+    expect(pool.addAccount).toHaveBeenCalledTimes(1)
+    // 凭据里存的必须是原样 key（形状闸不得改动它）。
+    const value = String((ctx.credentials.set as never as { mock: { calls: [string, string][] } }).mock.calls[0]![1])
+    expect((JSON.parse(value) as { api_key: string }).api_key).toBe(OC_SK_KEY)
+  })
+
+  it('⚠️ 尾段含 `-` 的 key：credentialRef 不得抛错（ref 归一化到 POSIX 标识符）', async () => {
+    // 实测（2026-10-22）：旧实现把尾段原样拼进 ref，而 `credentialRef()`
+    // 只认 `[A-Za-z_][A-Za-z0-9_]*` ⇒ 抛 TypeError，用户看到的是
+    // `credential ref "…" must match …` 这条与 key 无关的报错、账号写不进去。
+    const { call, pool, ctx } = harness()
+    const key = `sk-${'a'.repeat(40)}-d-e-f-g`
+    const r = await call('opencode.addAccount', { apiKey: key })
+    expect(r.ok, `含短横线的 key 被拒：${JSON.stringify(r)}`).toBe(true)
+    const ref = String((ctx.credentials.set as never as { mock: { calls: [string, string][] } }).mock.calls[0]![0])
+    expect(ref).toMatch(/^[A-Za-z_][A-Za-z0-9_]*$/)
+    expect(ref).toContain('OPENCODE_ACCOUNT_')
+    expect(pool.addAccount).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * ★★ P2（2026-10-25 审计 A1-F1）：ref 归一化不得让两条不同 key 撞成同一引用。
+   *
+   * ## ⚠️ 这对输入必须是「**两条都走归一化分支**、且剥完非法字符后相同」
+   *
+   * 旧用例选的是 `…ab-cd` vs `…ab_cd` —— 而 `ab_cd` 的尾 8 位**本身合法**
+   * （`[A-Z0-9_]*` 通过），走的是**合法分支**、堆本不带 hash ⇒ 两者分支就不同、
+   * ref 天然不同，**与 hash 腿完全无关**。审计实测：把 hash 后缀整段删掉，
+   * 该用例仍然 **33 passed 全绿**（守卫无牙）。
+   *
+   * 真会撞的是 `…ab-cd` vs `…ab.cd`：两者都不合法、剥掉 `-`/`.` 后都是
+   * `AB` ⇒ **去掉 hash 就变成同一个 ref**（实测 `OPENCODE_ACCOUNT_AAAABCD`）。
+   */
+  it('★★ P2：两条都走归一化且剥完相同的 key，其 ref 必须不同（锁 hash 腿）', async () => {
+    const { call, ctx } = harness()
+    const base = `sk-${'a'.repeat(40)}`
+    await call('opencode.addAccount', { apiKey: `${base}ab-cd` })
+    await call('opencode.addAccount', { apiKey: `${base}ab.cd` })
+    const calls = (ctx.credentials.set as never as { mock: { calls: [string, string][] } }).mock.calls
+    expect(calls).toHaveLength(2)
+    // 枢轴：两条 key 落到的凭据引用必须不同 —— 否则后添加的会**覆盖**前者的凭据
+    expect(calls[0]![0]).not.toBe(calls[1]![0])
+    // 反向自证：两者的「剥完非法字符」形态确实相同（证明这对输入真的需要 hash
+    // 才能区分；若哪天归一化规则改了，这条会提醒我们这对已不再是「真撞对」）
+    const stripped = (ref: string): string => ref.replace(/_[0-9A-F]{8}$/, '')
+    expect(stripped(String(calls[0]![0]))).toBe(stripped(String(calls[1]![0])))
+  })
+
+  /**
+   * ★★ P2（2026-10-25 审计 A1-F2 / B1）：**合法尾段**的 ref 必须逐字节不变。
+   *
+   * ## 为什么这条必须单独守卫
+   *
+   * PR 自己声明的不变量是「只在尾段不合法时归一化 ⇒ 合法尾段的 ref 逐字节
+   * 不变 ⇒ 存量账号的凭据引用不动」。审计实测：把「合法分支也追加 hash」
+   * 注入后，opencode 全目录 19 个 spec + backup + jet-hub-store 共
+   * **21 文件 / 481 passed 全绿** —— 这条不变量**零守卫**。
+   *
+   * ⚠️ 严重度是 P2 而不是 P1（审计 B1 的 REFUTED）：`credentialRef` 是**池里
+   * 存档的字符串**，不会被「用 key 重新算一遍」，所以存量**条目**不会被改写；
+   * 破的是「新建账号的 ref 公式」，属形态漂移。但它是**公式**的守卫，成本极低，
+   * 值得钉死 —— 而且它同时防住「改名后 ACCOUNT_REF_RE 识别面再缩小」。
+   */
+  it('★★ P2：合法尾段的 ref 公式逐字节锁定（防公式漂移）', async () => {
+    const cases: Array<[string, string]> = [
+      ['12345678', 'OPENCODE_ACCOUNT_12345678'],
+      ['ABCDEF12', 'OPENCODE_ACCOUNT_ABCDEF12'],
+      ['________', 'OPENCODE_ACCOUNT_________'],
+      ['A_B_C_D_', 'OPENCODE_ACCOUNT_A_B_C_D_'],
+    ]
+    for (const [tail, expected] of cases) {
+      const { call, ctx } = harness()
+      // ⚠️ 前置条件自证：这些尾段确实走**合法分支**（否则本用例测错了分支）
+      expect(/^[A-Z0-9_]*$/.test(tail.toUpperCase()), tail).toBe(true)
+      await call('opencode.addAccount', { apiKey: `sk-${'a'.repeat(40)}${tail}` })
+      const ref = String((ctx.credentials.set as never as { mock: { calls: [string, string][] } }).mock.calls[0]![0])
+      expect(ref, tail).toBe(expected)
+    }
+  })
+
+  /**
+   * ★★ P2（2026-10-25 审计 A1-F14 / B1）：账号槽 id **不得伪装成匿名槽**。
+   *
+   * ## 缺陷
+   *
+   * 账号槽 id 是 `opencode-${key 尾 8 位小写}`，而「匿名通道」的判据是
+   * **id 前缀** `opencode-anon-`（`src/index.ts` 的 `ensureDefaultAnonymousSlot`
+   * 与客户端 `jet-hub.js` 的 `isAnonymousAccountId` 都这么判）。于是尾 8 位
+   * 恰为 `anon-abc` 之类的 key 会产出 `opencode-anon-abc` ⇒
+   *
+   * 1. 客户端把它标成「匿名」（不计额度、走匿名文案）；
+   * 2. `ensureDefaultAnonymousSlot` 以为「已经有匿名通道了」⇒ **永久跳过**
+   *    创建默认匿名槽 ⇒ 零账号新用户**失去免费通道**，且零报错。
+   *
+   * ⚠️ 本 PR 之前这条路径**不可达**：base 的实现把尾段原样拼进 `credentialRef()`，
+   * 含 `-` 的尾段会抛 TypeError ⇒ 根本进不了池。本 PR 放宽字符集后才成立
+   * ⇒ 属**本 PR 新引入的可达静默功能损失**。
+   */
+  it('★★ P2：key 尾段形如 `anon-abc` 时，账号槽 id 不得落进匿名槽命名空间', async () => {
+    const { call, pool } = harness()
+    // 尾 8 位 = `anon-abc`（合法字符集内，KEY_PATTERN 会放行）
+    const key = `sk-${'a'.repeat(40)}anon-abc`
+    expect(key.length).toBeGreaterThan(20)
+    const r = await call('opencode.addAccount', { apiKey: key })
+
+    expect(r.ok).toBe(true)
+    const entry = pool.addAccount.mock.calls[0]![0] as Record<string, unknown>
+    const id = String(entry.id)
+    // 枢轴：不得以匿名槽前缀开头（否则 ensureDefaultAnonymousSlot 跳过创建，
+    // 客户端也会把它渲染成匿名通道）
+    expect(id.startsWith('opencode-anon-')).toBe(false)
+  })
+
+  it('★★ P2：`anon-` 尾段与真实匿名槽共存时，两者 id 必须不同', async () => {
+    const { call, pool } = harness()
+    const r = await call('opencode.addAccount', { apiKey: `sk-${'a'.repeat(40)}anon-abc` })
+    const accountId = (r.value as { accountId: string }).accountId
+    const anon = await call('opencode.addAnonymous', {})
+    const anonId = (anon.value as { accountId: string }).accountId
+    expect(accountId).not.toBe(anonId)
+    // 真实匿名槽仍必须满足自己的前缀判据（这条反向守卫防「把匿名槽也改名」）
+    expect(anonId).toMatch(/^opencode-anon-[0-9a-f]{6}$/)
+    expect(pool.addAccount).toHaveBeenCalledTimes(2)
   })
 
   it('合法 key 写入凭据 + 账号池条目', async () => {
@@ -164,13 +306,95 @@ describe('opencode.addAccount', () => {
   })
 
   it('重复 key 复用同一账号（不产生第二个条目）', async () => {
-    const { call, pool } = harness()
+    const { call, pool, ctx } = harness()
+    // ⚠️ 夹具必须**模拟真实**：池里那条账号是因为之前成功添加才存在的，
+    //    所以它的凭据**一定读得到**且 api_key 与本次相同。旧夹具只 mock 了
+    //    `listAccountsByProvider` 却不给凭据（= 「账号在、凭据缺」的坏态），
+    //    那是另一个场景（见下面 P1 的两条用例），不是「重复 key 复用」。
+    ctx.credentials.resolve.mockResolvedValue({ value: JSON.stringify({ api_key: VALID_KEY, nickname: '主号' }), source: 'file' })
     const first = await call('opencode.addAccount', { apiKey: VALID_KEY })
     const id = (first.value as { accountId: string }).accountId
     pool.listAccountsByProvider.mockReturnValue([{ id, enabled: true, credentialRef: 'X' }])
     const second = await call('opencode.addAccount', { apiKey: VALID_KEY })
     expect((second.value as { existed: boolean }).existed).toBe(true)
     expect(pool.addAccount).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * ★★ P1（2026-10-25 审计 B1-1）：池里有账号、**凭据却读不到**时，
+   * 粘贴正确 key 必须是**修复**，不能被 `existed` 挡回去。
+   *
+   * ## 为什么这是 P1 而不是「无害的静默复用」
+   *
+   * 「账号在、凭据缺」是**产品自己能造出来的**状态：`exportBackup` 遇到凭据
+   * 缺失的账号时把账号写进备份、凭据从字典里略掉（只留一条 warning），
+   * 用 replace 模式导回就得到 `imported=1, credentialsImported=0`。
+   * 其它来源：`.credentials.yaml` 被清理/部分损坏、第三方备份转换器、手工编辑。
+   *
+   * 旧实现在这里直接 `return existed:true`（源码里 `existed:true` 的下标
+   * **严格早于** `credentials.set` ⇒ 是**根本没走到写**，不是写失败），于是：
+   *
+   * 1. 用户看到「该 key 已存在，已为你定位到原有账号」——**以为修好了**；
+   * 2. 凭据一个字节都没落盘；
+   * 3. 该账号在推理路径被 `parsed.api_key ?? OPENCODE.anonymousKey` 降级成
+   *    匿名免费通道 ⇒ 付费 key 完全失效，而**面板卡片一切正常、零日志**；
+   * 4. opencode 只有 5 个 RPC 方法、**没有** `setApiKey` ⇒ 唯一出路是
+   *    「先删后加」，而用户没有任何线索指向这一步。
+   *
+   * ⇒ 判据：命中同 id 时**必须先确认凭据真的在**，不在就覆盖写并如实回报。
+   */
+  it('★★ P1：池里有同 id 但凭据读不到 ⇒ 必须写入凭据（不得被 existed 挡回）', async () => {
+    const { call, pool, ctx } = harness()
+    const id = `opencode-${VALID_KEY.slice(-8).toLowerCase()}`
+    pool.listAccountsByProvider.mockReturnValue([{ id, enabled: true, credentialRef: 'OPENCODE_ACCOUNT_OLD' }])
+    // 凭据读不到（undefined = 这条 ref 在凭据存储里不存在）
+    ctx.credentials.resolve.mockResolvedValue(undefined)
+
+    const r = await call('opencode.addAccount', { apiKey: VALID_KEY })
+
+    expect(r.ok).toBe(true)
+    // 枢轴断言 1：**必须**真的写凭据（修复前这里是 0 次）
+    expect(ctx.credentials.set).toHaveBeenCalledTimes(1)
+    const value = String((ctx.credentials.set as never as { mock: { calls: [string, string][] } }).mock.calls[0]![1])
+    expect((JSON.parse(value) as { api_key: string }).api_key).toBe(VALID_KEY)
+    // 枢轴断言 2：不得再声称「已存在」—— 那是让用户以为修好了的那句话
+    expect((r.value as { existed: boolean }).existed).toBe(false)
+    // 枢轴断言 3：不新增条目（否则同一把 key 会有两条账号）
+    expect(pool.addAccount).not.toHaveBeenCalled()
+    // 枢轴断言 4：**写进去的凭据必须落在池条目实际引用的那个 ref 上**，
+    // 否则写进去没人引用（等于没修）。该 ref 本来合法 ⇒ 不需要 updateAccount；
+    // 若实现改用了新 ref 却忘了纠正引用，这里的相等断言会变红。
+    const writtenRef = String((ctx.credentials.set as never as { mock: { calls: [string, string][] } }).mock.calls[0]![0])
+    expect(writtenRef).toBe('OPENCODE_ACCOUNT_OLD')
+  })
+
+  it('★★ P1：凭据存在但**内容损坏**（非 JSON / 缺 api_key）⇒ 同样必须修复', async () => {
+    for (const broken of ['不是 JSON', '{}', JSON.stringify({ api_key: '' })]) {
+      const { call, pool, ctx } = harness()
+      const id = `opencode-${VALID_KEY.slice(-8).toLowerCase()}`
+      pool.listAccountsByProvider.mockReturnValue([{ id, enabled: true, credentialRef: 'OPENCODE_ACCOUNT_OLD' }])
+      ctx.credentials.resolve.mockResolvedValue({ value: broken, source: 'file' })
+
+      const r = await call('opencode.addAccount', { apiKey: VALID_KEY })
+
+      expect(r.ok, broken).toBe(true)
+      expect(ctx.credentials.set, broken).toHaveBeenCalledTimes(1)
+      expect((r.value as { existed: boolean }).existed, broken).toBe(false)
+    }
+  })
+
+  it('⚠️ 反向对照：凭据完好且 api_key 不同 ⇒ 仍按「已存在」复用，**不覆盖**别人的凭据', async () => {
+    // 这条防「凡命中就覆盖写」的过度修复：同尾段但**不同 key** 时，
+    // 覆盖会给那个账号换成另一把 key（用户以为在加新号，实际改掉了旧号）。
+    const { call, pool, ctx } = harness()
+    const id = `opencode-${VALID_KEY.slice(-8).toLowerCase()}`
+    pool.listAccountsByProvider.mockReturnValue([{ id, enabled: true, credentialRef: 'OPENCODE_ACCOUNT_OLD' }])
+    ctx.credentials.resolve.mockResolvedValue({ value: JSON.stringify({ api_key: `sk-${'b'.repeat(48)}` }), source: 'file' })
+
+    const r = await call('opencode.addAccount', { apiKey: VALID_KEY })
+
+    expect((r.value as { existed: boolean }).existed).toBe(true)
+    expect(ctx.credentials.set).not.toHaveBeenCalled()
   })
 })
 

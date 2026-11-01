@@ -175,6 +175,34 @@ export async function claimAllCompensation(accounts, onStatus, onClaim) {
 }
 
 /**
+ * 补偿卡片是否**值得渲染**。
+ *
+ * ⚠️⚠️ 用户 2026-10-26 要求「常驻改为领取后隐藏」：这张卡原本只要 `compensation`
+ *    非 null 就常驻，于是**全部领完之后**面板顶部仍挂着一行「补偿积分已领取 /
+ *    限时活动，过期后上游会返回「活动已结束」。」—— 一条纯占位的死文案。
+ *
+ * 判据（三条都只在「还有事要做 / 还有话要说」时才渲染）：
+ *  1. `error !== null`  ⇒ 查询失败要如实说（否则用户以为没有补偿，实际是没查到）；
+ *  2. `total > 0`       ⇒ 还有积分可领（主场景）；
+ *  3. `errorCount > 0`  ⇒ 部分账号没查到 —— 虽然没得领，但结论不完整，必须透出。
+ *
+ * ⚠️ **`scanned === 0` 时隐藏**（还没有 CodeBuddy 账号）：那时整块账号管理区
+ *    本身就是空的，再挂一张「尚未添加 CodeBuddy 账号」是重复提示。
+ * ⚠️ **不得**用 `claimableCount > 0` 代替 `total > 0`：额度是 `creditNum`，
+ *    上游可能回一个 `creditNum: 0` 的「可领但为 0」，那不是待办。
+ *
+ * @param {ReturnType<typeof toCompensationState>|null} state
+ * @returns {boolean}
+ */
+export function shouldShowCompensation(state) {
+  if (state === null) return false
+  if (state.error) return true
+  if (state.total > 0) return true
+  if (state.errorCount > 0) return true
+  return false
+}
+
+/**
  * 补偿卡片的**主文案**（如实展示，不做任何推断）。
  *
  * @param {ReturnType<typeof toCompensationState>} state
@@ -195,6 +223,12 @@ export function compensationHeadline(state) {
 /**
  * 补偿卡片的**副文案**。
  *
+ * ⚠️ 用户 2026-10-26：「常驻改为领取后隐藏」。副文案在「已领完」那条分支上
+ *    原本还印着「限时活动，过期后上游会返回「活动已结束」。」—— 那是给
+ *    **没领之前**的人看的说明，领完之后只剩噪音。现在该分支返回空串，
+ *    卡片本身也被 `shouldShowCompensation` 挡掉（双保险：万一哪天有人
+ *    放宽了渲染条件，也不会把这条死文案带回来）。
+ *
  * @param {ReturnType<typeof toCompensationState>} state
  * @returns {string}
  */
@@ -205,5 +239,6 @@ export function compensationHint(state) {
     return `可领取账号 ${state.claimableCount} / ${state.scanned} 个（按账号独立，每账号限领一次）${partial}`
   }
   if (state.error) return '该能力为附加信息，不影响账号列表的使用。'
-  return '限时活动，过期后上游会返回「活动已结束」。'
+  // 已领完 / 无可领：不印任何说明（卡片已被 shouldShowCompensation 隐藏）。
+  return ''
 }

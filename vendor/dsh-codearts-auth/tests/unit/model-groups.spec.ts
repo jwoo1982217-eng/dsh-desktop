@@ -185,9 +185,12 @@ describe('Jet Hub 面板的分组接线', () => {
     expect(client).not.toMatch(/filtered\.map\(model => React\.createElement\(ModelToggle/)
   })
 
-  it('组头带折叠、计数与「本组全开/全关」', () => {
+  it('组头带折叠、计数与「全开/全关」', () => {
     expect(client).toMatch(/dim-jh-modelGroupHead/)
     expect(client).toMatch(/dim-jh-modelGroupToggle/)
+    // ⚠️ 文案是裸的「全开 / 全关」：模型列表弹窗顶部那排「打开全部 / 关闭全部」
+    //    已于 2026-10-26 按用户要求删除，两排并列的歧义不复存在。
+    //    （中途曾为了区分改成「本组全开 / 本组全关」，工具条删掉后又改了回来。）
     expect(client).toMatch(/'全开'/)
     expect(client).toMatch(/'全关'/)
     expect(client).toMatch(/onClick: \(\) => toggleGroup\(group\)/)

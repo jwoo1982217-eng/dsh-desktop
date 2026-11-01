@@ -400,3 +400,38 @@ describe('OpenAI gateway config', () => {
     expect(readFileSync(join(home, 'openai-gateway', 'api-key'), 'utf8')).toBe(first)
   })
 })
+
+/**
+ * 「允许局域网访问」设置页开关（2026-10-20）在配置解析层的语义。
+ *
+ * ⚠️ 与 IKL7UN 闸门的关系必须用用例锁死：开关是**程序内字面量**（不经 env
+ * 字符串解析链），因此允许通配；但 env 字符串里的通配值**仍然**必须被闸门
+ * 拒绝 —— 开关不能变成「顺便绕过 fail-closed 闸门」的通道。
+ */
+describe('「允许局域网访问」开关（resolveGatewayConfig 的 allowLan）', () => {
+  it('★ 打开且 env 未给 host ⇒ 绑 0.0.0.0（全部网卡，局域网可达）', () => {
+    expect(resolveGatewayConfig({}, { allowLan: true })).toEqual({ host: '0.0.0.0', port: 8326 })
+    // 空串/纯空白不算「显式给了 host」⇒ 开关照常生效（与默认值回落同一判据）。
+    expect(resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: '' }, { allowLan: true }).host).toBe('0.0.0.0')
+    expect(resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: '   ' }, { allowLan: true }).host).toBe('0.0.0.0')
+  })
+
+  it('打开但 env 显式给了 host ⇒ env 优先（运维口径高于 UI 开关）', () => {
+    expect(resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: '172.21.0.8' }, { allowLan: true }).host).toBe('172.21.0.8')
+    expect(resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: '127.0.0.1' }, { allowLan: true }).host).toBe('127.0.0.1')
+  })
+
+  it('关闭或未传 ⇒ 行为与修复前逐字节一致（默认 127.0.0.1，老用户零变化）', () => {
+    expect(resolveGatewayConfig({}).host).toBe('127.0.0.1')
+    expect(resolveGatewayConfig({}, { allowLan: false }).host).toBe('127.0.0.1')
+    expect(resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: '172.21.0.8' }, {}).host).toBe('172.21.0.8')
+  })
+
+  it('★ env 通配值仍被拒绝：开关打开也不能让字符串解析链「顺便」通配', () => {
+    expect(() => resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: '0.0.0.0' }, { allowLan: true }))
+      .toThrow(/通配/)
+    // 第三轮审计的实测样本（表意句号真绑全网卡）在开关打开时同样必须被拦。
+    expect(() => resolveGatewayConfig({ DSH_OPENAI_GATEWAY_HOST: '0\u30020\u30020\u30020' }, { allowLan: true }))
+      .toThrow()
+  })
+})

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
+import { createToolResultMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { DEFAULT_IMAGE_LIMITS, parseImageDataUrl, toImageBlock, } from './images.js';
 import { isThinkingOffEffort, translateReasoningEffort } from '../reasoning-ladder.js';
 // ⚠️ 复用 `src/sse.ts` 的**同一份**「工具名是否可用」判据（各适配器的
@@ -53,6 +53,10 @@ export const GATEWAY_SOURCE_KIND = 'openai-gateway';
  */
 export function gatewayToolResultBlock(toolCallId, content) {
     return { type: 'tool-result', toolCallId, content };
+}
+/** 工具结果由当前宿主工厂构造，兼容旧包裹块和新 role:tool。 */
+export function createGatewayToolMessage(toolCallId, content, isError) {
+    return createToolResultMessage({ callId: toolCallId, content, isError: isError === true });
 }
 /**
  * CodeArts 单次输出的安全上限。
@@ -410,7 +414,11 @@ callIds) {
         // `arguments` 实测不拦，故原样传递（改它会破坏「工具调用参数是要回读的证据」）。
         const text = rewriteTencentContentFingerprints(textFromContent(value.content), provider);
         // ⚠️ 先累积再构造（0.2.0 的 content 是 readonly，不能事后 push）。
-        const content = text.length > 0 ? [{ type: 'text', text }] : [];
+        const reasoning = typeof value.reasoning_content === 'string' ? value.reasoning_content : typeof value.reasoning === 'string' ? value.reasoning : '';
+        const content = [
+            ...(reasoning.length ? [{ type: 'reasoning', text: reasoning }] : []),
+            ...(text.length ? [{ type: 'text', text }] : []),
+        ];
         if (value.tool_calls !== undefined) {
             const calls = convertToolCalls(value.tool_calls);
             content.push(...calls);
@@ -429,7 +437,7 @@ callIds) {
             // ⚠️ 边界如实标注：**无** `tool_calls` 的空 assistant（`content:''`）在改前
             // 也产出同形，故这**不是本次引入的回归**；但本次修法把它从「罕见」变成
             // 「坏块会话的必经路径」（坏块会话一定会走到这里），故一并堵上。
-            if (calls.length === 0 && text.length === 0)
+            if (content.length === 0)
                 return undefined;
         }
         return createGatewayMessage('assistant', content, { kind: 'model', provider, model });
@@ -440,7 +448,7 @@ callIds) {
         }
         if (callIds.dropped.has(value.tool_call_id) && !callIds.kept.has(value.tool_call_id))
             return undefined;
-        return { ...createGatewayMessage('tool', await partsFromContent(value.content, bridge, limits), { kind: 'tool', callId: value.tool_call_id }), toolCallId: value.tool_call_id };
+        return createGatewayToolMessage(value.tool_call_id, await partsFromContent(value.content, bridge, limits));
     }
     throw new OpenAiGatewayError(`unsupported message role: ${String(role)}`);
 }

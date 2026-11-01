@@ -30,7 +30,19 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { browserCandidates, findBrowserExecutable } from '../../src/chromium-session.js'
+import {
+  browserCandidates,
+  browserNotFoundMessage,
+  decodeRegistryOutput,
+  decodeRegistryOutputWithFallback,
+  encodingForOemCodePage,
+  registryCodePage,
+  windowsRegisteredBrowserPaths,
+  findBrowserExecutable,
+  isBrowserDeploymentError,
+  scoopRootFromPath,
+  BrowserDeploymentError,
+} from '../../src/chromium-session.js'
 
 /**
  * 被扫描的源码文件。
@@ -125,6 +137,214 @@ afterEach(() => {
     else process.env[k] = v
   }
   for (const k of Object.keys(saved)) delete saved[k]
+})
+
+describe('Windows App Paths 浏览器发现', () => {
+  // ⚠️⚠️ **夹具必须是「真实形态」**（2026-10-30 四路审计 P0 D-01 / P2 D-4 修）：
+  //
+  // 旧夹具写的是 `'    (默认)    REG_SZ    D:\\\\Tools\\\\Chrome\\\\App\\\\chrome.exe\r\n'`
+  // —— ① 中文标签是 **UTF-8**（真实输出是 **GBK 字节**）；② 路径是**双反斜杠**
+  // （真实输出是**单反斜杠**）；③ 路径**根本不存在**。
+  // ⇒ 它只验证了「`REG_SZ` 这个 ASCII token 能找到」，**完全绕开了编码问题**
+  // ⇒ P0 D-01 正是从这条缝漏过去的。
+  //
+  // ⇒ 下面的夹具改成：**真实存在的临时文件** + **真实 GBK 字节**。
+
+  /** 造一个真实的、存在的可执行文件（`existsSync` 过滤要过）。 */
+  function makeRealExe(dirName: string, rel: string): string {
+    const dir = join(dirName, ...rel.split('/').slice(0, -1))
+    mkdirSync(dir, { recursive: true })
+    const exe = join(dirName, ...rel.split('/'))
+    writeFileSync(exe, '')
+    return exe
+  }
+
+  it('★★ **GBK 字节**的中文路径必须被正确解码（2026-10-30 审计 P0 D-01 修）', () => {
+    // ⚠️⚠️ **判据必须直接打解码器**（旧夹具把「已解码的文本」喂给注入点 ⇒
+    //    **完全绕开了编码问题** ⇒ P0 D-01 正是从这条缝漏过去的）。
+    //
+    //    真实 `reg query` 输出是**系统 OEM 代码页字节**（中文 Windows = GBK）。
+    //    旧实现写死 `encoding: 'utf8'` ⇒ 中文被解成 **U+FFFD（不可逆）**。
+    const gbkBytesOf = (text: string): Buffer => {
+      // Node 无 GBK **编码器**（`TextEncoder` 只有 utf8）⇒ 用已知字节表。
+      // ⚠️⚠️ 字节表必须**逐项反查验证**（2026-10-30 第二轮审计 N-4 修）：
+      //    原表把 `认` 写成 `[0xd0,0xb6]` ⇒ 实测解出的是 **`卸`**（另一个字！）
+      //    ⇒ 而夹具里用的是 `默`/`认` 的**标签**、路径用「我的工具」⇒
+      //    那张错表**从未被真正测到**（潜伏）⇒ 必须给表项**加守卫**。
+      //    下表每一项都由 `TextDecoder('gb18030')` 反查得出（见本用例的自证）。
+      const table: Record<string, readonly number[]> = {
+        '我': [0xce, 0xd2], '的': [0xb5, 0xc4], '工': [0xb9, 0xa4], '具': [0xbe, 0xdf],
+        '默': [0xc4, 0xac], '认': [0xc8, 0xcf],
+      }
+      // ⚠️ **自证**：表里每一项都必须**解回原字**（否则这张表是错的）。
+      for (const [ch, bytes] of Object.entries(table)) {
+        expect(new TextDecoder('gb18030').decode(Buffer.from(bytes)), `字节表项 ${ch} 必须解回自身`).toBe(ch)
+      }
+      const out: number[] = []
+      for (const ch of text) {
+        const bytes = table[ch]
+        if (bytes === undefined) out.push(...Buffer.from(ch, 'utf8'))
+        else out.push(...bytes)
+      }
+      return Buffer.from(out)
+    }
+    const raw = gbkBytesOf('    (默认)    REG_SZ    D:\\我的工具\\Chrome\\App\\chrome.exe\r\n')
+    // ⚠️ **自证**：这段字节确实是 GBK（按 utf8 解必然乱码、按 gb18030 解正常）。
+    //    ⚠️ `Buffer.toString` **只认 utf8/latin1/ucs2/base64 等**（无 gbk）⇒
+    //    GBK 的「正确解」必须走 `TextDecoder`（Node 内置支持 gbk/gb18030，实测）。
+    expect(raw.toString('utf8')).not.toBe(new TextDecoder('gb18030').decode(raw))
+    expect(new TextDecoder('gb18030').decode(raw)).toContain('我的工具')
+
+    // ⚠️ 判据：解码后中文**完整**、**没有 U+FFFD**。
+    const decoded = decodeRegistryOutput(raw, 'gb18030')
+    expect(decoded).toContain('我的工具')
+    expect(decoded).not.toContain('\uFFFD')
+    expect(decoded).toContain('D:\\我的工具\\Chrome\\App\\chrome.exe')
+    // ⚠️ 反向对照：旧的 utf8 口径**确实**会坏（证明这条用例有判别力）。
+    expect(raw.toString('utf8')).toContain('\uFFFD')
+  })
+
+  it('★★ 英文代码页（windows-1252）**不得**被 `gb18030` 解坏（2026-10-30 第二轮审计修）', () => {
+    // ⚠️⚠️ **两个解码器都能解任何字节序列**（`fatal: false`）⇒ 「先试 gb18030」
+    //    在**英文 Windows**上会把 1252 的字节解成**别的字符**：
+    //    `C:\Users\José\Chrome` ⇒ gb18030 解成 `C:\Users\Jos閈\Chrome`。
+    const raw = Buffer.from('C:\\Users\\Jos\u00e9\\Chrome', 'latin1')
+    // ⚠️ 自证：这段字节是 1252 的（`é` = 0xE9，位于 `Jos` 之后）。
+    expect(raw.indexOf(0xe9)).toBeGreaterThan(0)
+    expect(raw[raw.indexOf(0xe9)]).toBe(0xe9)
+    // ⚠️ 1252 解码器必须给出正确的 `é`
+    expect(decodeRegistryOutput(raw, 'windows-1252')).toContain('Jos\u00e9')
+    // ⚠️ 反向对照：**gb18030 确实会解坏**（证明这条用例有判别力）
+    expect(decodeRegistryOutput(raw, 'gb18030')).not.toContain('Jos\u00e9')
+  })
+
+  it('★★ 代码页判据必须**读权威的 OEMCP**（2026-10-30 第二轮审计 P1-1 修）', () => {
+    // ⚠️⚠️ **不能**按 locale 猜：日文 OEMCP=932（Shift-JIS）、韩文=949、
+    //    **繁体中文=950（Big5）** ⇒ 把 ja/ko/zh-TW 映射到 gb18030 **全错**
+    //    （实测 Shift-JIS 的 `あ` 被 gb18030 解成 `偁`、Big5 的 `中` 解成 `い`）。
+    // ⚠️ 而且 `Intl` 的 locale 是**用户区域格式**、不一定等于 UI 语言。
+    // ⇒ 权威来源：`HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage` 的 `OEMCP`。
+    expect(encodingForOemCodePage(936)).toBe('gb18030')
+    expect(encodingForOemCodePage(932)).toBe('shift_jis')
+    expect(encodingForOemCodePage(949)).toBe('euc-kr')
+    expect(encodingForOemCodePage(950)).toBe('big5')
+    expect(encodingForOemCodePage(1252)).toBe('windows-1252')
+    expect(encodingForOemCodePage(65001)).toBe('utf-8')
+    // ⚠️ 未知档 ⇒ 1252（**安全降级**：解错会被存在性过滤筛掉 ⇒「找不到」）
+    expect(encodingForOemCodePage(99999)).toBe('windows-1252')
+    // ⚠️ **OEMCP 优先于 locale**
+    expect(registryCodePage(936, 'en-US')).toBe('gb18030')
+    expect(registryCodePage(1252, 'zh-CN')).toBe('windows-1252')
+    // ⚠️ 读不到 OEMCP ⇒ locale 启发式（**只**把简体中文映射到 GBK）
+    expect(registryCodePage(undefined, 'zh-CN')).toBe('gb18030')
+    expect(registryCodePage(undefined, 'zh-TW')).toBe('windows-1252')
+    expect(registryCodePage(undefined, 'ja-JP')).toBe('windows-1252')
+    expect(registryCodePage(undefined, 'ko-KR')).toBe('windows-1252')
+    expect(registryCodePage(undefined, 'en-US')).toBe('windows-1252')
+  })
+
+  it('★★ 首选编码解出 U+FFFD ⇒ 自动重试候选编码（2026-10-30 第二轮审计修）', () => {
+    // ⚠️⚠️ `TextDecoder`（`fatal:false`）**不抛** ⇒ 首选编码猜错时只产出
+    //    U+FFFD ⇒ 路径被存在性过滤筛掉 ⇒ 整条注册表腿静默失效。
+    // ⇒ 必须有「重试」兜底。
+    const raw = Buffer.from('C:\\Users\\Jos\u00e9\\Chrome', 'latin1')
+    // ⚠️ 首选 gb18030（**错**的）⇒ 兜底必须救回来
+    const rescued = decodeRegistryOutputWithFallback(raw, 'gb18030')
+    expect(rescued).toContain('Jos\u00e9')
+    expect(rescued).not.toContain('\uFFFD')
+    // ⚠️ 反向对照：纯 ASCII 输出**首选即命中**（零额外开销）
+    const ascii = Buffer.from('C:\\Program Files\\Chrome\\chrome.exe', 'latin1')
+    expect(decodeRegistryOutputWithFallback(ascii, 'gb18030')).toBe('C:\\Program Files\\Chrome\\chrome.exe')
+  })
+
+  it('★★ 解码后的中文路径**能过存在性过滤**并成为候选（端到端）', () => {
+    if (process.platform !== 'win32') {
+      expect(windowsRegisteredBrowserPaths(() => ({ status: 0, stdout: 'x' }))).toEqual([])
+      return
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'reg-gbk-'))
+    try {
+      // ⚠️ **真实的中文目录名** + **真实存在的文件**（存在性过滤要过）。
+      const exe = makeRealExe(dir, '我的工具/Chrome/App/chrome.exe')
+      const found = windowsRegisteredBrowserPaths((key) => (
+        key.startsWith('HKCU') && key.endsWith('\\chrome.exe')
+          // ⚠️ 注入点给的是**已解码**的文本（与真实解码器输出一致）。
+          ? { status: 0, stdout: `    (默认)    REG_SZ    ${exe}\r\n` }
+          : { status: 1, stdout: '' }
+      ))
+      expect(found).toEqual([exe])
+      expect(found[0]).not.toContain('\uFFFD')
+      expect(found[0]).toContain('我的工具')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('★ 注册名 ≠ 文件名时**不得**误杀（2026-10-30 审计 P3-3 修）', () => {
+    if (process.platform !== 'win32') return
+    const dir = mkdtempSync(join(tmpdir(), 'reg-edge-'))
+    try {
+      // ⚠️ 真实形态：`App Paths\msedge.exe` 的默认值是 `Microsoft Edge.exe`
+      //    （实测本机）⇒ 旧守卫 `=== 'msedge.exe'` 会**误杀**它。
+      const exe = makeRealExe(dir, 'Microsoft Edge/Application/Microsoft Edge.exe')
+      const found = windowsRegisteredBrowserPaths((key) => (
+        key.endsWith('\\msedge.exe')
+          ? { status: 0, stdout: `    (Default)    REG_SZ    ${exe}\r\n` }
+          : { status: 1, stdout: '' }
+      ))
+      expect(found).toEqual([exe])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('★ `REG_EXPAND_SZ` 也**要认**（2026-10-30 审计 U6 修）', () => {
+    if (process.platform !== 'win32') return
+    const dir = mkdtempSync(join(tmpdir(), 'reg-expand-'))
+    try {
+      const exe = makeRealExe(dir, 'Chrome/App/chrome.exe')
+      // ⚠️ 旧实现用 `/\bREG_SZ\b/i` ⇒ **不匹配** `REG_EXPAND_SZ`
+      //    （`\b` 在 `_` 前不成立）⇒ 整行被跳过。
+      const found = windowsRegisteredBrowserPaths((key) => (
+        key.endsWith('\\chrome.exe')
+          ? { status: 0, stdout: `    (Default)    REG_EXPAND_SZ    ${exe}\r\n` }
+          : { status: 1, stdout: '' }
+      ))
+      expect(found).toEqual([exe])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('★ **不存在的路径不产生候选**（存在性过滤，2026-10-30 审计 P2-1 修）', () => {
+    if (process.platform !== 'win32') return
+    // ⚠️ 标准安装会推出 `C:\Program Files\Google\Data` 这种**垃圾路径** ⇒
+    //    存在性过滤把它筛掉（否则污染目录列表 + 扫无关目录的 localStorage）。
+    const found = windowsRegisteredBrowserPaths((key) => (
+      key.endsWith('\\chrome.exe')
+        ? { status: 0, stdout: '    (Default)    REG_SZ    C:\\不存在的路径\\App\\chrome.exe\r\n' }
+        : { status: 1, stdout: '' }
+    ))
+    expect(found).toEqual([])
+  })
+
+  it('★ 查询失败或路径不完整时不产生候选', () => {
+    const found = windowsRegisteredBrowserPaths(() => ({ status: 0, stdout: '    (默认)    REG_SZ\r\n' }))
+    expect(found).toEqual([])
+  })
+
+  it('★ 非 Windows 平台**不执行**注册表查询（平台闸门）', () => {
+    if (process.platform === 'win32') {
+      // Windows 上闸门是「不短路」⇒ 断言查询器**被调用过**。
+      let called = 0
+      windowsRegisteredBrowserPaths(() => { called += 1; return { status: 1, stdout: '' } })
+      expect(called).toBeGreaterThan(0)
+      return
+    }
+    let called = 0
+    windowsRegisteredBrowserPaths(() => { called += 1; return { status: 0, stdout: 'x' } })
+    expect(called, '非 Windows 不得执行注册表查询').toBe(0)
+  })
 })
 
 describe('ZCode 浏览器探测', () => {
@@ -559,5 +779,480 @@ describe('ZCode 浏览器探测', () => {
     }
     // 确认剥注释后正文仍在（否则说明 stripComments 过度，把代码也吃掉了）。
     expect(code).toContain('join(')
+  })
+})
+
+/**
+ * Gitee issue IKQ4JN：**scoop 装在非默认根时一个 chromium 都找不到**。
+ *
+ * ## 为什么这一组必须存在（它补的正是漏掉的那一格）
+ *
+ * 既有用例（「SCOOP 显式声明的根目录优先于默认 ~/scoop」）只覆盖了
+ * **`SCOOP` 有值**的情形。而报障人的机器上 `SCOOP` / `SCOOP_GLOBAL` **都是空的**
+ * （用 `root_path` 把根挪到 `D:\System_Tools\Scoop`），`~/scoop` 也不存在
+ * ⇒ 两条腿同时落空 ⇒ 候选链 9 条全部 `existsSync === false`。
+ *
+ * ⇒ 缺的判据就是「**环境变量为空 + 根不在默认位置**」这一格。
+ * 它是本 issue 的**可复现最小条件**，也是当初这个 bug 穿过全部测试的原因。
+ */
+describe('scoop 非默认根（IKQ4JN 根因①）', () => {
+  /** 报障人的机器：scoop 在 D 盘、SCOOP 为空、~/scoop 不存在。 */
+  const reporterEnv = {
+    LOCALAPPDATA: 'C:\\Users\\reporter\\AppData\\Local',
+    PROGRAMFILES: 'C:\\Program Files',
+    'PROGRAMFILES(X86)': 'C:\\Program Files (x86)',
+    PATH: 'D:\\System_Tools\\Scoop\\shims;C:\\Windows\\system32',
+    // ⚠️ 刻意不给 SCOOP / SCOOP_GLOBAL —— 这正是 issue 的实测状态。
+  }
+  const reporterHome = 'C:\\Users\\reporter'
+  /** shims 存在性替身：只有 D 盘那个是真的。 */
+  const shimsWithScoop = (p: string): boolean =>
+    p === 'D:\\System_Tools\\Scoop\\shims\\scoop.cmd'
+    || p === 'D:\\System_Tools\\Scoop\\shims\\scoop.ps1'
+
+  it('★★ 从 PATH 反推 scoop 根（不依赖 SCOOP 变量）', () => {
+    expect(scoopRootFromPath(reporterEnv, shimsWithScoop)).toBe('D:\\System_Tools\\Scoop')
+  })
+
+  it('★★ 报障场景：候选链里必须出现真实的 scoop 根', () => {
+    const list = browserCandidates({
+      platform: 'win32',
+      env: reporterEnv,
+      home: reporterHome,
+      exists: shimsWithScoop,
+    })
+    expect(
+      list,
+      '候选链里没有 D:\\System_Tools\\Scoop ⇒ 非默认根机器的 ZCode 领取恒失败',
+    ).toContain('D:\\System_Tools\\Scoop\\apps\\chromium\\current\\chrome.exe')
+  })
+
+  it('★ 反推出来的档**排在默认 ~/scoop 之前**（实测到的根优先于默认推导）', () => {
+    const list = browserCandidates({
+      platform: 'win32',
+      env: reporterEnv,
+      home: reporterHome,
+      exists: shimsWithScoop,
+    })
+    const derived = list.indexOf('D:\\System_Tools\\Scoop\\apps\\chromium\\current\\chrome.exe')
+    const fallback = list.indexOf('C:\\Users\\reporter\\scoop\\apps\\chromium\\current\\chrome.exe')
+    expect(derived).toBeGreaterThanOrEqual(0)
+    expect(fallback).toBeGreaterThan(derived)
+  })
+
+  it('★ 显式 SCOOP 仍**优先于** PATH 反推（既有契约不变）', () => {
+    const list = browserCandidates({
+      platform: 'win32',
+      env: { ...reporterEnv, SCOOP: 'E:\\explicit-scoop' },
+      home: reporterHome,
+      exists: shimsWithScoop,
+    })
+    const explicit = list.indexOf('E:\\explicit-scoop\\apps\\chromium\\current\\chrome.exe')
+    const derived = list.indexOf('D:\\System_Tools\\Scoop\\apps\\chromium\\current\\chrome.exe')
+    expect(explicit).toBe(0)
+    expect(derived).toBeGreaterThan(explicit)
+  })
+
+  it('⚠️ 目录名叫 shims 但**没有 scoop 自己的 shim** ⇒ 不认（防误命中）', () => {
+    // 某些 SDK 也有 shims 子目录；只按目录名匹配会误判成 scoop 根。
+    expect(scoopRootFromPath(reporterEnv, () => false)).toBeUndefined()
+  })
+
+  it('⚠️ PATH 里的引号包裹能剥掉（安装器写坏时常见）', () => {
+    const env = { PATH: '"D:\\System_Tools\\Scoop\\shims";C:\\Windows' }
+    expect(scoopRootFromPath(env, shimsWithScoop)).toBe('D:\\System_Tools\\Scoop')
+  })
+
+  it('⚠️ 无 PATH / PATH 为空 ⇒ undefined（不抛错）', () => {
+    expect(scoopRootFromPath({}, shimsWithScoop)).toBeUndefined()
+    expect(scoopRootFromPath({ PATH: '' }, shimsWithScoop)).toBeUndefined()
+  })
+
+  it('⚠️ `Path`（首字母大写）也认 —— Windows 上两种拼写都出现过', () => {
+    const env = { Path: 'D:\\System_Tools\\Scoop\\shims' }
+    expect(scoopRootFromPath(env, shimsWithScoop)).toBe('D:\\System_Tools\\Scoop')
+  })
+
+  it('★ Windows 候选链补齐 Brave（IKQ4JN 附带建议 4）', () => {
+    const list = browserCandidates({
+      platform: 'win32',
+      env: reporterEnv,
+      home: reporterHome,
+      exists: () => false,
+    })
+    const brave = list.filter((p) => p.toLowerCase().includes('brave'))
+    expect(brave.length, 'Windows 候选链缺 Brave（mac/linux 早就有）').toBeGreaterThanOrEqual(3)
+    // ⚠️ Brave 必须排在 Edge 之前（Edge 是最后的兜底）。
+    const firstBrave = list.findIndex((p) => p.toLowerCase().includes('brave'))
+    const edge = list.findIndex((p) => p.toLowerCase().includes('msedge.exe'))
+    expect(firstBrave).toBeLessThan(edge)
+  })
+
+  it('⚠️ 候选链里**不得**出现 headless_shell（IKQ4JN 实测坑 2：恒 F001）', () => {
+    const list = browserCandidates({
+      platform: 'win32',
+      env: reporterEnv,
+      home: reporterHome,
+      exists: () => false,
+    })
+    for (const p of list) {
+      expect(p.toLowerCase(), 'chrome-headless-shell 能启动但 mint 恒 F001，不可加进候选')
+        .not.toContain('headless')
+    }
+  })
+})
+
+/**
+ * Gitee issue IKQ4JN 根因②：**部署错误不得计入 captcha 退避**。
+ *
+ * ## 为什么必须有这一组
+ *
+ * 原实现把「找不到浏览器」和「mint 产出失败」一视同仁地 `noteFailure()`，
+ * 于是第 3 次点击进入冷却，用户看到「设备信誉不足」——把部署问题说成信誉问题。
+ *
+ * ⚠️ 这组的判据是**行为级**（抛真的错误对象、断言计数不变），
+ * 而不是「源码里有没有 `isBrowserDeploymentError`」这种文本断言。
+ */
+describe('部署错误不计入 captcha 退避（IKQ4JN 根因②）', () => {
+  it('★★ 部署错误可被识别；普通产出错误不可', () => {
+    const deploy = new BrowserDeploymentError('找不到浏览器', 'browser-not-found')
+    expect(isBrowserDeploymentError(deploy)).toBe(true)
+    expect(isBrowserDeploymentError(new Error('mint F001'))).toBe(false)
+    expect(isBrowserDeploymentError(null)).toBe(false)
+    expect(isBrowserDeploymentError('字符串')).toBe(false)
+    // ⚠️ 名字对但 deployKind 不合法 ⇒ 不认（防第三方恰好同名）。
+    const impostor = Object.assign(new Error('x'), { name: 'BrowserDeploymentError', deployKind: 'whatever' })
+    expect(isBrowserDeploymentError(impostor)).toBe(false)
+  })
+
+  it('★★ 部署错误**不累计** streak（连抛 5 次仍不进冷却）', async () => {
+    const { CaptchaBackoff } = await import('../../src/captcha-backoff.js')
+    const backoff = new CaptchaBackoff({ threshold: 3, baseMs: 60_000 })
+    // 模拟 zcode-auth 的 catch 分支：部署错误**跳过** noteFailure。
+    for (let i = 0; i < 5; i++) {
+      const error = new BrowserDeploymentError('找不到浏览器', 'browser-not-found')
+      if (!isBrowserDeploymentError(error)) backoff.noteFailure()
+    }
+    expect(backoff.failureStreak(), '部署错误被计入了信誉退避').toBe(0)
+    expect(backoff.remainingMs(), '部署错误触发了冷却 ⇒ 用户会看到「设备信誉不足」').toBe(0)
+  })
+
+  it('★★ 对照：普通产出错误**照常**累计并进入冷却（护栏没被拆掉）', async () => {
+    const { CaptchaBackoff } = await import('../../src/captcha-backoff.js')
+    const backoff = new CaptchaBackoff({ threshold: 3, baseMs: 60_000 })
+    for (let i = 0; i < 3; i++) {
+      const error = new Error('mintOnPage: F001')
+      if (!isBrowserDeploymentError(error)) backoff.noteFailure()
+    }
+    expect(backoff.failureStreak()).toBe(3)
+    expect(backoff.remainingMs(), '产出失败必须仍能进冷却（那是信誉护栏）').toBeGreaterThan(0)
+  })
+})
+
+/**
+ * Gitee issue IKQ4JN 附带建议 1/3：找不到浏览器时**摊开**已尝试的候选与变量值。
+ */
+describe('找不到浏览器时的可执行提示（IKQ4JN 附带建议 1/3）', () => {
+  it('★ 回显本进程看到的 override 值 + 逐条候选路径', () => {
+    const message = browserNotFoundMessage('win32', 'ZCODE_CHROME_PATH', {
+      tried: ['C:\\a\\chrome.exe', 'C:\\b\\msedge.exe'],
+      overrideValue: undefined,
+    })
+    expect(message).toContain('本进程看到的 ZCODE_CHROME_PATH = （未设置）')
+    expect(message).toContain('本次已尝试 2 条候选')
+    expect(message).toContain('C:\\a\\chrome.exe')
+    expect(message).toContain('C:\\b\\msedge.exe')
+  })
+
+  it('★ 设了变量时回显它的值（用来分辨「变量没生效」与「路径写错」）', () => {
+    const message = browserNotFoundMessage('win32', 'ZCODE_CHROME_PATH', {
+      tried: [],
+      overrideValue: 'D:\\my\\chrome.exe',
+    })
+    expect(message).toContain('本进程看到的 ZCODE_CHROME_PATH = D:\\my\\chrome.exe')
+  })
+
+  it('⚠️ 空候选链也要说清（不留一片空白）', () => {
+    const message = browserNotFoundMessage('win32', 'ZCODE_CHROME_PATH', { tried: [] })
+    expect(message).toContain('没有产生任何候选路径')
+  })
+
+  it('★★ 省略 detail ⇒ 与修复前**逐字节相同**（老调用方不受影响）', () => {
+    // 既有用例与库库AI 的调用点都只传前两个参数；输出必须不变。
+    const withoutDetail = browserNotFoundMessage('win32')
+    expect(withoutDetail).not.toContain('本进程看到的')
+    expect(withoutDetail).toContain('可用 ZCODE_CHROME_PATH 显式指定 chrome.exe 路径')
+    // Windows 文案必须提 Brave（候选链已补）。
+    expect(withoutDetail).toContain('Brave')
+  })
+})
+
+/**
+ * **接线守卫**：`zcode-auth.ts` 的 catch 分支必须真的用上部署错误判据。
+ *
+ * ## ⚠️⚠️ 为什么这一格只能靠源码判据（如实登记）
+ *
+ * 该分支在 `CaptchaPool` 的 `mint` 回调闭包里，要真跑需要构造整个
+ * `ZcodeAuth` + 池 + 浏览器替身，成本远高于收益（而那套编排另有
+ * `zcode-captcha-guard.spec.ts` / `zcode-carrier-auth.spec.ts` 覆盖）。
+ *
+ * ## ⚠️ 但判据必须**锚定结构关系**，不能只查「有没有这个词」
+ *
+ * 本仓库记过：`expect(src).toContain('isBrowserDeploymentError')` 这类断言
+ * 对「`if (false && isBrowserDeploymentError(error))`」**完全无感**
+ * —— 实测确认过这个变异全绿。
+ *
+ * ⇒ 判据写成两条**位置关系**：
+ * ① 部署错误分支必须 `throw error`（早退，不落到下面的计数）；
+ * ② 该分支必须**出现在** `noteFailure()` 之前。
+ */
+describe('zcode-auth 的 catch 分支接线（IKQ4JN 根因②）', () => {
+  const authPath = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'zcode-auth.ts')
+
+  it('★★ 部署错误分支必须早退（`throw error`）且在 noteFailure **之前**', () => {
+    const code = stripComments(readFileSync(authPath, 'utf8'))
+    const branchAt = code.indexOf('isBrowserDeploymentError(error)')
+    expect(branchAt, 'zcode-auth 的 catch 里没有部署错误分支').toBeGreaterThan(-1)
+    const noteAt = code.indexOf('captchaBackoff.noteFailure()')
+    expect(noteAt, '找不到 noteFailure 调用点（判据锚点失效）').toBeGreaterThan(-1)
+    expect(
+      branchAt,
+      '部署错误分支必须在 noteFailure 之前 ⇒ 否则它照样会累计 streak',
+    ).toBeLessThan(noteAt)
+    // 分支体里必须有 `throw error`（早退），且它出现在 noteFailure 之前。
+    const between = code.slice(branchAt, noteAt)
+    expect(between, '部署错误分支没有 throw error ⇒ 会继续落到 noteFailure').toContain('throw error')
+  })
+
+  /**
+   * ⚠️⚠️ **条件必须是精确等价，不是「禁几种假值前缀」**（对抗审计实测打穿）。
+   *
+   * 初版写 `/^\s*(?:false|0|''|""|null|undefined)\s*&&/` 只禁「假值常数 + `&&`」，
+   * 而对抗审计实测**三种写法全部绕过**（判据全绿）：
+   *
+   * | 写法 | 后果 |
+   * |---|---|
+   * | `isBrowserDeploymentError(error) === false` | 分支永不执行 ⇒ 根因②修复整体失效**且**所有普通错误被误当部署错误而不计数 |
+   * | `isBrowserDeploymentError(error) \|\| true` | **所有**错误都不计数/不冷却 ⇒ `CaptchaBackoff` 整道信誉护栏被静默拆除（最危险） |
+   * | `isBrowserDeploymentError(error) && <恒假>` | 等价回归到修复前 |
+   *
+   * ⇒ 判据改成「**条件去掉外层空白后必须逐字等于** `isBrowserDeploymentError(error)`」，
+   * 或它的合法取反 `!isBrowserDeploymentError(error)`（那种形态下分支语义相反，
+   * 但**本仓库不这么写**，故一并禁止 —— 允许它只会给绕过留口子）。
+   *
+   * 这是「白名单」而不是「黑名单」：任何多余的运算符/常量都会让它变红。
+   */
+  it('★★ 部署错误分支的条件必须**精确**（禁所有绕过写法）', () => {
+    const code = stripComments(readFileSync(authPath, 'utf8'))
+    const guard = code.match(/if\s*\(([^()]*isBrowserDeploymentError\([^()]*\)[^()]*)\)/)
+    expect(guard, '找不到部署错误分支的 if 条件（判据锚点失效）').not.toBeNull()
+    const condition = guard![1]!.trim()
+    /**
+     * ⚠️ 白名单只有一种合法形态。多加 `=== false`、`|| true`、`&& …`、
+     * 三元、`Boolean(...)` 包装等**全部变红**。
+     * 分隔符统一按源码实际写法（`isBrowserDeploymentError(error)`）。
+     */
+    expect(
+      condition,
+      `部署错误分支的条件被改写了 ⇒ 根因②的修复可能整体失效、或信誉护栏被拆：if (${condition})`,
+    ).toBe('isBrowserDeploymentError(error)')
+  })
+
+  it('★★ 对照：`noteFailure()` 仍**存在且未被注释掉**（护栏没被拆）', () => {
+    const code = stripComments(readFileSync(authPath, 'utf8'))
+    // ⚠️ 剥注释后仍有它 ⇒ 它不是在注释里（注释诱饵）。
+    expect(code).toContain('captchaBackoff.noteFailure()')
+    // 且不在 `if (false)` 之类的死条件里（本仓库反复记录的假绿形态）。
+    expect(code).not.toMatch(/if\s*\(\s*false\s*\)[^\n]*noteFailure/)
+  })
+})
+
+/**
+ * **去重**：反推根与默认 `~/scoop` 是同一个目录时，候选链里只应出现一次。
+ *
+ * ## ⚠️ 为什么必须单独守（实测无牙）
+ *
+ * 实测：把 `sameAsDefault` 恒置 `false`（= 不去重）时，**全部 34 条用例仍全绿**。
+ * 后果不是崩溃，而是：
+ * - 「找不到浏览器」的报错里同一条路径**重复列出**（用户以为扫了两个地方）；
+ * - 既有 `list.find(c => c.includes('scoop'))` 这类「取第一条」的判据，
+ *   取到哪一条**取决于真实环境**（`zcode-browser-home-source` 两条用例
+ *   就是这样变红的）。
+ *
+ * ⇒ 判据必须是**行为级**的「候选里不出现重复路径」，而不是源码里有没有那个变量。
+ */
+describe('反推根与默认根相同时去重（IKQ4JN）', () => {
+  /** shims 与 scoop.cmd 都指向**家目录下**的 scoop（= 与 `~/scoop` 同一个根）。 */
+  const homeScoopShims = (p: string): boolean =>
+    p === 'C:\\Users\\me\\scoop\\shims\\scoop.cmd'
+
+  it('★★ 同一个根只出现一次（否则报错里重复、既有判据取哪条依赖环境）', () => {
+    const list = browserCandidates({
+      platform: 'win32',
+      env: { PATH: 'C:\\Users\\me\\scoop\\shims' },
+      home: 'C:\\Users\\me',
+      exists: homeScoopShims,
+    })
+    const scoopEntries = list.filter((p) => p.toLowerCase().includes('scoop'))
+    expect(scoopEntries.length, `scoop 候选重复了：${scoopEntries.join(' | ')}`).toBe(1)
+    expect(scoopEntries[0]).toBe('C:\\Users\\me\\scoop\\apps\\chromium\\current\\chrome.exe')
+  })
+
+  it('★ scoop 那两档不得重复（朴素但有效）', () => {
+    /**
+     * ⚠️ 只判 **scoop 那两档**，不判整条链。
+     *
+     * 整条链在「env 里没有任何 `PROGRAMFILES` / `LOCALAPPDATA`」时会天然产生
+     * **相对路径重复**（`join('', …)` 得 `Google\Chrome\…`）：那是
+     * `browserCandidates` 头部「坑 1」记录的**既有**形态，由
+     * `findBrowserExecutable` 的 `isAbsolute` 过滤兜住，**不是**本 issue 的范围。
+     * 把它写进断言会让本组在无关的既有行为上变红（实测踩到）。
+     */
+    const list = browserCandidates({
+      platform: 'win32',
+      env: { PATH: 'C:\\Users\\me\\scoop\\shims' },
+      home: 'C:\\Users\\me',
+      exists: homeScoopShims,
+    })
+    const scoopEntries = list.filter((p) => p.toLowerCase().includes('scoop'))
+    expect(new Set(scoopEntries).size, `scoop 档有重复：${scoopEntries.join(' | ')}`)
+      .toBe(scoopEntries.length)
+  })
+
+  it('★ 大小写 / 尾分隔符不同也算同一个根（Windows 语义）', () => {
+    // `PATH` 里写成大写、且带尾反斜杠 —— 仍是同一个目录。
+    const list = browserCandidates({
+      platform: 'win32',
+      env: { PATH: 'C:\\USERS\\ME\\SCOOP\\shims\\' },
+      home: 'C:\\Users\\me',
+      exists: (p) => p.toLowerCase() === 'c:\\users\\me\\scoop\\shims\\scoop.cmd',
+    })
+    expect(list.filter((p) => p.toLowerCase().includes('scoop')).length).toBe(1)
+  })
+
+  it('⚠️ 不同根时**两条都要保留**（去重不得误伤）', () => {
+    const list = browserCandidates({
+      platform: 'win32',
+      env: { PATH: 'D:\\Other\\Scoop\\shims' },
+      home: 'C:\\Users\\me',
+      exists: (p) => p === 'D:\\Other\\Scoop\\shims\\scoop.cmd',
+    })
+    // ⚠️ 用 `toLowerCase()` 过滤：反推出来的根是**大小写混合**的
+    //    （`D:\Other\Scoop` 里是大写 `S`），直接 `includes('scoop')` 会漏（实测踩到）。
+    const scoopEntries = list.filter((p) => p.toLowerCase().includes('scoop'))
+    expect(scoopEntries.length, '不同根被误去重 ⇒ 默认兜底丢了').toBe(2)
+    expect(scoopEntries[0]).toContain('D:\\Other\\Scoop')
+    expect(scoopEntries[1]).toContain('C:\\Users\\me\\scoop')
+  })
+})
+
+/**
+ * **冷却闸门不得自我放大**（对抗审计实测的 P0，IKQ4JN 附带修）。
+ *
+ * ## 实测的原始缺陷
+ *
+ * 闸门在 `ZcodeCaptchaBrowser` 内部，而调用侧的 catch 包住整个
+ * `mintWithOutcome` ⇒ 闸门抛的普通 `Error` 流回 catch ⇒ `noteFailure()` 一次
+ * ⇒ 冷却期内**每点一次，streak +1、冷却翻倍**。
+ *
+ * 实测：真失败 3 次进 60s 冷却后，用户再点 5 次（一次 mint 都没发出）
+ * ⇒ streak 4→8、冷却 60s → 120 → 240 → 480 → 960 → **1800s**。
+ */
+describe('冷却闸门不得自我放大（IKQ4JN）', () => {
+  it('★★ 冷却期内重复点击**不再累计** streak（否则 1 分钟被点成 30 分钟）', async () => {
+    const { CaptchaBackoff, CaptchaCooldownError, isCaptchaCooldownError } =
+      await import('../../src/captcha-backoff.js')
+    const backoff = new CaptchaBackoff({ threshold: 3, baseMs: 60_000, maxMs: 1_800_000 })
+    // 真失败 3 次 ⇒ 进 60s 冷却。
+    for (let i = 0; i < 3; i++) backoff.noteFailure()
+    const baseline = backoff.remainingMs()
+    expect(baseline).toBeGreaterThan(0)
+    // 冷却期内用户连点 5 次：闸门每次抛 CaptchaCooldownError。
+    for (let i = 0; i < 5; i++) {
+      const gateError = new CaptchaCooldownError('冷却中', backoff.remainingMs())
+      // 与 zcode-auth 的 catch 同构：冷却错误**跳过**计数。
+      if (!isCaptchaCooldownError(gateError)) backoff.noteFailure()
+    }
+    expect(backoff.failureStreak(), '冷却期内重复点击被计入 ⇒ streak 自我放大').toBe(3)
+    expect(
+      backoff.remainingMs(),
+      '冷却被点成了更长时间（原始缺陷：60s → 1800s）',
+    ).toBeLessThanOrEqual(baseline)
+  })
+
+  it('⚠️ `CaptchaCooldownError` 与普通 Error 可区分', async () => {
+    const { CaptchaCooldownError, isCaptchaCooldownError } = await import('../../src/captcha-backoff.js')
+    expect(isCaptchaCooldownError(new CaptchaCooldownError('x', 60_000))).toBe(true)
+    expect(isCaptchaCooldownError(new Error('x'))).toBe(false)
+    expect(isCaptchaCooldownError(null)).toBe(false)
+    // ⚠️ 名字对但缺 remainMs ⇒ 不认（防第三方同名）。
+    const impostor = Object.assign(new Error('x'), { name: 'CaptchaCooldownError' })
+    expect(isCaptchaCooldownError(impostor)).toBe(false)
+  })
+})
+
+/**
+ * **`scoopRootFromPath` 必须与宿主平台无关**（对抗审计 P1 修法）。
+ *
+ * 缺陷原状：用了 `node:path` 的**默认导出**（跟随宿主）。在 Linux/macOS 上
+ * `posix.basename('D:\\x\\shims')` 返回**整串**（反斜杠不是 POSIX 分隔符）
+ * ⇒ 永不等于 `'shims'` ⇒ 本函数在非 Windows 宿主上**恒 undefined**。
+ *
+ * ⇒ 修法是改用 `win32.*`。这条用例的价值：**它在本机（无论什么平台）都成立**，
+ * 所以 CI 换到 Linux 也不会静默失效。
+ */
+describe('scoop 路径解析与宿主平台无关（IKQ4JN）', () => {
+  it('★★ Windows 风格路径在任何宿主上都解析正确', () => {
+    // ⚠️ 断言的是「不管 process.platform 是什么，这个纯函数都给出同一答案」。
+    expect(
+      scoopRootFromPath(
+        { PATH: 'D:\\System_Tools\\Scoop\\shims' },
+        (p) => p === 'D:\\System_Tools\\Scoop\\shims\\scoop.cmd',
+      ),
+    ).toBe('D:\\System_Tools\\Scoop')
+  })
+
+  it('★ 尾分隔符 / 大小写 / 混合分隔符都认', () => {
+    for (const path of [
+      'D:\\System_Tools\\Scoop\\shims\\',   // 尾反斜杠
+      'D:\\System_Tools\\Scoop\\SHIMS',     // 大写
+      'D:\\System_Tools\\Scoop/shims',      // 混合分隔符
+    ]) {
+      expect(
+        scoopRootFromPath({ PATH: path }, () => true),
+        `${path} 未被识别`,
+      ).toBe('D:\\System_Tools\\Scoop')
+    }
+  })
+})
+
+/**
+ * **`detail.tried` 必须只列「真的会被尝试」的路径**（对抗审计 P1 修法）。
+ *
+ * `findBrowserExecutable()` 会跳过非绝对路径，而 `browserCandidates()` 原样返回
+ * 它们（空环境变量会产生相对路径 —— `browserCandidates` 头部「坑 1」的既有形态）。
+ * 若文案把相对路径也列进「已尝试」，用户会以为扫过那些位置。
+ */
+describe('报错里的「已尝试」必须是真的（IKQ4JN）', () => {
+  it('★★ 生产抛错点必须按 `isAbsolute` 过滤后再回显', () => {
+    const code = stripComments(readFileSync(sourcePath, 'utf8'))
+    // 锚在**具体表达式**上：调用 browserNotFoundMessage 时 tried 经过过滤。
+    expect(code, 'error message lists un-attempted relative candidates').toMatch(
+      /tried:\s*browserCandidates\(\)\.filter\([\s\S]{0,80}?isAbsolute\(/,
+    )
+  })
+
+  it('★ 相对路径候选确实存在（证明上面的过滤不是空谈）', () => {
+    // 环境变量全空 ⇒ 候选里确实有相对路径。
+    const list = browserCandidates({
+      platform: 'win32',
+      env: { PATH: '' },
+      home: 'C:\\Users\\me',
+      exists: () => false,
+    })
+    expect(
+      list.some((p) => p.length > 0 && !isAbsolute(p)),
+      '若这里为 false，说明过滤那一条已无必要，应删掉它并更新判据',
+    ).toBe(true)
   })
 })

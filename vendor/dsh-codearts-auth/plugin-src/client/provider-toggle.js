@@ -343,6 +343,60 @@ export function nextProviderOrderAfterDrop(openIds, closedIds, sourceId, targetI
 }
 
 /**
+ * 拖拽落点之后的完整顺序 —— **两组都能拖**（2026-10-26 用户需求）。
+ *
+ * ## 为什么要分成「组内」与「跨组」
+ *
+ * 组间顺序是**固定**的：已打开恒在前、已关闭恒在后（{@link providerSwitchRows}
+ * 保证）。用户把已关闭行拖到已打开行上面时，渲染结果会立刻弹回原位 ——
+ * 那种「拖得动但落不下」比拖不动更让人困惑。故跨组拖拽一律返回 `null`
+ * （= 无需变更，调用方不提交）。
+ *
+ * ## 两个分支
+ *
+ * - **两组都在已打开里** → 走 {@link nextProviderOrderAfterDrop}（既有逻辑：
+ *   已关闭 id 按「旧顺序里的直接前驱」插回，重开时回到用户排过的位置）。
+ * - **两组都在已关闭里** → 只在 closed 段内做 {@link orderAfterDrop}，open 段
+ *   原样保持。⚠️ 这里**不能**走 `nextProviderOrderAfterDrop`：它假设 source 在
+ *   open 段里，已关闭的 source 在 open 段查不到 ⇒ 直接返回 `null`。
+ *
+ * ## 结果数组的形状
+ *
+ * 返回 `[...openIds, ...新 closed 顺序]`。已打开段用**展示顺序**而非原 order
+ * 片段 —— 两者等价：展示顺序本身就是 `order` 经
+ * {@link sortOpenProvidersByOrder} 稳定排序得到的，且排序只看组内相对次序。
+ *
+ * @param {string[]} openIds 当前展示中已打开的供应商 id（展示顺序）
+ * @param {string[]} closedIds 已关闭的供应商 id（展示顺序）
+ * @param {string} sourceId 被拖动的 id
+ * @param {string} targetId 落点 id
+ * @param {'before' | 'after'} position 插到落点之前还是之后
+ * @param {string[] | null | undefined} [oldOrder] 上一次提交的完整顺序
+ * @returns {string[] | null} 新顺序；跨组或无需变更时返回 null
+ */
+export function nextProviderOrderAfterGroupDrop(
+  openIds, closedIds, sourceId, targetId, position, oldOrder,
+) {
+  const open = Array.isArray(openIds) ? openIds : [];
+  const closed = Array.isArray(closedIds) ? closedIds : [];
+  const sourceInOpen = open.includes(sourceId);
+  const targetInOpen = open.includes(targetId);
+  const sourceInClosed = closed.includes(sourceId);
+  const targetInClosed = closed.includes(targetId);
+
+  if (sourceInOpen && targetInOpen) {
+    return nextProviderOrderAfterDrop(open, closed, sourceId, targetId, position, oldOrder);
+  }
+  if (sourceInClosed && targetInClosed) {
+    const moved = orderAfterDrop(closed, sourceId, targetId, position);
+    if (moved === null) return null;
+    return [...open, ...moved];
+  }
+  // 跨组（或 id 不在任一组里）：组间顺序不可改，视为无变更。
+  return null;
+}
+
+/**
  * 「供应商开关」弹窗的行数据：已打开在前、已关闭在后，每行自带开关呈现状态。
  *
  * ## 为什么单独抽出来
@@ -375,8 +429,12 @@ export function nextProviderOrderAfterDrop(openIds, closedIds, sourceId, targetI
  */
 export function providerSwitchRows(providers, statuses, order) {
   const { open, closed } = groupProviders(providers, statuses);
-  // 已打开组支持自定义排序；已关闭组恒按声明顺序（见 sortOpenProvidersByOrder 注释）。
+  // 两组都支持自定义排序（2026-10-26 用户需求「已关闭的供应商也应该支持调整顺序」）。
+  // ⚠️ 在此之前只有已打开组走 `order`，已关闭组恒按声明顺序沉底 —— 那条口径
+  //    来自 2026-10-06 的「关闭的仍按默认排序显示在最下面」，现已被新需求覆盖。
+  //    组间顺序不变：已打开恒在前、已关闭恒在后，`order` 只影响**组内**排列。
   const orderedOpen = sortOpenProvidersByOrder(open, order);
+  const orderedClosed = sortOpenProvidersByOrder(closed, order);
   /** @param {{ id: string, label?: string }} provider */
   const toRow = (provider) => {
     const id = provider?.id;
@@ -393,8 +451,8 @@ export function providerSwitchRows(providers, statuses, order) {
     };
   };
   // 已打开在前：与 rail 的分组顺序一致，用户在两处看到的是同一个排列。
-  // 有自定义顺序时已打开组按其重排（关闭组不受影响，恒按声明顺序沉底）。
-  return [...orderedOpen.map(toRow), ...closed.map(toRow)];
+  // 两组各自按 `order` 重排，组间顺序恒为「已打开 → 已关闭」。
+  return [...orderedOpen.map(toRow), ...orderedClosed.map(toRow)];
 }
 
 /**

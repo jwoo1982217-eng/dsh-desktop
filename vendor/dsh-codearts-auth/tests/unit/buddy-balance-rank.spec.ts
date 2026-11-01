@@ -240,6 +240,113 @@ describe('splitBuddyCreditsByExpiry（按到期时间拆分两桶）', () => {
     const split = splitBuddyCreditsByExpiry(balance(pkg({ deductionEndTime: NOW + 20 * DAY })), NOW, 30 * DAY)
     expect(split).toEqual({ expiring: 100, permanent: 0 })
   })
+
+  /**
+   * ★★ **`deductionEndTime` 是「数字字符串」时必须与前端同判**
+   * （2026-10-21 对抗性审计发现，P2：全仓唯一一处真正的「同一语义两套判据」）。
+   *
+   * ## 两侧原来不同判
+   *
+   * | 输入 | 前端 `splitCreditsByExpiry` | 后端（旧） |
+   * |---|---|---|
+   * | `1760432000000`（number） | 临期 | 临期 |
+   * | `"1760432000000"`（字符串） | **临期**（用 `Number()`） | **永久**（用 `typeof`）|
+   *
+   * ⇒ 用户可见症状正是本仓库反复要防的：**面板说「临期 100」，而锁定永久积分时
+   *   选号判 `none`、报「积分已用尽」**。
+   *
+   * ## 可达性（如实标注：低但非零）
+   *
+   * 三个 PR 新接的 provider 全部经 `Number()` / `Date.parse` 归一化后才写该字段，
+   * **生产主路径不可达**。可达的是外部写进 `credits.balances` 的数据
+   *（旧缓存 / 备份导入 / 手工编辑 state.json）。
+   */
+  it('★★ 数字字符串形态的 deductionEndTime 与前端同判（临期）', () => {
+    const split = splitBuddyCreditsByExpiry(
+      balance(pkg({ deductionEndTime: String(NOW + 3 * DAY) as unknown as number })),
+      NOW,
+    )
+    expect(split, '字符串毫秒必须被认成「有确切到期时刻」⇒ 临期').toEqual({ expiring: 100, permanent: 0 })
+  })
+
+  it('★ 反向对照：null / 空串 / 非数字串仍判「未知到期」（不得被 Number() 宽松成时刻 0）', () => {
+    for (const bad of [null, '', 'abc', ' ', undefined]) {
+      const split = splitBuddyCreditsByExpiry(
+        balance(pkg({ deductionEndTime: bad as unknown as number })),
+        NOW,
+      )
+      expect(split, `${String(bad)} 必须判未知到期 ⇒ 永久桶`).toEqual({ expiring: 0, permanent: 100 })
+    }
+  })
+
+  /**
+   * ★★ **`Number()` 的两格意外翻转必须挡住**（2026-10-21 二轮审计自查发现）。
+   *
+   * ## 缺陷
+   *
+   * 我把判据从 `typeof === 'number'` 改成 `Number()` 时，只想到了
+   * 「数字字符串」那种**合法**输入翻成「已知」（那是**有意变更**），
+   * 却漏了 `Number()` 的两格**类型污染**：
+   *
+   * | 输入 | `Number(x)` | 旧 `typeof` | 只写 `Number()` 时 | 后果 |
+   * |---|---|---|---|---|
+   * | `true` | **1** | 未知 ⇒ 永久桶 | **已知 ⇒ 时刻 1ms（1970）** | 误判「早已过期」⇒ 进 `expiring` 桶 |
+   * | `[1760432000000]` | **1760432000000** | 未知 ⇒ 永久桶 | **已知** | 单元素数组被当成数字 |
+   *
+   * 两格的共同方向是「把**非数字**放宽成已知」—— 与「认数字字符串」不同源。
+   * ⇒ 判据收窄为「**只接受 number 或 string**」。
+   *
+   * ⚠️ 这条用例的存在理由：**我第一版就漏了这两格**，而且是逐格对比新旧才发现的
+   *    （不是靠跑测试 —— 当时 40 条全绿）。
+   */
+  it('★★ true / 数组 / 对象 不得被 Number() 放宽成「已知到期」', () => {
+    const contaminations: Array<[string, unknown]> = [
+      ['true（Number(true)===1 ⇒ 1970）', true],
+      ['false', false],
+      ['单元素数组（Number([ms])===ms）', [NOW + 3 * DAY]],
+      ['空数组', []],
+      ['空对象', {}],
+    ]
+    for (const [label, bad] of contaminations) {
+      const split = splitBuddyCreditsByExpiry(
+        balance(pkg({ deductionEndTime: bad as unknown as number })),
+        NOW,
+      )
+      expect(
+        split,
+        `${label} 必须判未知到期 ⇒ 永久桶（不得被 Number() 放宽成已知）`,
+      ).toEqual({ expiring: 0, permanent: 100 })
+    }
+  })
+
+  /**
+   * ★★ **`packages` 里含 `null` / `undefined` 元素时不得抛错**
+   * （2026-10-21 对抗性审计发现，P2：与前端判据不对称）。
+   *
+   * 前端 `splitCreditsByExpiry` 第一句就是 `if (!pkg || pkg.active !== true) continue`，
+   * 而后端原来直接读 `pkg.active` ⇒ `packages: [null]` 抛**裸 TypeError**
+   *（`Cannot read properties of null (reading 'active')`）。
+   *
+   * 后果不是「无可用账号」那句文案，而是未捕获异常穿出 `select()`
+   *（`BuddyBalanceSelector.select` 无 try/catch）⇒ 用户看到内部错误，
+   * 而池里可能还有别的健康账号。
+   *
+   * 可达性：各 provider 目前都在 push 前过滤非对象条目 ⇒ **当前不可达**；
+   * 但这是防御缺口且与前端不对称，故补齐。
+   */
+  it('★★ packages 含 null / undefined 元素时不抛错（与前端同判：跳过）', () => {
+    // ⚠️ 断言「剩下那个包被正常计入」而不是「合计 100」：`pkg()` 默认**不带**
+    //    `deductionEndTime` ⇒ 它落**永久桶**（50），这才是正确结果。
+    //    （第一版我把期望写成 `expiring:100` 是错的 —— 那是把它当成临期了。）
+    const withNull = { packages: [null as never, pkg({ remaining: 50 })] } as never
+    expect(() => splitBuddyCreditsByExpiry(withNull, NOW)).not.toThrow()
+    expect(
+      splitBuddyCreditsByExpiry(withNull, NOW),
+      'null 元素被跳过，剩下的包（无到期时间）应落永久桶',
+    ).toEqual({ expiring: 0, permanent: 50 })
+    expect(splitBuddyCreditsByExpiry({ packages: [undefined as never] } as never, NOW))
+      .toEqual({ expiring: 0, permanent: 0 })
+  })
 })
 
 describe('buddyBalanceTier（档位判定）', () => {

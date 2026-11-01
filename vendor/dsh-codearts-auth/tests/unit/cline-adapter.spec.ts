@@ -35,7 +35,7 @@ const POOL_ACCOUNT_ID = 'cline-bb211a53'
 /** 实测凭据形态（access_token 自带 workos: 前缀）。 */
 const cred: ClineCredential = {
   access_token: 'workos:eyJhbGciOiJSUzI1NiIs',
-  refresh_token: 'tmgEeM2rd9ybYoWpXl8JqUfvK',
+  refresh_token: 'synthetic-cline-refresh-fixture-0000',
   expire_time: Date.now() + 3_600_000,
   account_id: 'usr-01M3BCV4FYCGJKAWD3MJG3DBQM',
   email: 'ijetlee@163.com',
