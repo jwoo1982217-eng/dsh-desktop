@@ -1253,9 +1253,10 @@ function ModelSelect({ locked, available, directory, load, select, t }) {
   }, [open]);
   react.useLayoutEffect(() => {
     if (!open) return;
-    const place = () => {
+    const place = (event) => {
       const rect = triggerRef.current?.getBoundingClientRect(), menu = menuRef.current;
       if (!rect || !menu) return;
+      if (event?.type === "scroll" && event.target instanceof Node && menu.contains(event.target)) return;
       const viewport = window.visualViewport;
       const width = viewport?.width ?? innerWidth, height = viewport?.height ?? innerHeight;
       const left = viewport?.offsetLeft ?? 0, top = viewport?.offsetTop ?? 0;
@@ -1263,7 +1264,8 @@ function ModelSelect({ locked, available, directory, load, select, t }) {
       const tablet = !mobile && matchMedia("(pointer:coarse)").matches;
       const maxHeight = Math.max(100, Math.min(tablet ? 680 : mobile ? 620 : 580, height - (tablet ? 48 : 24)));
       const h = Math.min(menu.offsetHeight, maxHeight);
-      setPos({ visibility: "visible", maxHeight, left: tablet ? left + (width - menu.offsetWidth) / 2 : mobile ? left + 12 : Math.max(left + 12, Math.min(rect.right - menu.offsetWidth, left + width - menu.offsetWidth - 12)), top: tablet ? top + (height - h) / 2 : mobile ? top + height - h - 12 : Math.max(top + 12, Math.min(rect.top - h - 8, top + height - h - 12)) });
+      const next = { visibility: "visible", maxHeight, left: tablet ? left + (width - menu.offsetWidth) / 2 : mobile ? left + 12 : Math.max(left + 12, Math.min(rect.right - menu.offsetWidth, left + width - menu.offsetWidth - 12)), top: tablet ? top + (height - h) / 2 : mobile ? top + height - h - 12 : Math.max(top + 12, Math.min(rect.top - h - 8, top + height - h - 12)) };
+      setPos((previous) => Object.keys(next).every((key) => previous[key] === next[key]) ? previous : next);
     };
     const observer = new ResizeObserver(place);
     if (menuRef.current) observer.observe(menuRef.current);

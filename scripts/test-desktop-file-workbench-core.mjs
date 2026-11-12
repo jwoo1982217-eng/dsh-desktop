@@ -1,0 +1,60 @@
+import { tmpdir as __publicTmpdir } from 'node:os';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import {randomUUID,createHash} from 'node:crypto';
+import {spawn} from 'node:child_process';
+import {createServer} from 'node:http';
+import {fileURLToPath} from 'node:url';
+import {installDesktopFileWorkbench,rollbackDesktopFileWorkbench,desktopFileWorkbenchFiles} from './install-desktop-file-workbench.mjs';
+
+const repo=fileURLToPath(new URL('../',import.meta.url));
+const output=path.resolve(process.argv[2]||(__publicTmpdir() + '/dsh-desktop-file-workbench-20261106/generated/cold-acceptance'));
+assert(output.startsWith((__publicTmpdir() + '/dsh-desktop-file-workbench-20261106/generated/')));
+fs.mkdirSync(output,{recursive:true});
+const fixture=fs.mkdtempSync(path.join(output,'fixture-'));
+const home=path.join(fixture,'home'),profile=path.join(home,'profiles/web'),project=path.join(fixture,'project'),shared=path.join(fixture,'shared');
+const modules=path.join(repo,'desktop-runtime/node_modules');
+for(const dir of [profile,project,shared])fs.mkdirSync(dir,{recursive:true});
+fs.symlinkSync(modules,path.join(home,'node_modules'));
+fs.writeFileSync(path.join(profile,'package.json'),JSON.stringify({name:'desktop-files-core-fixture',private:true,dependencies:{},dsh:{profile:{bundles:['@deepseek-ai/dsh-base','@deepseek-ai/dsh-web-app']}}}));
+fs.writeFileSync(path.join(project,'project.txt'),'project original\n');fs.writeFileSync(path.join(shared,'共享.txt'),'shared original\n');
+const owner='desktop-files-isolated-acceptance';let child,stdout='',stderr='',installed,result,phase='setup';
+const safe=text=>String(text).replace(/([?&]token=)[^\s"'<>]+/g,'$1[hidden]').replace(/(Cookie|Bearer)\s*[:=]?\s*[^\s"'<>]+/gi,'$1 [hidden]');
+async function stop(){if(child&&child.exitCode===null&&child.signalCode===null){child.kill('SIGTERM');let timer;try{await Promise.race([new Promise(r=>child.once('exit',r)),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Owned fixture process did not stop')),15000);})]);}finally{clearTimeout(timer);}}}
+try{
+ installed=installDesktopFileWorkbench(home,modules,{apply:true,owner,sourceDir:path.join(repo,'desktop-file-workbench'),files:desktopFileWorkbenchFiles});
+ const portServer=createServer();await new Promise(r=>portServer.listen(0,'127.0.0.1',r));const port=portServer.address().port;await new Promise(r=>portServer.close(r));
+ const env=Object.fromEntries(Object.entries(process.env).filter(([k])=>!/(?:API_KEY|ACCESS_TOKEN|SECRET|PASSWORD|AUTH_TOKEN|^DSH_|^OPENAI_|^ANTHROPIC_|^DEEPSEEK_|^HTTP_PROXY$|^HTTPS_PROXY$|^ALL_PROXY$)/i.test(k)));env.DSH_HOME=home;env.CI='true';
+ child=spawn(process.execPath,['--expose-internals',path.join(modules,'@deepseek-ai/dsh/lib/bin.js'),'--profile','web','--host','127.0.0.1','--port',String(port),'--no-open'],{cwd:home,env,stdio:['ignore','pipe','pipe']});
+ child.stderr.on('data',b=>{stderr=(stderr+b).slice(-20000);});
+ const entry=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Fixture core boot timed out: '+safe(stderr))),30000);child.stdout.on('data',b=>{stdout=(stdout+b).slice(-30000);const m=stdout.match(/dsh web: (http:\/\/127\.0\.0\.1:\d+\/\?token=[^\s\x1b]+)/);if(m){clearTimeout(timer);resolve(m[1]);}});child.once('exit',code=>{clearTimeout(timer);reject(Error('Fixture boot exited '+code+': '+safe(stderr)));});});
+ phase='authenticate';const entryUrl=new URL(entry),origin=entryUrl.origin,auth=await fetch(entry,{redirect:'manual'}),cookie=auth.headers.getSetCookie().map(x=>x.split(';')[0]).join('; ');assert(cookie);
+ const raw=async(method,payload)=>{const r=await fetch(origin+'/api/'+method,{method:'POST',headers:{cookie,origin,'content-type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:randomUUID(),method,payload}),signal:AbortSignal.timeout(10000)});const body=await r.text();assert(body,'Empty RPC '+method+' status '+r.status);let j;try{j=JSON.parse(body);}catch{throw Error('Invalid RPC '+method+' status '+r.status+' bytes '+body.length);}assert.equal(j.result?.ok,true,JSON.stringify(j.result?.error));return j.result.value;};
+ phase='existing API';const beforeSessions=await raw('session/list',{args:{_request:{}}});
+ await raw('workspace/create',{args:{request:{path:project}}});
+ phase='bootstrap';const bootstrap=await fetch(origin+'/desktop-files/api/bootstrap',{headers:{cookie},signal:AbortSignal.timeout(10000)});const bootstrapBody=await bootstrap.text();if(bootstrap.status!==200){const plugins=await raw('pluginManager/listPlugins',{args:{}});fs.writeFileSync(path.join(output,'plugin-diagnostics.json'),JSON.stringify(plugins,null,2));}assert(bootstrapBody,'Empty bootstrap status '+bootstrap.status);let boot=JSON.parse(bootstrapBody);assert.equal(bootstrap.status,200,JSON.stringify(boot));assert.equal(boot.ok,true);boot=boot.value;assert.equal(boot.limits.providerAvailable,true);
+ const manage=async(action,payload={},status=200)=>{phase=action;const r=await fetch(origin+'/desktop-files/api/manage',{method:'POST',headers:{cookie,origin,'content-type':'application/json','x-dsh-files-csrf':boot.csrf},body:JSON.stringify({action,...payload}),signal:AbortSignal.timeout(10000)});const j=await r.json();assert.equal(r.status,status,JSON.stringify(j));assert.equal(j.ok,status===200,JSON.stringify(j));return status===200?j.value:j.error;};
+ const roots=await manage('roots.list'),internal=roots.roots.find(x=>x.kind==='internal'),workspace=roots.roots.find(x=>x.kind==='workspace'&&x.path===project);assert(internal&&workspace);assert.equal(workspace.status,'ready');
+ const loc=(r,p='')=>({rootId:r.id,generation:r.generation,path:p});
+ const created=await manage('write',{...loc(internal,'你好.txt'),text:'初始内容\n',version:null});assert(created.version);
+ let read=await manage('read',loc(internal,'你好.txt'));assert.equal(read.text,'初始内容\n');
+ const saved=await manage('write',{...loc(internal,'你好.txt'),text:'已保存\n',version:read.version});assert(saved.version);
+ fs.writeFileSync(path.join(internal.path,'你好.txt'),'外部编辑\n');const conflict=await manage('write',{...loc(internal,'你好.txt'),text:'不得覆盖\n',version:saved.version},409);assert(conflict.code);assert.equal(fs.readFileSync(path.join(internal.path,'你好.txt'),'utf8'),'外部编辑\n');
+ read=await manage('read',loc(internal,'你好.txt'));await manage('mkdir',loc(internal,'子目录'));await manage('rename',{...loc(internal,'你好.txt'),to:'子目录/新文件.txt',version:read.version});
+ const content=await manage('read',loc(internal,'子目录/新文件.txt'));assert.equal(content.text,'外部编辑\n');const search=await manage('search',{...loc(internal),query:'外部',content:true});assert(search.matches.some(x=>x.path==='子目录/新文件.txt'));
+ const plan=await manage('roots.planAdd',{path:shared,label:'共享夹具',mode:'read-only'}),added=await manage('roots.add',{planId:plan.planId,confirm:true});assert.equal(added.root.mode,'read-only');await manage('write',{...loc(added.root,'共享.txt'),text:'not allowed',version:null},403);
+ const list=await manage('list',loc(added.root));const exported=list.entries.find(x=>x.name==='共享.txt');assert(exported?.version);const ticket=await manage('export.prepare',{...loc(added.root,'共享.txt'),version:exported.version});
+ const head=await fetch(origin+'/desktop-files/export/'+ticket.id,{method:'HEAD',headers:{cookie}});assert.equal(head.status,200);const download=await fetch(origin+'/desktop-files/export/'+ticket.id,{headers:{cookie}});assert.equal(download.status,200);assert.equal(await download.text(),'shared original\n');assert.equal((await fetch(origin+'/desktop-files/export/'+ticket.id,{headers:{cookie}})).status,410);
+ await manage('roots.remove',{rootId:added.root.id,generation:added.root.generation,confirm:true});assert.equal(fs.readFileSync(path.join(shared,'共享.txt'),'utf8'),'shared original\n');
+ const rwPlan=await manage('roots.planAdd',{path:shared,label:'共享读写夹具',mode:'read-write'}),rw=await manage('roots.add',{planId:rwPlan.planId,confirm:true}),params=new URLSearchParams({...loc(rw.root),path:''}),bytes=Buffer.from([0,1,2,254,255]);
+ const imported=await fetch(origin+'/desktop-files/api/import?'+params,{method:'POST',headers:{cookie,origin,'content-type':'application/octet-stream','x-dsh-files-csrf':boot.csrf,'x-dsh-file-name':encodeURIComponent('导入.bin')},body:bytes});assert.equal(imported.status,200,await imported.clone().text());assert.deepEqual(fs.readFileSync(path.join(shared,'导入.bin')),bytes);
+ const duplicate=await fetch(origin+'/desktop-files/api/import?'+params,{method:'POST',headers:{cookie,origin,'content-type':'application/octet-stream','x-dsh-files-csrf':boot.csrf,'x-dsh-file-name':encodeURIComponent('导入.bin')},body:Buffer.from('different')});assert.equal(duplicate.status,409);assert.deepEqual(fs.readFileSync(path.join(shared,'导入.bin')),bytes);
+ fs.symlinkSync(project,path.join(shared,'outside-link'));await manage('list',loc(rw.root,'outside-link'),403);assert.equal(fs.readFileSync(path.join(project,'project.txt'),'utf8'),'project original\n');
+ const afterSessions=await raw('session/list',{args:{_request:{}}});assert.equal(afterSessions.items.length,beforeSessions.items.length);
+ const page=await fetch(origin+'/desktop-files',{headers:{cookie}});assert.equal(page.status,200);assert.match(await page.text(),/DSH 文件/);
+ result={actualCore:'0.2.1-alpha.4',existingSdkOnly:true,providerAvailable:boot.limits.providerAvailable,providerMode:boot.limits.providerMode,workspaceRegistry:true,rootKinds:['internal','workspace','shared'],utf8CreateReadSave:true,realProviderCasConflict:true,ordinaryFileRename:true,contentSearch:true,sharedReadOnlyRespected:true,sharedRemovalPreservesData:true,exportHeadNonConsume:true,downloadTicketSingleUse:true,binaryImport:true,sameNameImportNoOverwrite:true,symlinkEscapeRefused:true,originalFixtureSentinelPreserved:true,noSessionCreated:true,noModelRequest:true,pageServed:true,sourceFingerprint:installed.fingerprint};
+ await stop();const rollback=rollbackDesktopFileWorkbench(home,installed.receiptPath||installed.receipt,{apply:true,owner});assert(rollback.retainedTarget);result.isolatedInstallRollback=true;result.completedTargetRetained=true;
+ fs.writeFileSync(path.join(output,'real-core-verification.json'),JSON.stringify(result,null,2));console.log(JSON.stringify(result));
+}catch(error){fs.writeFileSync(path.join(output,'failure.txt'),phase+'\n'+safe(error.stack)+'\n'+safe(error.cause?.code||error.cause?.message||'')+'\n'+safe(stderr));throw Error(safe(error.message));}
+finally{await stop();fs.writeFileSync(path.join(output,'core-log.redacted.txt'),safe(stdout)+'\n'+safe(stderr));if(result)fs.rmSync(fixture,{recursive:true,force:true});}

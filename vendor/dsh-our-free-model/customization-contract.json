@@ -29,10 +29,10 @@
   ],
   "criticalFiles": {
     "src/host-channels.js": "266be2ac2d5b16138d10bc96604d314977303ee6e9e8829eba6a545690224312",
-    "src/open-external.js": "5b5d9193b8bb0f4fd9a18218e2e2c2abfecf2ed0ab92b5675a7a83e2dede4cc5",
+    "src/open-external.js": "66b41014ceb26110f328df9c9f87ae7b1135e4e82a901349ab6b221f6bbafc77",
     "src/customization-guard.js": "ce9c1731a0fc742e213987b56ee6c0d298a35888150024880a02f29cf7bd1cc7",
     "client.js": "8adcd2ea74c596a0b08c36461123143e3b322434235bfb92ca14880bdf8daf7b",
-    "vendor/channel-pack/pack.js": "0a04a35051a8e8aa5b23314fc98680756383c92d1dcb43b6c0777d49d4967a9f"
+    "vendor/channel-pack/pack.js": "68eeec8702ded2c70195e76dbdc37de9ebb7dd90f5ed8c4cbd0ce0b1967044dd"
   },
   "note": "Locally managed customization contract; not an official upstream release signature. Changes to pinned mobile/shared-backend interfaces require host review.",
   "criticalSections": [
@@ -198,5 +198,16 @@
   "reviewedHostSdkVersions": [
     "0.2.1-alpha.1",
     "0.2.1-alpha.4"
+  ],
+  "reviewLog": [
+    {
+      "date": "2026-11-07",
+      "upstream": "999e9f784ea3ea7a11cae383b142697b1ff2c42f -> efea046244d9b165f097af99a66c31e852731cb9",
+      "file": "src/open-external.js",
+      "from": "5b5d9193b8bb0f4fd9a18218e2e2c2abfecf2ed0ab92b5675a7a83e2dede4cc5",
+      "to": "66b41014ceb26110f328df9c9f87ae7b1135e4e82a901349ab6b221f6bbafc77",
+      "reason": "上游 #738 将 Windows icacls 授权对象由裸账户名改为当前 token 的 SID（*S-1-5-...），避免同名机器上自锁；被评审的 mobile/shared-backend 接口 openExternal 的 Android WebView 拦截三行逐字节未变，故复核通过。",
+      "reviewer": "owner-managed upgrade session 2026-11-07"
+    }
   ]
 }

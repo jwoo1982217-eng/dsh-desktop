@@ -1,5 +1,7 @@
 # DSH 电脑版
 
+本目录是 **DSH 电脑端源码**。Android 手机端在独立的 `../dsh-phone-public` 仓库维护；目录职责与分类入口见 [源码目录说明](SOURCE_LAYOUT.md)。
+
 团队协作入口已加入本项目：侧栏底部切换「团队协作 / 普通聊天」，分别与成员私聊或在项目群中通过 @ 派活。「设置 → Agent 人设」可从现有卡片创建成员，成员模型使用已有账号线路，普通聊天的人设组合保持独立。用法见 [团队协作说明](team/README.md)。
 
 基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的电脑版适配源码，固定使用官方 `0.2.1-alpha.4` 预览版核心。程序在电脑本机运行，支持 Mac 独立桌面窗口和浏览器两种使用方式；提供 Jet Hub、ChatGPT 会员授权、API 网关、Noema、技能和手机远程连接。

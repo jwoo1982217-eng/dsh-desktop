@@ -11,7 +11,13 @@ const report = process.argv[2] ?? path.join(os.tmpdir(), 'dsh-model-picker');
 await mkdir(report, {recursive:true});
 const {chromium} = await import(pathToFileURL(process.env.DSH_PLAYWRIGHT_MODULE ?? path.join(os.homedir(), '.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright/index.mjs')));
 const source = await readFile(path.join(root, 'runtime/overlays/@deepseek-ai/dsh-client-ui-model-selection/lib/client.js'), 'utf8');
-const tested = source.replace('return module.exports;', 'module.exports.test = {ModelSelect, pickerRows, pickerPreferences}; return module.exports;');
+const marker = 'function ModelSelect({ locked, available, directory, load, select, t }) {';
+assert(source.includes(marker), 'Pinned picker instrumentation boundary missing');
+const tested = source.replace(marker, marker + '\n globalThis.__dshPickerRenders = (globalThis.__dshPickerRenders ?? 0) + 1;')
+  .replace('return module.exports;', 'module.exports.test = {ModelSelect, pickerRows, pickerPreferences}; return module.exports;');
+const modelsPerGroup = Number(process.env.DSH_PICKER_MODELS_PER_GROUP ?? 80);
+assert(Number.isInteger(modelsPerGroup) && modelsPerGroup >= 40 && modelsPerGroup <= 200);
+const totalModels = 18 * modelsPerGroup;
 const runtime = path.join(root, root.includes('dsh-phone-public') ? 'runtime' : 'desktop-runtime');
 // Reuse the pinned frontend's actual shared React, store and primitive bundle.
 // Replace only its boot entry in this isolated copy; no server/session runs.
@@ -27,7 +33,7 @@ window.__ModuleLoader__ = {load({factory}) {window.picker = factory(id => ({
   '@deepseek-ai/dsh-client-ui-primitives':shared['@deepseek-ai/dsh-client-ui-primitives']
 }[id]));}};
 ${tested}
-const groups = Array.from({length:18}, (_,n)=>({id:'api-'+n,name:n===0?'聚合 API':n===1?'CodeBuddy (腾讯)':'来源 '+n,models:Array.from({length:40},(_,m)=>({id:m===0?'deepseek-v4-flash':m===1?'glm-5.3':'model-'+m,name:m===0?'DeepSeek V4 Flash':m===1?'GLM 5.3':m===2?'超长模型名称 ' + 'ABCDEFGHIJKLMNOP'.repeat(5):'Model '+m,...m===0?{reasoning:{defaultEffort:'high',efforts:[{id:'low',name:'Low'},{id:'high',name:'High'}]}}:{}}))}));
+const groups = Array.from({length:18}, (_,n)=>({id:'api-'+n,name:n===0?'聚合 API':n===1?'CodeBuddy (腾讯)':'来源 '+n,models:Array.from({length:${modelsPerGroup}},(_,m)=>({id:m===0?'deepseek-v4-flash':m===1?'glm-5.3':'model-'+m,name:m===0?'DeepSeek V4 Flash':m===1?'GLM 5.3':m===2?'超长模型名称 ' + 'ABCDEFGHIJKLMNOP'.repeat(5):'Model '+m,...m===0?{reasoning:{defaultEffort:'high',efforts:[{id:'low',name:'Low'},{id:'high',name:'High'}]}}:{}}))}));
 window.calls=[]; window.loads=0; window.reject=false; window.deferred=false;
 window.store=createSnapshotStore({current:{provider:'api-1',model:'deepseek-v4-flash',reasoningEffort:'high'},groups,status:'ready',pending:null,error:null,failures:[]});
 const t=(key,args={})=>({'menu.model':'模型','trigger.fallback':'请选择模型','trigger.selectAria':'请选择模型','trigger.aria':'选择模型，当前 '+args.model,'effort.providerDefault':'Default','status.loading':'正在刷新模型列表…','action.reload':'重新加载','search.clear':'清除搜索','error.action':'模型操作失败：'+args.message,'error.sessionInUse':'当前会话已被占用','warning.groupLoad':args.name+' 加载失败：'+args.message})[key]??key;
@@ -61,7 +67,7 @@ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 const url='http://127.0.0.1:'+server.address().port;
 await writeFile(path.join(report,'fixture-url.txt'),url);
 const browser=await chromium.launch({executablePath:process.env.DSH_CHROME??'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',headless:true});
-const results=[], errors=[];
+const results=[], errors=[], scrollRendering=[];
 try {
   for(const size of [{width:1280,height:800,touch:false},{width:393,height:852,touch:true},{width:320,height:640,touch:true},{width:844,height:390,touch:true},{width:800,height:1280,touch:true},{width:1280,height:800,touch:true}]) {
     const context=await browser.newContext({viewport:{width:size.width,height:size.height},isMobile:size.touch,hasTouch:size.touch});
@@ -71,13 +77,25 @@ try {
     const open=async()=>{await page.getByRole('button',{name:/选择模型，当前/}).click();await page.getByRole('dialog',{name:'选择模型'}).waitFor();};
     const search=page.getByRole('searchbox');
     const rows=page.locator('[data-picker-model]');
-    await open();assert.equal(await rows.count(),720);
+    await open();assert.equal(await rows.count(),totalModels);
     assert.equal(await page.getByRole('dialog').evaluate(el=>el.querySelector('.dsh-picker-list').scrollHeight>el.querySelector('.dsh-picker-list').clientHeight),true);
     const bounds=await page.getByRole('dialog').boundingBox();assert(bounds.x>=11 && bounds.x+bounds.width<=size.width-11 && bounds.y>=11 && bounds.y+bounds.height<=size.height-11);
     if(size.touch) assert.equal(await search.evaluate(el=>el===document.activeElement),false);
     if(size.touch&&size.width>=601) assert(Math.abs(bounds.x+(bounds.width/2)-size.width/2)<2);
     // Scroll the actual nested viewport, then the fixed header stays visible.
     const list=page.locator('.dsh-picker-list');
+    const scrollWork=await list.evaluate(async el=>{
+      const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
+      await frame();await frame();
+      const renders=globalThis.__dshPickerRenders, start=el.scrollTop;
+      for(let i=0;i<5;i++){el.scrollTop+=80;el.dispatchEvent(new Event('scroll'));await frame();}
+      await frame();await frame();
+      return{renders:globalThis.__dshPickerRenders-renders,start,end:el.scrollTop};
+    });
+    scrollRendering.push({size,models:totalModels,...scrollWork});
+    await writeFile(path.join(report,'scroll-render-verification.json'),JSON.stringify(scrollRendering,null,2));
+    assert(scrollWork.end>scrollWork.start,'The actual nested menu must scroll');
+    assert.equal(scrollWork.renders,0,'Scrolling the menu must not render the whole model catalog again');
     await list.hover();await page.mouse.wheel(0,2000);await page.waitForFunction(()=>document.querySelector('.dsh-picker-list').scrollTop>100);
     assert.equal(await page.locator('.dsh-picker-head').isVisible(),true);assert.equal(await search.isVisible(),true);
     if(size.touch){
@@ -100,7 +118,7 @@ try {
     assert.equal(await rows.first().getAttribute('aria-checked'),'true');
     await page.getByRole('button',{name:'全部',exact:true}).click();await search.fill('不会存在的模型');assert.equal(await rows.count(),0);
     await search.press('Enter');assert.equal(await page.evaluate(()=>window.calls.length),1);
-    await page.getByRole('button',{name:'清除筛选',exact:true}).click();assert.equal(await rows.count(),720);
+    await page.getByRole('button',{name:'清除筛选',exact:true}).click();assert.equal(await rows.count(),totalModels);
     // Failed selection stays open and never enters history; next attempt recovers.
     await search.fill('codebuddy deepseekv4');await page.evaluate(()=>{window.reject=true;});await rows.first().click();
     await page.getByText('模型操作失败：test/rejected: fixture rejection',{exact:true}).waitFor();
@@ -132,7 +150,7 @@ try {
     }
     await search.press('Escape');assert.equal(await search.inputValue(),'');await search.press('Escape');await page.getByRole('dialog').waitFor({state:'hidden'});
     // Malformed/blocked storage does not stop choosing a model.
-    await page.evaluate(()=>{localStorage.setItem('dsh:model-picker:v1','null');});await page.reload();await open();assert.equal(await rows.count(),720);
+    await page.evaluate(()=>{localStorage.setItem('dsh:model-picker:v1','null');});await page.reload();await open();assert.equal(await rows.count(),totalModels);
     await page.getByRole('button',{name:'关闭模型选择',exact:true}).click();
     await page.evaluate(()=>Object.defineProperty(window,'localStorage',{configurable:true,get(){throw Error('fixture storage blocked');}}));
     await open();await search.fill('codebuddy glm53');await rows.first().click();await page.getByRole('dialog').waitFor({state:'hidden'});
@@ -146,7 +164,7 @@ try {
     await target.selectOption('team:fixture:project');await page.getByText(/^5 小时重置：2 次/).waitFor();await page.getByRole('button',{name:'重置5 小时额度',exact:true}).click();await page.getByRole('dialog',{name:'确认消耗额度重置机会',exact:true}).waitFor();await page.getByRole('button',{name:'取消',exact:true}).click();assert.equal(await page.evaluate(()=>window.resetCalls.filter(c=>c.method==='zcode.resetUse').length),0);
     assert(await resetDialog.evaluate(el=>{const r=el.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth&&r.top>=0&&r.bottom<=innerHeight;}));await page.screenshot({path:path.join(report,`reset-picker-${size.width}${size.touch?'-touch':''}.png`)});await page.getByRole('button',{name:'关闭额度重置',exact:true}).click();await resetDialog.waitFor({state:'hidden'});
     await page.evaluate(()=>window.resetMulti=true);await open();await page.getByRole('button',{name:'重置 ZCode 套餐额度',exact:true}).click();await resetDialog.waitFor();const accountPicker=page.getByRole('combobox',{name:'重置额度的 ZCode 账号',exact:true});await page.waitForFunction(()=>document.querySelector('select[aria-label="重置额度的 ZCode 账号"]').options.length===3);assert.equal(await accountPicker.inputValue(),'');await page.evaluate(()=>window.resetFail=true);await accountPicker.selectOption('account-b');await page.getByRole('alert').filter({hasText:'套餐读取失败验证'}).waitFor();assert.equal(await page.getByRole('combobox',{name:'额度重置目标套餐',exact:true}).count(),0);await page.getByRole('button',{name:'关闭额度重置',exact:true}).click();await page.evaluate(()=>window.disposeReset());assert.equal(await page.evaluate(()=>typeof globalThis.__dshOpenZcodeReset),'undefined');
-    results.push({size,models:720,directSearch:true,sourceAndIdSearch:true,exactRoute:true,favoritesAndRecent:true,mouseAndTouchScroll:true,insetBounds:true,imeAndTabSafe:true,pendingGuard:true,failedSelectionRecovery:true,reasoningPreserved:true,malformedStorageRecovery:true,composerResetEntry:true,resetTargetExplicit:true,noResetConsumed:true,resetScopeFailureRecovery:true});
+    results.push({size,models:totalModels,menuScrollRenders:scrollWork.renders,directSearch:true,sourceAndIdSearch:true,exactRoute:true,favoritesAndRecent:true,mouseAndTouchScroll:true,insetBounds:true,imeAndTabSafe:true,pendingGuard:true,failedSelectionRecovery:true,reasoningPreserved:true,malformedStorageRecovery:true,composerResetEntry:true,resetTargetExplicit:true,noResetConsumed:true,resetScopeFailureRecovery:true});
     await context.close();
   }
   assert.deepEqual(errors,[]);

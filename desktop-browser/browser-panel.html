@@ -10,9 +10,10 @@
     #tabs{display:flex;flex:none;gap:3px;padding:5px 6px;border-bottom:1px solid #e3e3e8;overflow-x:auto}#tabs:empty{display:none}.tab{display:flex;align-items:center;min-width:90px;max-width:180px;border-radius:7px}.tab.active{background:#ede9f6}.tab .select{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;text-align:left}.tab .close{flex:none;min-width:24px;width:24px}
     #toolbar{display:flex;flex:none;align-items:center;gap:3px;padding:6px;border-bottom:1px solid #e3e3e8}#address{min-width:0;flex:1;border:1px solid #dedee5;border-radius:8px;height:32px;background:#fff;padding:0 9px}#open{padding:0 8px;background:#ebe6f6;color:#574d85}
     #message{flex:none;padding:7px 10px;color:#ad3f38;background:#fff3f1;font-size:12px}#message:empty{display:none}
+    #filePrompt,#transfer{flex:none;padding:7px 10px;background:#f0edf8;display:flex;align-items:center;gap:8px;font-size:12px}#filePrompt[hidden],#transfer[hidden]{display:none}#transferStatus{flex:1}#transferProgress{max-width:150px;flex:1}#surface.dragging{outline:3px solid #8171cc;outline-offset:-3px}
     #surface{position:relative;flex:1;min-height:240px;overflow:hidden;background:white;outline:none}#screen{width:100%;height:100%;object-fit:contain;display:block;user-select:none;-webkit-user-drag:none}#screen:not([src]){display:none}#empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#888;font-size:13px;text-align:center;padding:20px}#empty strong{font-size:16px;font-weight:500;color:#555}#empty[hidden]{display:none}
     #keyboard{position:absolute;width:1px;height:1px;left:0;bottom:0;opacity:0;padding:0;border:0;resize:none}#status{flex:none;height:23px;padding:3px 9px;border-top:1px solid #e3e3e8;color:#888;font-size:11px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-    @media(prefers-color-scheme:dark){html,body{color:#e4e4ea;background:#222329}#toolbar,#tabs,#status{border-color:#383940}button:hover{background:#393940}#address{background:#2c2d34;border-color:#44454e}.tab.active,#open{background:#40364f;color:#eee7fa}#message{background:#462c2b;color:#f6aaa4}}
+    @media(prefers-color-scheme:dark){html,body{color:#e4e4ea;background:#222329}#toolbar,#tabs,#status{border-color:#383940}button:hover{background:#393940}#address{background:#2c2d34;border-color:#44454e}.tab.active,#open{background:#40364f;color:#eee7fa}#message{background:#462c2b;color:#f6aaa4}#filePrompt,#transfer{background:#362f44}}
   </style>
 </head>
 <body>
@@ -24,8 +25,12 @@
     <input id="address" aria-label="网站地址" placeholder="输入网址" autocomplete="off" spellcheck="false">
     <button id="open" type="submit">打开</button>
     <button id="new" type="button" title="新建网页标签" aria-label="新建网页标签">＋</button>
+    <button id="attach" type="button" title="添加图片或文件：先点击网页的评论框，或先点击网页上传按钮" aria-label="添加图片或文件" disabled>📎</button>
     <button id="login" type="button" title="打开与 DSH 共享登录的可见浏览器窗口，由你完成安全验证" aria-label="打开 DSH 登录窗口" disabled>登录窗口</button>
   </form>
+  <input id="fileInput" type="file" multiple hidden>
+  <div id="filePrompt" hidden><span id="filePromptText">网页请求选择文件</span><button id="chooseFiles" type="button">选择文件</button><button id="cancelChooser" type="button">取消</button></div>
+  <div id="transfer" role="status" hidden><span id="transferStatus"></span><progress id="transferProgress" max="100" value="0"></progress><button id="cancelTransfer" type="button">取消传输</button></div>
   <div id="message" role="alert"></div>
   <div id="surface" tabindex="0" aria-label="网页内容">
     <img id="screen" alt="当前网页" draggable="false">
@@ -44,10 +49,13 @@
       const surface = $('surface'), image = $('screen'), keyboard = $('keyboard');
       let active = null, tabs = [], revision = 0, frameWidth = 1024, frameHeight = 768, busy = false, stopped = false, composing = false, visible = true;
       let lastNavigation = -1, navigationQueue = Promise.resolve(), actionRevision = 0;
+      let chooser = null, transferring = false, cancelTransfer = false;
+      let picker = null;
       const controller = new AbortController();
       function controls() {
-        for (const id of ['back','forward','reload','login']) $(id).disabled = !active || busy;
-        for (const id of ['open','new']) $(id).disabled = busy;
+        for (const id of ['back','forward','reload','login','attach']) $(id).disabled = !active || busy || transferring;
+        for (const id of ['open','new']) $(id).disabled = busy || transferring;
+        $('chooseFiles').disabled = transferring; $('cancelChooser').disabled = transferring;
       }
       async function api(method, payload = {}) {
         const response = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ type: 'client-request', rpcId: crypto.randomUUID(), method: 'manage', payload: {panel, method, payload} }), signal: controller.signal });
@@ -65,6 +73,9 @@
           const close = document.createElement('button'); close.className = 'close'; close.textContent = '×'; close.setAttribute('aria-label','关闭网页标签'); close.onclick = () => command('close',{id:tab.id}); row.append(select,close); return row;
         }));
         const selected = tabs.find(tab => tab.id === active);
+        chooser = state.fileChooser || null;
+        $('filePrompt').hidden = !chooser;
+        $('filePromptText').textContent = chooser ? '网页请求选择' + (chooser.multiple ? '文件（可多选）' : '一个文件') : '';
         if (document.activeElement !== $('address') && selected) $('address').value = selected.url === 'about:blank' ? '' : selected.url;
         controls();
         $('empty').hidden = Boolean(image.getAttribute('src'));
@@ -85,6 +96,69 @@
       }
       $('toolbar').onsubmit = event => {event.preventDefault(); command('open',{url:$('address').value.trim()});};
       $('new').onclick = () => command('new');
+      function selectFiles() {
+        if (!active || transferring) return;
+        picker = { id: active, kind: chooser ? 'input' : 'paste', ...(chooser ? { requestId: chooser.requestId } : {}) };
+        $('fileInput').multiple = !chooser || chooser.multiple;
+        $('fileInput').accept = chooser?.accept || '';
+        $('fileInput').value = ''; $('fileInput').click();
+      }
+      $('attach').onclick = selectFiles; $('chooseFiles').onclick = selectFiles;
+      $('cancelChooser').onclick = () => { if (chooser) command('file.cancelChooser', { requestId: chooser.requestId }); };
+      $('fileInput').onchange = () => { if (picker && $('fileInput').files.length) void sendFiles([...$('fileInput').files], picker); };
+      $('fileInput').oncancel = () => { if (picker?.kind === 'input') command('file.cancelChooser', { id: picker.id, requestId: picker.requestId }); picker = null; };
+      $('cancelTransfer').onclick = () => { cancelTransfer = true; $('cancelTransfer').disabled = true; };
+      async function chunkBase64(blob) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader(); reader.onerror = () => reject(Error('无法读取所选文件'));
+          reader.onload = () => resolve(String(reader.result).split(',')[1] || ''); reader.readAsDataURL(blob);
+        });
+      }
+      async function sendFiles(files, destination) {
+        if (transferring) { $('message').textContent = '已有文件正在传输，请稍后再试'; return; }
+        if (!files.length) return;
+        const total = files.reduce((n, file) => n + file.size, 0);
+        if (files.length > 8 || files.some(file => file.size > 32 * 1024 * 1024) || total > 64 * 1024 * 1024) { $('message').textContent = '一次最多 8 个文件，单个不超过 32 MB，合计不超过 64 MB'; return; }
+        transferring = true; cancelTransfer = false; actionRevision++; controls();
+        $('message').textContent = ''; $('transfer').hidden = false; $('transferProgress').hidden = false; $('transferProgress').value = 0;
+        $('cancelTransfer').hidden = false; $('cancelTransfer').disabled = false; $('transferStatus').textContent = '正在读取所选文件…';
+        let uploadId, committed = false, sent = 0;
+        try {
+          if (active !== destination.id) throw Error('网页标签已变化，请重新选择文件');
+          const start = await api('file.begin', { ...destination, files: files.map(file => ({ name: file.name, size: file.size, type: file.type })) });
+          uploadId = start.uploadId;
+          for (let index = 0; index < files.length; index++) {
+            const file = files[index];
+            for (let offset = 0; offset < file.size; offset += start.chunkBytes) {
+              if (cancelTransfer) throw Error('已取消文件传输');
+              const part = file.slice(offset, offset + start.chunkBytes), data = await chunkBase64(part);
+              await api('file.chunk', { id: destination.id, uploadId, index, offset, data });
+              sent += part.size; const progress = total ? Math.round(sent * 100 / total) : 100;
+              $('transferProgress').value = progress; $('transferStatus').textContent = '正在传输 ' + file.name + ' · ' + progress + '%';
+            }
+          }
+          if (cancelTransfer) throw Error('已取消文件传输');
+          $('cancelTransfer').hidden = true; $('transferStatus').textContent = '正在交给网页…';
+          const result = await api('file.commit', { id: destination.id, uploadId }); committed = true;
+          $('transferStatus').textContent = result.message || '文件已交给网页，请确认网页附件预览后再提交';
+        } catch (error) {
+          $('transferStatus').textContent = error.message; $('message').textContent = error.message;
+        } finally {
+          if (uploadId && !committed) await api('file.cancel', { id: destination.id, uploadId }).catch(() => {});
+          transferring = false; picker = null; $('fileInput').value = ''; $('cancelTransfer').hidden = true; $('transferProgress').hidden = true; controls();
+        }
+      }
+      keyboard.addEventListener('paste', event => {
+        const files = [...(event.clipboardData?.files || [])];
+        if (!files.length) return;
+        event.preventDefault(); void sendFiles(files, { id: active, kind: 'paste' });
+      });
+      surface.addEventListener('dragover', event => { if (event.dataTransfer?.types.includes('Files')) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; surface.classList.add('dragging'); } });
+      surface.addEventListener('dragleave', () => surface.classList.remove('dragging'));
+      surface.addEventListener('drop', event => {
+        event.preventDefault(); surface.classList.remove('dragging'); const p = point(event);
+        if (p) void sendFiles([...(event.dataTransfer?.files || [])], { id: active, kind: 'drop', point: p });
+      });
       $('login').onclick = async () => { const result = await command('login'); if (result) $('status').textContent = '请在新开的 DSH 登录窗口完成验证；返回后刷新原网页即可。'; };
       for (const method of ['back','forward','reload']) $(method).onclick = () => command(method);
       function point(event) {
@@ -92,11 +166,11 @@
         const rect = image.getBoundingClientRect(), scale = Math.min(rect.width / frameWidth, rect.height / frameHeight);
         const x = (event.clientX - rect.left - (rect.width - frameWidth * scale)/2)/scale;
         const y = (event.clientY - rect.top - (rect.height - frameHeight * scale)/2)/scale;
-        return x >= 0 && y >= 0 && x <= frameWidth && y <= frameHeight ? {x,y} : null;
+        return x >= 0 && y >= 0 && x <= frameWidth && y <= frameHeight ? {x,y,viewportWidth:frameWidth,viewportHeight:frameHeight} : null;
       }
       const modifiers = event => (event.altKey?1:0)|(event.ctrlKey?2:0)|(event.metaKey?4:0)|(event.shiftKey?8:0);
       const buttons = ['left','middle','right'];
-      surface.onmousedown = event => {const p=point(event);if(!p)return;event.preventDefault();keyboard.focus({preventScroll:true});command('pointer',{type:'mousePressed',...p,button:buttons[event.button]||'none',buttons:event.buttons,modifiers:modifiers(event)},true);};
+      surface.onmousedown = event => {const p=point(event);if(!p||transferring)return;event.preventDefault();keyboard.focus({preventScroll:true});command('pointer',{type:'mousePressed',...p,button:buttons[event.button]||'none',buttons:event.buttons,modifiers:modifiers(event)},true);};
       surface.onmouseup = event => {const p=point(event);if(p)command('pointer',{type:'mouseReleased',...p,button:buttons[event.button]||'none',buttons:event.buttons,modifiers:modifiers(event)},true);};
       let lastMove = 0;
       surface.onmousemove = event => {const p=point(event),now=Date.now();if(p&&now-lastMove>60){lastMove=now;command('pointer',{type:'mouseMoved',...p,buttons:event.buttons,modifiers:modifiers(event)},true);}};

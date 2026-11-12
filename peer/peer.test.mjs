@@ -365,14 +365,38 @@ test('large history crosses encrypted peer frames as one ordered text message an
   ws.send(upload,{binary:true});await waitFor(()=>received.length===1&&messages.length===3);
   assert.equal(received[0].binary,true);assert.deepEqual(received[0].value,upload);
   assert.equal(messages[2].binary,true);assert.deepEqual(messages[2].value,upload);
-  assert.ok(frames.length>20);assert.ok(frames.every(size=>size<=1024*1024));
+  assert.ok(frames.length>0);assert.ok(frames.every(size=>size<=1024*1024));
   assert.equal(f.phone.online,true);assert.equal(f.computer.online,true);assert.equal(ws.readyState,WebSocket.OPEN);
 });
 
-test('bad or oversized socket fragments close only that socket and never deliver a partial message', async t => {
+test('a history snapshot above one MiB reaches the browser intact before its next update', {timeout:12000}, async t => {
+  const f=await proxyFixture(t),events=new WebSocketServer({server:f.ui});t.after(()=>events.close());
+  const history=JSON.stringify({type:'item',streamId:'history',value:{type:'snapshot',text:randomBytes(1100000).toString('base64')}});
+  assert.ok(Buffer.byteLength(history)>1024*1024);
+  events.on('connection',ws=>{ws.send(history);ws.send('next update')});
+  const ws=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`),messages=[];
+  ws.on('error',()=>{});ws.on('message',(data,binary)=>messages.push({data,binary}));t.after(()=>ws.terminate());
+  await once(ws,'open');await waitFor(()=>messages.length===2);
+  assert.equal(messages[0].data.toString(),history);assert.equal(messages[0].binary,false);
+  assert.equal(messages[1].data.toString(),'next update');assert.equal(f.phone.online,true);assert.equal(f.computer.online,true);
+});
+
+test('six MiB binary traffic is paced in both directions without dropping the peer', {timeout:20000}, async t => {
+  const f=await proxyFixture(t),events=new WebSocketServer({server:f.ui});t.after(()=>events.close());
+  const bytes=randomBytes(6*1024*1024),received=[];
+  events.on('connection',ws=>ws.on('message',(data,binary)=>{received.push({data,binary});ws.send(data,{binary})}));
+  const ws=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`),messages=[];
+  ws.on('error',()=>{});ws.on('message',(data,binary)=>messages.push({data,binary}));t.after(()=>ws.terminate());
+  await once(ws,'open');ws.send(bytes,{binary:true});await waitFor(()=>messages.length===1);
+  assert.deepEqual(received[0].data,bytes);assert.equal(received[0].binary,true);
+  assert.deepEqual(messages[0].data,bytes);assert.equal(messages[0].binary,true);
+  assert.equal(f.phone.online,true);assert.equal(f.computer.online,true);
+});
+
+test('bad or legacy-limit socket fragments close only that socket and never deliver a partial message', {timeout:5000}, async t => {
   const f=await proxyFixture(t),events=new WebSocketServer({server:f.ui});t.after(()=>events.close());
   events.on('connection',ws=>ws.send('ready'));
-  let id;const action=f.computer.handler;f.computer.handler=(name,value)=>{if(name==='ws.open')id=value.id;return action(name,value)};
+  let id;const action=f.computer.handler;f.computer.handler=(name,value)=>{if(name==='ws.open'){id=value.id;return action(name,{id:value.id,url:value.url,chunks:true})}return action(name,value)};
   for(const overflow of [false,true]){
     const ws=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`),messages=[];t.after(()=>ws.terminate());ws.on('message',x=>messages.push(x.toString()));
     await waitFor(()=>messages.length===1);const closed=once(ws,'close');
@@ -382,6 +406,23 @@ test('bad or oversized socket fragments close only that socket and never deliver
     f.computer.send({type:'ws.data.chunk',id,index:overflow?16:2,final:true,binary:false,data:'YQ=='});
     await closed;assert.deepEqual(messages,['ready']);assert.equal(f.phone.online,true);assert.equal(f.computer.online,true);
   }
+});
+
+test('a complete large final message arrives before an upstream normal close', {timeout:7000}, async t=>{
+  const f=await proxyFixture(t),events=new WebSocketServer({server:f.ui});t.after(()=>events.close());
+  const history='final history😀'.repeat(120000);
+  events.on('connection',ws=>{ws.send(history);ws.close(1000)});
+  const ws=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`),messages=[];
+  ws.on('error',()=>{});ws.on('message',x=>messages.push(x.toString()));t.after(()=>ws.terminate());
+  await once(ws,'close');assert.equal(messages.length,1);assert.equal(messages[0].length,history.length);assert.equal(messages[0]===history,true);assert.equal(f.phone.online,true);
+});
+
+test('the negotiated eight MiB ceiling rejects overflow and a new socket remains usable', {timeout:7000}, async t=>{
+  const f=await proxyFixture(t),events=new WebSocketServer({server:f.ui});t.after(()=>events.close());let connections=0;
+  events.on('connection',ws=>{if(connections++===0)ws.send(Buffer.alloc(8*1024*1024+1));else ws.send('recovered')});
+  const first=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`),messages=[];first.on('error',()=>{});first.on('message',x=>messages.push(x));t.after(()=>first.terminate());
+  await once(first,'close');assert.equal(messages.length,0);assert.equal(f.phone.online,true);assert.equal(f.computer.online,true);
+  const next=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`);t.after(()=>next.terminate());assert.equal(String((await once(next,'message'))[0]),'recovered');
 });
 
 test('a partial socket message is discarded on disconnect and a fresh socket starts cleanly', async t => {
@@ -517,4 +558,39 @@ test('remote HTML revalidation cannot retain an older mobile presentation', asyn
   assert.equal(response.headers.get('etag'), null);
   assert.equal(response.headers.get('last-modified'), null);
   assert.match(await response.text(), /new document.*电脑模式/);
+});
+
+test('offline HTML attachments preserve downloaded bytes and CSP across inline and streamed relay replies', async t => {
+  const f=await proxyFixture(t);
+  const small=Buffer.from('<!doctype html><html><body>离线回放</body></html>');
+  const large=Buffer.concat([small,Buffer.from('x'.repeat(400000))]);
+  const csp="default-src 'none'; script-src 'none'";
+  f.ui.on('request',(req,res)=>{res.writeHead(200,{'content-type':'text/html; charset=utf-8',
+    'content-disposition':"AtTaChMeNt; filename*=UTF-8''replay.html",'content-security-policy':csp});res.end(req.url==='/small-export'?small:large);});
+  for(const [url,expected]of [['/small-export',small],['/large-export',large]]){
+    const response=await fetch(`http://127.0.0.1:${f.uiProxyPort}${url}`);
+    assert.equal(response.status,200);
+    assert.equal(response.headers.get('content-security-policy'),csp);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()),expected);
+  }
+  const head=await fetch(`http://127.0.0.1:${f.uiProxyPort}/small-export`,{method:'HEAD'});
+  assert.equal(head.headers.get('content-security-policy'),csp);assert.equal((await head.arrayBuffer()).byteLength,0);
+});
+
+
+
+test('real encrypted follower visibility switches token streaming and restores without replaying a prompt',async t=>{
+ const f=await proxyFixture(t,{quietAfterMs:20}),received=[];
+ const upstream=new WebSocketServer({server:f.ui});
+ upstream.on('connection',ws=>ws.on('message',data=>{const value=JSON.parse(data.toString());received.push(value);if(value.type==='open'&&value.endpoint==='session/follow')ws.send(JSON.stringify({type:'item',streamId:value.streamId,value:{type:'snapshot',cursor:0,records:[{event:{type:'turn/start'}}],...(value.payload.args.request.assistantStream?{assistantStream:{revision:1}}:{})}}));}));
+ t.after(()=>upstream.close());
+ const ws=new WebSocket(`ws://127.0.0.1:${f.uiProxyPort}/api/remote.mux`),messages=[];ws.on('message',data=>messages.push(JSON.parse(data.toString())));await once(ws,'open');t.after(()=>ws.terminate());
+ const request={type:'open',streamId:'visible-browser',endpoint:'session/follow',payload:{args:{request:{address:{kind:'session',sessionId:'fixture'},assistantStream:true}}}};
+ ws.send(JSON.stringify(request));await waitFor(()=>messages.length===1);
+ const prompt={type:'open',streamId:'prompt-once',endpoint:'session/prompt',payload:{args:{request:{text:'fixture'}}}};ws.send(JSON.stringify(prompt));
+ ws.send(JSON.stringify({type:'dsh-peer-visibility',hidden:true}));await waitFor(()=>received.some(x=>x.type==='open'&&x.payload?.args?.request?.assistantStream===false));
+ await waitFor(()=>messages.length===2);assert.equal(messages[1].streamId,'visible-browser');assert.deepEqual(messages[1].value.assistantStream,{revision:0});
+ ws.send(JSON.stringify({type:'dsh-peer-visibility',hidden:false}));await waitFor(()=>received.filter(x=>x.type==='open'&&x.endpoint==='session/follow').length===3);
+ await waitFor(()=>messages.length===3);assert.equal(messages[2].streamId,'visible-browser');assert.equal(messages[2].value.assistantStream.revision,1);
+ assert.equal(received.filter(x=>x.endpoint==='session/prompt').length,1);assert.ok(!received.some(x=>x.type==='dsh-peer-visibility'));ws.terminate();
 });

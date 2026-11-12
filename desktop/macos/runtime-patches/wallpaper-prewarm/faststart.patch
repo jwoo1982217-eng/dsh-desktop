@@ -1,0 +1,24 @@
+--- a/lib/faststart.js
++++ b/lib/faststart.js
+@@ -43,7 +43,7 @@
+  *   · 清扫只回收**旧版的副本**：不认识的字节一律不碰（那条纪律与缓存目录搬迁一致）。
+  */
+ 
+-import { readdirSync, statSync, unlinkSync } from 'node:fs';
++import { readdirSync, statSync, lstatSync, unlinkSync } from 'node:fs';
+ import { join, resolve } from 'node:path';
+ 
+ /** 旧副本清扫的单次上限：够回收几个 GB，又不会把启动卡住（超了下次启动接着删）。 */
+@@ -182,7 +182,11 @@
+     for (const w of picked) {
+       try {
+         const abs = mediaMap.get(String(w.media).split('/').pop());
+-        if (abs) faststartVariant(abs, logFn);  // 判不了也不报错：本次照旧发原片
++        // Optional warmup must not open an external alias merely because the
++        // library was scanned. lstat inspects the link itself, without opening
++        // its target. Explicit playback/faststart remain on their normal path.
++        if (!abs || !lstatSync(abs).isFile()) continue;
++        faststartVariant(abs, logFn);  // 判不了也不报错：本次照旧发原片
+       } catch { /* 单张失败不影响其它 */ }
+     }
+   }

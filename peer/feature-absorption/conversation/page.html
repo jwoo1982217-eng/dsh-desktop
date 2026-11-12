@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>会话分享与回放</title><link rel="stylesheet" href="./page.css"></head>
+<body>
+<header><a href="../">返回功能</a><h1>会话分享与回放</h1><p>选择消息后导出。文件会隐藏识别到的凭据与个人目录；分享前仍可自行检查内容。</p></header>
+<main>
+ <section aria-labelledby="choose-title"><h2 id="choose-title">选择会话</h2><div class="row"><label class="grow">会话<select id="sessions" aria-label="选择会话"></select></label><button id="reload" type="button">刷新</button></div><p id="status" role="status" aria-live="polite"></p>
+  <div class="row"><button id="select-all" type="button">选择全部</button><button id="clear" type="button">清空选择</button><span id="selection-count">已选 0 条</span></div>
+  <div class="row"><label>从<select id="range-from" aria-label="范围开始"></select></label><label>到<select id="range-to" aria-label="范围结束"></select></label><button id="range-select" type="button">选择范围</button></div>
+  <div id="messages" class="message-list" aria-label="消息列表"></div>
+  <fieldset><legend>导出内容</legend><label><input id="include-text" type="checkbox" checked>正文</label><label><input id="include-reasoning" type="checkbox">思考</label><label><input id="include-tools" type="checkbox">工具记录</label></fieldset>
+  <div class="row"><button type="button" data-export="markdown">Markdown</button><button type="button" data-export="html">离线 HTML</button><button type="button" data-export="json">回放文件</button><button type="button" data-export="svg">图片 SVG</button></div><div id="download" role="status"></div>
+ </section>
+ <section aria-labelledby="replay-title"><h2 id="replay-title">离线回放</h2><p>回放只展示文件中的文字，不恢复工具状态、不执行工具或发送消息。</p><label>打开回放文件<input id="import-file" type="file" accept=".dsh-replay,.json,application/json"></label><details><summary>粘贴回放文件内容</summary><textarea id="import-text" aria-label="回放文件内容" rows="5"></textarea><button id="import-button" type="button">打开回放</button></details><p id="import-status" role="status" aria-live="polite"></p>
+  <div id="replay" hidden><h3 id="replay-name"></h3><div class="row"><button id="play" type="button">播放</button><button id="next" type="button">下一条</button><button id="show-all" type="button">显示全部</button><label>速度<select id="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label><span id="counter"></span></div><input id="progress" type="range" min="0" value="0" aria-label="回放进度"><div id="replay-messages"></div></div>
+ </section>
+</main><script type="module" src="./client.js"></script>
+</body></html>

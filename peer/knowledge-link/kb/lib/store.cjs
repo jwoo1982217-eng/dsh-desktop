@@ -1,6 +1,7 @@
 'use strict';
 const crypto = require('node:crypto');
 const {fs,path,hash,mkdir,json,writeJson,atomic,lock}=require('./util.cjs');
+const retention=require('./retention.cjs');
 function current(c) {
   const pointer=path.join(c.dataDir,'CURRENT');
   if(!fs.existsSync(pointer))return null;
@@ -47,6 +48,7 @@ function writeCache(c,key,source,content,vectors,dim) {
   }catch(e){fs.rmSync(dir,{recursive:true,force:true});throw e;}
 }
 function commit(c,caches,dim,warnings=[],failpoint) {
+  const old=current(c),reusable=new Map((old?.manifest.shards||[]).map(s=>[s.textHash+':'+s.binHash,s]));
   const parent=path.join(c.dataDir,'generations');mkdir(parent);
   const id=Date.now()+'-'+crypto.randomUUID(),dir=path.join(parent,id);mkdir(dir);
   let rows=[],vectors=[],shards=[],cats={},sources=[];
@@ -54,8 +56,14 @@ function commit(c,caches,dim,warnings=[],failpoint) {
     if(!rows.length)return;
     const name='shard-'+String(shards.length).padStart(4,'0');
     const text=rows.map(JSON.stringify).join('\n')+'\n',bin=Buffer.concat(vectors);
-    atomic(path.join(dir,name+'.jsonl'),text);atomic(path.join(dir,name+'.bin'),bin);
-    shards.push({text:name+'.jsonl',bin:name+'.bin',count:rows.length,bytes:Buffer.byteLength(text)+bin.length,textHash:hash(text),binHash:hash(bin)});rows=[];vectors=[];
+    const textHash=hash(text),binHash=hash(bin),prior=reusable.get(textHash+':'+binHash);
+    for(const [suffix,data,digest,previous]of [['.jsonl',text,textHash,prior?.text],['.bin',bin,binHash,prior?.bin]]){
+      const target=path.join(dir,name+suffix),source=previous&&path.join(old.dir,previous);
+      let linked=false;
+      if(source)try{if(hash(fs.readFileSync(source))===digest){fs.linkSync(source,target);linked=true;}}catch(e){if(!['ENOENT','EXDEV','EPERM','EACCES','ENOTSUP','EMLINK'].includes(e.code))throw e;}
+      if(!linked)atomic(target,data);
+    }
+    shards.push({text:name+'.jsonl',bin:name+'.bin',count:rows.length,bytes:Buffer.byteLength(text)+bin.length,textHash,binHash});rows=[];vectors=[];
   };
   try {
     for(const cache of caches) {
@@ -72,7 +80,6 @@ function commit(c,caches,dim,warnings=[],failpoint) {
     // All shards are complete and verified before switching the single commit point.
     for(const shard of shards)for(const _ of shardRows(dir,shard,dim)){}
     failpoint?.('before-publish');
-    const old=current(c);
     if(old)atomic(path.join(c.dataDir,'PREVIOUS'),old.id+'\n');
     atomic(path.join(c.dataDir,'CURRENT'),id+'\n');return {id,manifest};
   }catch(e){fs.rmSync(dir,{recursive:true,force:true});throw e;}
@@ -113,8 +120,9 @@ async function build(c,kind,embed,{log=()=>{},failpoint,force=false}={}) {
     const keys=caches.map(x=>x.key).sort();
     let intact=true;
     if(old)try{for(const shard of old.manifest.shards)for(const _of of shardRows(old.dir,shard,old.manifest.dim)){};}catch{intact=false;}
-    if(intact && old && old.manifest.signature===c.signature && old.manifest.shardSize===c.shardSize && JSON.stringify(keys)===JSON.stringify(old.manifest.sources.map(x=>x.key).sort()) && JSON.stringify([...new Set(warnings)])===JSON.stringify(old.manifest.warnings))return {id:old.id,manifest:old.manifest,changed,reused,embedded,reusedChunks,noOp:true};
-    const result=commit(c,caches,dim,[...new Set(warnings)],failpoint);return {...result,changed,reused,embedded,reusedChunks};
+    const cleanup=()=>{try{return retention.collectLocked(c,{apply:true});}catch(e){log('[kb] 索引回收未完成：'+e.message);return {error:e.message};}};
+    if(intact && old && old.manifest.signature===c.signature && old.manifest.shardSize===c.shardSize && JSON.stringify(keys)===JSON.stringify(old.manifest.sources.map(x=>x.key).sort()) && JSON.stringify([...new Set(warnings)])===JSON.stringify(old.manifest.warnings))return {id:old.id,manifest:old.manifest,changed,reused,embedded,reusedChunks,noOp:true,cleanup:cleanup()};
+    const result=commit(c,caches,dim,[...new Set(warnings)],failpoint);return {...result,changed,reused,embedded,reusedChunks,cleanup:cleanup()};
   }finally{release();}
 }
 function rollback(c) {
@@ -129,4 +137,5 @@ function rollback(c) {
     atomic(path.join(c.dataDir,'CURRENT'),previous+'\n');if(now)atomic(path.join(c.dataDir,'PREVIOUS'),now.id+'\n');return previous;
   }finally{release();}
 }
-module.exports={current,floats,shardRows,cacheKey,cached,writeCache,commit,build,rollback};
+const acquireCurrent=c=>retention.acquire(c,current);
+module.exports={current,acquireCurrent,floats,shardRows,cacheKey,cached,writeCache,commit,build,rollback};

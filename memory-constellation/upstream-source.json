@@ -1,0 +1,13 @@
+{
+  "repository": "https://github.com/yuyun-git/dsh-meow-constellation",
+  "commit": "a762f5cae29f34922ee3c6e3d7ba4f35e5b5f7f4",
+  "files": [
+    "lib/constellation.html",
+    "lib/client.js",
+    "lib/index.js",
+    "package.json",
+    "cordis.patch.yml",
+    "LICENSE",
+    "README.md"
+  ]
+}

@@ -1,0 +1,5 @@
+packages: ['.']
+nodeLinker: hoisted
+supportedArchitectures:
+  os: [darwin]
+  cpu: [arm64]

@@ -1,0 +1,8 @@
+{
+  "name": "dsh-desktop-runtime-rc1",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.6",
+  "engines": {"node": ">=24.11.0"},
+  "dependencies": {"@deepseek-ai/dsh": "0.2.2-rc.1"}
+}

@@ -6,6 +6,7 @@ export const fontStacks = {
   mono:'"SF Mono","Cascadia Code","JetBrains Mono",Consolas,monospace',
   jetbrains:'"JetBrains Mono","SF Mono",Consolas,monospace',fira:'"Fira Code","SF Mono",Consolas,monospace',
 };
+const fontStack = key => /^local:[a-f0-9]{64}$/.test(key || '') ? '"dshLocal_'+key.slice(6)+'",system-ui,sans-serif' : fontStacks[key];
 export function composeTokens(recipe, options) {
   const tokens=structuredClone(recipe.tokens);
   const set=(key,value)=>{tokens[key]={light:value,dark:value};};
@@ -16,7 +17,7 @@ export function composeTokens(recipe, options) {
   })) if(options[field]) for(const key of keys)set(key,options[field]);
   for(const [field,keys] of [['uiFont',['--dsw-font-family']],['codeFont',['--dsw-font-mono','--ds-font-family-code']]]) {
     if(!options[field])continue;
-    const family=fontStacks[options[field]];
+    const family=fontStack(options[field]);
     for(const key of keys)set(key,family);
     for(const [key,modes] of Object.entries(tokens)) {
       if(!key.startsWith('--dsw-font-'))continue;
@@ -38,7 +39,7 @@ export async function recipeFor(state) {
 }
 export function createVisuals(doc, {native=false}={}) {
   const body=doc.body,html=doc.documentElement;
-  const savedAttributes=new Map(),savedStyles=new Map(); let link=null,recipe=null,options=null,tokens=null,scheme='light',disposed=false;
+  const savedAttributes=new Map(),savedStyles=new Map(),faces=new Map(); let link=null,recipe=null,options=null,tokens=null,scheme='light',disposed=false;
   const rememberAttr=(node,key)=>{const id=(node===html?'html:':'body:')+key;if(!savedAttributes.has(id))savedAttributes.set(id,{node,key,value:node.getAttribute(key)});};
   const attr=(node,key,value)=>{rememberAttr(node,key);if(value===null){if(node.hasAttribute(key))node.removeAttribute(key);}else if(node.getAttribute(key)!==value)node.setAttribute(key,value);};
   const style=(key,value)=>{if(!savedStyles.has(key))savedStyles.set(key,[body.style.getPropertyValue(key),body.style.getPropertyPriority(key)]);body.style.setProperty(key,value);};
@@ -57,12 +58,23 @@ export function createVisuals(doc, {native=false}={}) {
     if(!native){attr(body,'data-ds-dark-theme',scheme==='dark'?'':null);style('color-scheme',scheme);for(const [key,modes] of Object.entries(tokens))style(key,modes[scheme]);}
     style('--ac-glow',recipe.glow||'none');style('--ac-wallpaper',options.wallpaper?'url("'+options.wallpaper+'")':'none');
     style('--ac-wallpaper-opacity',String(options.wallpaperOpacity));style('--ac-blur',options.blur+'px');
-    style('--ac-code-family',fontStacks[options.codeFont]||'inherit');style('--ac-code-size',options.codeSize?options.codeSize+'px':'inherit');
+    style('--ac-code-family',fontStack(options.codeFont)||'inherit');style('--ac-code-size',options.codeSize?options.codeSize+'px':'inherit');
   };
   const observer=new MutationObserver(()=>{if(recipe && html.getAttribute('data-dsh-skin')!==(recipe.attributes['data-dsh-skin']??null))paint();});
   observer.observe(html,{attributes:true,attributeFilter:['data-dsh-skin']});
   return {
-    async prepare(next) {
+    async prepare(next, nextOptions = {}) {
+      const wanted=new Set(['uiFont','codeFont'].map(k=>nextOptions[k]).filter(k=>/^local:[a-f0-9]{64}$/.test(k || '')));
+      const loaded=new Map();
+      for(const key of wanted) {
+        if(faces.has(key))continue;
+        const id=key.slice(6),face=new doc.defaultView.FontFace('dshLocal_'+id,`url("/appearance-center/font?id=${id}")`);
+        let timer;
+        try {await Promise.race([face.load(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('本地字体加载超时，当前外观保留')),10000);})]);}
+        finally {clearTimeout(timer);}
+        if(disposed)throw Error('外观页面已关闭');
+        loaded.set(key,face);
+      }
       const candidate=doc.createElement('link');candidate.rel='stylesheet';candidate.media='not all';candidate.href='/appearance-center/themes/'+next.file+'.css';
       await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{candidate.remove();reject(Error('主题样式加载超时，当前外观保留'));},15000);
         candidate.onload=()=>{clearTimeout(timer);resolve();};candidate.onerror=()=>{clearTimeout(timer);candidate.remove();reject(Error('主题样式读取失败，当前外观保留'));};doc.head.append(candidate);});
@@ -71,10 +83,12 @@ export function createVisuals(doc, {native=false}={}) {
         const oldAttributes=recipe?.attributes||{}; resetStyle();resetAttrs();
         recipe={...next,previousAttributes:oldAttributes};options=state.options;tokens=composed;scheme=mode;
         for(const key of Object.keys(oldAttributes))if(key!=='data-dsh-skin')attr(body,key,null);
+        for(const [key,face] of loaded){doc.fonts.add(face);faces.set(key,face);}
         paint();const previous=link;link=candidate;candidate.media='all';previous?.remove();
+        for(const [key,face] of faces)if(!wanted.has(key)){doc.fonts.delete(face);faces.delete(key);}
       },cancel(){if(!used){used=true;candidate.remove();}}};
     },
     sync(mode){scheme=mode;paint();},
-    dispose(){disposed=true;observer.disconnect();link?.remove();common.remove();resetStyle();resetAttrs();},
+    dispose(){disposed=true;observer.disconnect();link?.remove();common.remove();for(const face of faces.values())doc.fonts.delete(face);faces.clear();resetStyle();resetAttrs();},
   };
 }

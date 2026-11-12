@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir, rename, rm, symlink, lstat, realpath } from
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import {patchPocket} from '../runtime/pocket-update/patch.mjs';
 
 export const pocketVersion = '2.10.6';
 
@@ -23,6 +24,7 @@ export async function installDesktopPocket(profile, modules) {
   for (const file of ['cordis.patch.yml', 'lib/index.js', 'client/index.jsx']) await readFile(path.join(source, file));
   const require = createRequire(path.join(await realpath(source), 'package.json'));
   for (const dependency of ['qrcode', 'qrcode-terminal']) require.resolve(dependency);
+  await patchPocket(await realpath(source));
   await mkdir(path.dirname(target), { recursive: true });
   const staging = target + '.new-' + randomUUID(), backup = target + '.old-' + randomUUID();
   const temporary = manifestFile + '.pocket-' + randomUUID();

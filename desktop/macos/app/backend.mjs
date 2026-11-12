@@ -1,5 +1,8 @@
 import {prepareProfileMigration, commitProfileMigration, migrationReceipt, restoreProfileMigration} from './profile-migration.mjs';
+import {preservePocket} from './pocket-preserve.mjs';
+import {applyProgramUpdate} from './program-update.mjs';
 import {checkPluginInheritance} from './plugin-inheritance.mjs';
+import {prepareRc1Profile, assertFreshRc1PluginCompatibility, publishFreshRc1Marker, removeFreshRc1Marker} from './rc1-profile.mjs';
 import {EventEmitter} from 'node:events';
 import {readFile, writeFile, mkdir, rename, rm, lstat, symlink} from 'node:fs/promises';
 import {spawn, execFile} from 'node:child_process';
@@ -7,7 +10,7 @@ import {createConnection} from 'node:net';
 import {randomUUID} from 'node:crypto';
 import path from 'node:path';
 
-export const coreVersion = '0.2.1-alpha.4';
+export const coreVersion = '0.2.2-rc.1';
 export const startupTimeoutMs = 240000;
 export const statePath = (home, port) => path.join(home, `.desktop-web-${port}.json`);
 export function localEntry(value, port) {
@@ -54,6 +57,14 @@ export async function atomicJson(file, value) {
 // Only program entry points move. Accounts, chat files, skills and user patches
 // stay in DSH_HOME. All replaced entries have a rollback copy.
 export async function prepareProfile(home, runtime, {beforeCommit} = {}) {
+  const engineVersion = JSON.parse(await readFile(path.join(runtime, 'node_modules/@deepseek-ai/dsh/package.json'), 'utf8')).version;
+  if (engineVersion !== coreVersion) throw Error('安装包内的 DSH 核心版本不匹配。');
+  if (engineVersion === '0.2.2-rc.1') {
+    const upgraded = await prepareRc1Profile(home, runtime);
+    if (upgraded) return upgraded;
+  }
+  const selective = await applyProgramUpdate(home, runtime);
+  if (selective) return selective;
   const bundle = JSON.parse(await readFile(path.join(runtime, 'bundle.json'), 'utf8'));
   const modules = path.join(runtime, 'node_modules');
   const engine = JSON.parse(await readFile(path.join(modules, '@deepseek-ai/dsh/package.json'), 'utf8'));
@@ -65,7 +76,7 @@ export async function prepareProfile(home, runtime, {beforeCommit} = {}) {
   catch (error) { if (error.code === 'EEXIST') throw Error('另一个 DSH 安装过程尚未完成，请稍后重试。'); throw error; }
   let original = null, backup, manifestCommitted = false;
   const swaps = [], created = [];
-  let profileMigration, profilePatch;
+  let profileMigration, profilePatch, freshRc1Marker;
   try {
     try { original = await readFile(manifestFile, 'utf8'); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -74,12 +85,14 @@ export async function prepareProfile(home, runtime, {beforeCommit} = {}) {
     manifest.dependencies ??= {};
     profileMigration = await prepareProfileMigration(profile, modules);
     const names = bundle.plugins.filter(name => original === null || name in manifest.dependencies || manifest.dsh.profile.bundles.includes(name));
+    if (original === null && engine.version === '0.2.2-rc.1') await assertFreshRc1PluginCompatibility(runtime,names);
     for (const name of names) await checkPluginInheritance(name,
       path.join(modules, name), path.join(profile, 'node_modules', name));
     backup = path.join(home, 'backups', `mac-app-${bundle.version}-${randomUUID()}`);
     await mkdir(backup, {recursive: true, mode: 0o700});
     if (original !== null) await writeFile(path.join(backup, 'package.json'), original, {mode: 0o600});
     for (const name of names) {
+      if (name === 'dsh-pocket' && await preservePocket(home, profile, modules, manifest)) continue;
       const source = path.join(modules, name), target = path.join(profile, 'node_modules', name);
       await readFile(path.join(source, 'package.json'));
       await mkdir(path.dirname(target), {recursive: true});
@@ -106,9 +119,12 @@ export async function prepareProfile(home, runtime, {beforeCommit} = {}) {
     if (current !== original) throw Error('DSH 配置刚刚发生变化，请重试；原配置已保留。');
     profilePatch = await commitProfileMigration(profileMigration, backup);
     await atomicJson(manifestFile, manifest); manifestCommitted = true;
-    await atomicJson(path.join(backup, 'restore.json'), {profile, manifestExisted: original !== null, swaps, profilePatch});
+    if (original === null && engine.version === '0.2.2-rc.1') freshRc1Marker = await publishFreshRc1Marker(profile,runtime);
+    await atomicJson(path.join(backup, 'restore.json'), {profile, manifestExisted: original !== null, swaps, profilePatch,
+      ...freshRc1Marker ? {rc1FreshMarker:freshRc1Marker.receipt,complete:true} : {}});
     return {profile, backup, fresh: original === null};
   } catch (error) {
+    if (freshRc1Marker) try {await removeFreshRc1Marker(freshRc1Marker);} catch (failure) {error.message += '；' + failure.message;}
     await restoreProfileMigration(profilePatch);
     for (const {target, saved, existed} of swaps.reverse()) {
       await rm(target, {recursive: true, force: true});

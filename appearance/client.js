@@ -34,14 +34,14 @@ function apply(ctx) {
   async function attach(frame){
     try{if(new URL(frame.src,location.href).pathname==='/appearance-center'){if(current)frame.contentWindow?.postMessage({type:'dsh:appearance-state',state:current},location.origin);return;}const doc=frame.contentDocument;if(!doc?.body||documents.has(doc)||!current)return;
       const visual=createVisuals(doc);documents.set(doc,visual);const sequence=generation;
-      const prepared=await visual.prepare(recipe);if(sequence!==generation||closed){prepared.cancel();return;}
+      const prepared=await visual.prepare(recipe,current.options);if(sequence!==generation||closed){prepared.cancel();return;}
       prepared.commit(current,mode(),composeTokens(recipe,current.options));
     }catch{} // Cross-origin embedded apps keep their own appearance.
   }
   async function adopt(state){
     if(closed||current && state.revision<current.revision)return false;
     if(current && state.revision===current.revision)return true;
-    const sequence=++generation;const next=await recipeFor(state),prepared=await documents.get(document).prepare(next);
+    const sequence=++generation;const next=await recipeFor(state),prepared=await documents.get(document).prepare(next,state.options);
     if(sequence!==generation||closed){prepared.cancel();return false;}
     const tokens=composeTokens(next,state.options);
     const nextLayer=ctx.theme.overrideTokens('dsh-appearance-center',tokens);layer?.();layer=nextLayer;
@@ -51,7 +51,7 @@ function apply(ctx) {
     if(state.options.uiSize!==null)setContentSize(state.options.uiSize);
     prepared.commit(state,mode(),tokens);
     refreshFrames();
-    for(const [doc,visual] of documents)if(doc!==document){try{const p=await visual.prepare(next);if(sequence===generation&&!closed)p.commit(state,mode(),tokens);else p.cancel();}catch{}}
+    for(const [doc,visual] of documents)if(doc!==document){try{const p=await visual.prepare(next,state.options);if(sequence===generation&&!closed)p.commit(state,mode(),tokens);else p.cancel();}catch{}}
     for(const frame of document.querySelectorAll('iframe')){try{if(new URL(frame.src,location.href).pathname==='/appearance-center')frame.contentWindow?.postMessage({type:'dsh:appearance-state',state},location.origin);}catch{}}
     return sequence===generation&&!closed;
   }
@@ -71,18 +71,20 @@ function apply(ctx) {
   ctx.slots.inject('settings.section',()=>ctx.slots.register({name:'settings.section',id:'appearance',priority:-100,order:20,label:'外观'},AppearanceSection));
   for(const id of ['appearance','font-size'])ctx.slots.inject('settings.general.item',()=>ctx.slots.register({name:'settings.general.item',id,priority:-100,order:id==='appearance'?10:11},()=>null));
   const response=await fetch('/appearance-center/manage',{method:'POST',signal:startupAbort.signal,headers:{'content-type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:appearanceRequestId(),method:'manage',payload:{action:'status'}})});
-  const envelope=await response.json();if(!response.ok||!envelope.result?.ok)throw Error('外观设置读取失败');
+  const envelope=await response.json();if(bootClosed)return;if(!response.ok||!envelope.result?.ok)throw Error('外观设置读取失败');
   let initial=envelope.result.value;
   // Only a first migration may adopt the old browser-local OpenCode choice.
   const oldPalette=palette?.getState?.();
   if(initial.revision===0 && oldPalette?.enabled && initial.providers.find(p=>p.id==='opencode')?.themes.some(t=>t.id==='opencode:'+oldPalette.theme)){
-    const migration=await fetch('/appearance-center/manage',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:appearanceRequestId(),method:'manage',payload:{action:'select',revision:0,theme:'opencode:'+oldPalette.theme}})}).then(r=>r.json());
+    const migration=await fetch('/appearance-center/manage',{method:'POST',signal:startupAbort.signal,headers:{'content-type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:appearanceRequestId(),method:'manage',payload:{action:'select',revision:0,theme:'opencode:'+oldPalette.theme}})}).then(r=>r.json());
+    if(bootClosed)return;
     if(migration.result?.ok)initial=migration.result.value;
-    else initial=await fetch('/appearance-center/manage',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:appearanceRequestId(),method:'manage',payload:{action:'status'}})}).then(r=>r.json()).then(e=>e.result.value);
+    else initial=await fetch('/appearance-center/manage',{method:'POST',signal:startupAbort.signal,headers:{'content-type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:appearanceRequestId(),method:'manage',payload:{action:'status'}})}).then(r=>r.json()).then(e=>e.result.value);
   }
   await adopt(initial);
+  if(bootClosed)return;
   if(typeof BroadcastChannel!=='undefined')ctx.effect(()=>{const channel=new BroadcastChannel('dsh:appearance-center');channel.onmessage=()=>{
-    fetch('/appearance-center/manage',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:appearanceRequestId(),method:'manage',payload:{action:'status'}})}).then(r=>r.json()).then(e=>e.result?.ok&&adopt(e.result.value)).catch(()=>{});
+    fetch('/appearance-center/manage',{method:'POST',signal:startupAbort.signal,headers:{'content-type':'application/json'},body:JSON.stringify({type:'client-request',rpcId:appearanceRequestId(),method:'manage',payload:{action:'status'}})}).then(r=>r.json()).then(e=>e.result?.ok&&adopt(e.result.value)).catch(()=>{});
   };return()=>channel.close();});
   }
   initialize().catch(error=>{if(!bootClosed)console.warn('[appearance-center] 外观恢复暂未完成，聊天仍可使用。',error);});

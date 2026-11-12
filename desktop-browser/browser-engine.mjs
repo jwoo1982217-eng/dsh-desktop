@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { access, mkdir, chmod } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
+import { randomUUID } from 'node:crypto';
+import { captureFileChooser, fileContext, cancelFileChooser, capturePasteTarget, deliverBrowserFiles } from './browser-file-delivery.mjs';
 
 export function websiteAddress(value) {
   if (typeof value !== 'string' || value.length > 8192 || /[\u0000-\u0020]/u.test(value.trim())) throw Error('请输入有效网址');
@@ -108,6 +110,7 @@ export class DesktopBrowser extends EventEmitter {
       pipe.on('event', message => this.event(message));
       pipe.on('closed', () => {
         if (this.pipe !== pipe) return;
+        this.anchorTargetId = undefined;
         this.tabs.clear();
         this.emit('closed');
       });
@@ -115,17 +118,40 @@ export class DesktopBrowser extends EventEmitter {
         this.version = await pipe.send('Browser.getVersion');
         await pipe.send('Browser.setDownloadBehavior', { behavior: 'deny' });
         await pipe.send('Target.setDiscoverTargets', { discover: true });
-        // --no-startup-window leaves an existing persistent profile unloaded.
-        // Initialize its default context with a minimized, empty bootstrap page;
-        // otherwise Chrome rejects hidden targets on the second launch.
-        const bootstrap = await pipe.send('Target.createTarget', { url: 'about:blank',
-          newWindow: true, background: true, windowState: 'minimized' });
-        await pipe.send('Target.closeTarget', { targetId: bootstrap.targetId });
+        // hidden target 依赖至少一个普通frame。初始化后马上关闭它会让
+        // 已有资料、无扩展后台页或最后一页关闭后的浏览器永久无法新建网页。
+        await this.ensureAnchor();
       } catch (error) { child.kill('SIGTERM'); throw error; }
     })();
     try { await this.starting; } finally { this.starting = undefined; }
   }
+  async ensureAnchor() {
+    if (this.anchoring) return this.anchoring;
+    const pipe = this.pipe;
+    if (!pipe || pipe.closed) throw Error('浏览器未连接');
+    this.anchoring = (async () => {
+      if (this.anchorTargetId) {
+        try { await pipe.send('Target.getTargetInfo', { targetId: this.anchorTargetId }); return; }
+        catch (error) {
+          if (pipe.closed || !/target.*(?:found|exist)|(?:found|exist).*target/i.test(error.message)) throw error;
+          this.anchorTargetId = undefined;
+        }
+      }
+      const { targetId } = await pipe.send('Target.createTarget', { url: 'about:blank', newWindow: true, background: true, windowState: 'minimized' });
+      this.anchorTargetId = targetId;
+    })();
+    try { await this.anchoring; } finally { this.anchoring = undefined; }
+  }
   event(message) {
+    if (message.method === 'Page.frameNavigated' || message.method === 'Page.fileChooserOpened') {
+      const tab = [...this.tabs.values()].find(value => value.sessionId === message.sessionId);
+      if (tab && message.method === 'Page.frameNavigated' && !message.params.frame.parentId) {
+        const documentId = tab.documentId;
+        tab.documentId = randomUUID(); tab.fileChooser = undefined;
+        this.emit('documentChanged', { id: tab.id, documentId });
+      }
+      if (tab && message.method === 'Page.fileChooserOpened') void captureFileChooser(this, tab, message.params);
+    }
     if (message.method === 'Target.targetCreated') {
       const info = message.params.targetInfo;
       if (info.type === 'page' && this.tabs.has(info.openerId) && !this.tabs.has(info.targetId)) {
@@ -137,7 +163,8 @@ export class DesktopBrowser extends EventEmitter {
       if (tab) { tab.url = message.params.targetInfo.url; tab.title = message.params.targetInfo.title; this.emit('tab', this.summary(tab)); }
     }
     if (message.method === 'Target.targetDestroyed') {
-      if (this.tabs.delete(message.params.targetId)) this.emit('tabs', this.list());
+      if (message.params.targetId === this.anchorTargetId) this.anchorTargetId = undefined;
+      if (this.tabs.delete(message.params.targetId)) { this.emit('tabClosed', message.params.targetId); this.emit('tabs', this.list()); }
     }
     if (message.method === 'Page.screencastFrame') {
       const tab = [...this.tabs.values()].find(value => value.sessionId === message.sessionId);
@@ -148,9 +175,10 @@ export class DesktopBrowser extends EventEmitter {
   async adoptPopup(info) {
     if (this.tabs.size >= 16) { await this.pipe.send('Target.closeTarget', { targetId: info.targetId }); return; }
     const { sessionId } = await this.pipe.send('Target.attachToTarget', { targetId: info.targetId, flatten: true });
-    const tab = { id: info.targetId, sessionId, url: info.url, title: info.title, human: Boolean(this.tabs.get(info.openerId)?.human), ...this.viewport };
+    const tab = { id: info.targetId, sessionId, url: info.url, title: info.title, documentId: randomUUID(), human: Boolean(this.tabs.get(info.openerId)?.human), ...this.viewport };
     this.tabs.set(tab.id, tab);
     await this.send(tab, 'Page.enable');
+    if (!tab.human) await this.send(tab, 'Page.setInterceptFileChooserDialog', { enabled: true });
     await this.resize(tab.id, tab.width, tab.height);
     this.emit('popup', { openerId: info.openerId, tab: this.summary(tab) });
   }
@@ -176,6 +204,7 @@ export class DesktopBrowser extends EventEmitter {
   async newTab(address, { visible = false } = {}) {
     const url = address === undefined ? 'about:blank' : websiteAddress(address);
     await this.start();
+    await this.ensureAnchor();
     // Hidden targets retain normal Chrome rendering without opening a desktop
     // window for every agent tab. Human verification uses a visible target in
     // this exact browser context, so no cookies or credentials are copied.
@@ -189,14 +218,16 @@ export class DesktopBrowser extends EventEmitter {
       try { ({ targetId } = await this.pipe.send('Target.createTarget', parameters)); break; }
       catch (error) {
         if (visible || !error.message.includes('Hidden target can be created only when remote debugging is enabled') || Date.now() >= deadline) throw error;
+        await this.ensureAnchor();
         await delay(50);
       }
     }
     try {
       const { sessionId } = await this.pipe.send('Target.attachToTarget', { targetId, flatten: true });
-      const tab = { id: targetId, sessionId, url: 'about:blank', title: '', human: visible, ...this.viewport };
+      const tab = { id: targetId, sessionId, url: 'about:blank', title: '', documentId: randomUUID(), human: visible, ...this.viewport };
       this.tabs.set(tab.id, tab);
       await this.send(tab, 'Page.enable');
+      if (!tab.human) await this.send(tab, 'Page.setInterceptFileChooserDialog', { enabled: true });
       await this.resize(tab.id, tab.width, tab.height);
       if (url !== 'about:blank') await this.navigate(tab.id, url);
       this.emit('tabs', this.list());
@@ -209,6 +240,9 @@ export class DesktopBrowser extends EventEmitter {
   }
   async navigate(id, address) {
     const tab = this.tab(id), url = websiteAddress(address);
+    const documentId = tab.documentId;
+    tab.documentId = randomUUID(); tab.fileChooser = undefined;
+    this.emit('documentChanged', { id: tab.id, documentId });
     const result = await this.send(tab, 'Page.navigate', { url });
     if (result.errorText) throw Error(`网页加载失败：${result.errorText}`);
     tab.url = url;
@@ -253,8 +287,17 @@ export class DesktopBrowser extends EventEmitter {
   }
   async stopFrames(id) { return this.send(this.tab(id), 'Page.stopScreencast'); }
   async screenshot(id) { return this.send(this.tab(id), 'Page.captureScreenshot', { format: 'png' }); }
-  async pointer(id, { type, x, y, button = 'none', buttons = 0, deltaX = 0, deltaY = 0, modifiers = 0 }) {
+  pointerPoint(tab, { x, y, viewportWidth, viewportHeight }) {
+    if (viewportWidth !== undefined || viewportHeight !== undefined) {
+      if (![viewportWidth, viewportHeight].every(n => Number.isInteger(n) && n > 0 && n <= 32768) || !Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x > viewportWidth || y > viewportHeight) throw Error('无效的鼠标操作');
+      x = x * tab.width / viewportWidth; y = y * tab.height / viewportHeight;
+    }
+    if (![x, y].every(Number.isFinite) || x < 0 || y < 0 || x > tab.width || y > tab.height) throw Error('无效的鼠标操作');
+    return { x, y };
+  }
+  async pointer(id, { type, x, y, viewportWidth, viewportHeight, button = 'none', buttons = 0, deltaX = 0, deltaY = 0, modifiers = 0 }) {
     const tab = this.tab(id);
+    ({ x, y } = this.pointerPoint(tab, { x, y, viewportWidth, viewportHeight }));
     if (!['mousePressed', 'mouseReleased', 'mouseMoved', 'mouseWheel'].includes(type) || !['none', 'left', 'right', 'middle'].includes(button) || ![x, y, deltaX, deltaY].every(Number.isFinite) || x < 0 || y < 0 || x > tab.width || y > tab.height || !Number.isInteger(buttons) || buttons < 0 || buttons > 7 || !Number.isInteger(modifiers) || modifiers < 0 || modifiers > 15) throw Error('无效的鼠标操作');
     return this.send(tab, 'Input.dispatchMouseEvent', { type, x, y, button, buttons, modifiers, ...(type === 'mousePressed' || type === 'mouseReleased' ? { clickCount: 1 } : {}), ...(type === 'mouseWheel' ? { deltaX, deltaY } : {}) });
   }
@@ -262,6 +305,16 @@ export class DesktopBrowser extends EventEmitter {
     if (typeof value !== 'string' || value.length > 65536) throw Error('无效的输入内容');
     return this.send(this.tab(id), 'Input.insertText', { text: value });
   }
+  fileChooser(id) {
+    const request = this.tab(id).fileChooser;
+    return request?.ready ? { requestId: request.requestId, multiple: request.multiple, accept: request.accept } : undefined;
+  }
+  async fileContext(id, payload) {
+    const tab = this.tab(id), context = fileContext(tab, payload);
+    return context.kind === 'paste' ? capturePasteTarget(this, tab, context) : context;
+  }
+  async cancelFileChooser(id, requestId) { cancelFileChooser(this.tab(id), requestId); }
+  async deliverFiles(id, context, files) { return deliverBrowserFiles(this, this.tab(id), context, files); }
   async key(id, { type, key, code, modifiers = 0, windowsVirtualKeyCode = 0 }) {
     if (!['keyDown', 'keyUp', 'rawKeyDown'].includes(type) || typeof key !== 'string' || key.length > 64 || typeof code !== 'string' || code.length > 64 || !Number.isInteger(modifiers) || modifiers < 0 || modifiers > 15 || !Number.isInteger(windowsVirtualKeyCode)) throw Error('无效的键盘操作');
     return this.send(this.tab(id), 'Input.dispatchKeyEvent', { type, key, code, modifiers, windowsVirtualKeyCode });

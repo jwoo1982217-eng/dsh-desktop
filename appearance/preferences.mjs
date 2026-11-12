@@ -24,7 +24,7 @@ export function preferences(value = {}, previous = defaults) {
           (typeof field !== 'number' || !Number.isFinite(field) || field < min || field > max ||
           (key !== 'wallpaperOpacity' && !Number.isInteger(field)))) throw Error('外观数值超出范围');
     } else if (['uiFont', 'codeFont'].includes(key)) {
-      if (field !== '' && !Object.hasOwn(fonts, field)) throw Error('请选择字体列表中的字体');
+      if (field !== '' && !Object.hasOwn(fonts, field) && !/^local:[a-f0-9]{64}$/.test(field)) throw Error('请选择字体列表中的字体');
     } else if (key === 'mode') {
       if (!['system', 'light', 'dark'].includes(field)) throw Error('请选择浅色、深色或跟随系统');
     } else if (key === 'width') {

@@ -1,0 +1,7 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>桌面增强</title><link rel="stylesheet" href="/desktop-enhancements/page.css"></head><body>
+<header><div><h1>耗时与缓存统计</h1><p id="subtitle">从本机会话日志读取；不会发起模型请求。</p></div><nav><button id="show-metrics" type="button">会话统计</button><button id="show-plugins" type="button">插件更新</button></nav></header>
+<p id="error" role="alert" hidden></p>
+<main id="metrics-panel"><div class="toolbar"><label>会话 <select id="session"></select></label><button id="refresh" type="button">刷新统计</button><button id="more" type="button" hidden>扩大读取窗口</button><span id="range"></span></div>
+<section id="totals" class="totals"></section><div class="scroll"><table><thead><tr><th>轮次 / 步骤</th><th>实际模型</th><th>状态</th><th>输入 Token</th><th>输出 Token</th><th>缓存命中</th><th>首词延迟</th><th>模型用时</th><th>工具墙钟</th><th>总墙钟</th></tr></thead><tbody id="rows"></tbody></table></div><p id="notes" class="muted"></p></main>
+<main id="plugins-panel" hidden><p>这里按准确版本更新公开注册源的第三方插件。本地源码、文件包、链接和内置插件保持原维护方式。</p><div class="toolbar"><button id="reload-plugins" type="button">刷新列表</button><span id="update-status"></span><button id="cancel-update" type="button" hidden>取消目标安装并恢复</button></div><div id="plugins"></div></main>
+<script type="module" src="/desktop-enhancements/page.js"></script></body></html>

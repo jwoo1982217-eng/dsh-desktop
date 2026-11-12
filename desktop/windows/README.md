@@ -4,14 +4,15 @@
 
 ## 构建
 
-需要 Node.js 24、Python 3，以及一个已整理并验证的完整程序运行时（含 `bundle.json` 和扁平 `node_modules`）。可复用 `desktop/macos/build.mjs` 产生的 `work/runtime`；本脚本会替换其中的平台包，并移除其他平台的二进制，不会打包 Mac 应用或用户配置目录。
+需要 Node.js 24、Python 3 和规范工程已锁定的 `desktop-runtime/node_modules`。`prepare-runtime.mjs` 从当前工程收集程序、共享模块与运行时覆盖，适配 Pocket 更新，再由 staging 替换 Windows 原生组件。不会复制 Mac 应用或用户配置。Windows 版本单独维护在本目录 `package.json`。
 
 ```sh
 npm ci --prefix desktop/windows/tools --ignore-scripts --no-audit --no-fund
-node desktop/windows/build.mjs --runtime /absolute/program-only/runtime --out /absolute/build/windows --tools /absolute/source/desktop/windows/tools
+node desktop/windows/prepare-runtime.mjs --out /absolute/task/generated/runtime --our-free-model /absolute/dsh-phone-public/our-free-model
+node desktop/windows/build.mjs --runtime /absolute/task/generated/runtime --out /absolute/task/generated/windows --tools /absolute/source/desktop/windows/tools
 ```
 
-产物：`DSH-0.1.6-Windows-x64-Setup.exe`、SHA-256、逐文件清单和构建回执。`runtime-lock.json` 锁定所有下载来源与 SHA-256。微软 CRT 从固定官方安装程序中提取，不需要用户单独安装运行库。修改版本时同步应用包、运行时 bundle 与说明中的版本。
+产物：`DSH-0.1.8-Windows-x64-Setup.exe`、SHA-256、逐文件清单和构建回执。`runtime-lock.json` 锁定所有下载来源与 SHA-256。微软 CRT 从固定官方安装程序中提取，不需要用户单独安装运行库。修改版本时同步 Windows 元数据、运行时 bundle 与说明中的版本。
 
 `--reuse-stage` 仅供同一次发布调整 Electron 壳或安装脚本后重打包；它不重新生成或验证原生运行时，不可用来跳过首次完整构建。
 
@@ -20,6 +21,8 @@ node desktop/windows/build.mjs --runtime /absolute/program-only/runtime --out /a
 - 默认目录 `%LOCALAPPDATA%\Programs\DSH`，桌面与开始菜单快捷方式，Windows 设置中的卸载入口。
 - 使用目录 junction 挂载内置插件，普通用户无需开发者模式或管理员权限。
 - Windows PATH 去除大小写重复项，显式指向捆绑的 `opencode.exe`。
+- 同目录提供 `dsh.cmd`，命令行和插件更新使用捆绑 Node/核心，中文和带空格路径保持为独立参数；系统 PowerShell 作为 Windows 命令后端。
+- 收集时拒绝外部 overlay 链接，保留旧输出；staging 检查大小写重名、Windows 保留设备名、尾随空格/点及不支持的字符。
 - 关闭窗口后，父进程通过私有 IPC 请求后台正常清理；超时才结束本应用拥有的进程树。复用的外部 DSH 服务不会被关闭。
 - 更新、卸载遇到程序文件锁定时要求关闭 DSH；卸载仅删除清单内的程序文件，保留用户配置及另存的文件。
 - Windows 日志目录 `%APPDATA%\DSH\logs`。
@@ -27,7 +30,8 @@ node desktop/windows/build.mjs --runtime /absolute/program-only/runtime --out /a
 ## 验证边界
 
 ```sh
-node --test desktop/windows/backend.test.mjs desktop/macos/backend.test.mjs desktop/macos/popup-navigation.test.mjs desktop/macos/release-links.test.mjs
+node --test desktop/windows/prepare-runtime.test.mjs desktop/windows/backend.test.mjs desktop/macos/backend.test.mjs desktop/macos/popup-navigation.test.mjs desktop/macos/release-links.test.mjs
+python3 -B desktop/windows/stage.test.py
 ```
 
 交付前还应解开最终 NSIS 包并与逐文件清单核对，确认所有 PE 原生组件为 AMD64、无 Mach-O/ELF、CRT 导入完整。资源修改仅改 DSH.exe 的图标和版本，须核对可执行代码段未改变。

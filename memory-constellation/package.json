@@ -1,0 +1,32 @@
+{
+  "name": "dsh-meow-constellation",
+  "version": "0.2.0-dsh-kb.1",
+  "description": "记忆星图：连接 DSH 现有知识库、真实图谱及记忆摘要，提供按需检索。",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.2-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "immediately": true
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test tests/*.test.mjs"
+  }
+}

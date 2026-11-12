@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { randomBytes, randomUUID } from 'node:crypto';
 import WebSocket from 'ws';
 import { makeCipher, relayProof, MAX_FRAME } from './protocol.mjs';
-import { transportOptions } from './transport-proxy.mjs?lan-v1';
+import { transportOptions } from './transport-proxy.mjs?lan-v2-wifi';
 
 export class PeerTunnel extends EventEmitter {
   constructor(pair, role, { reconnectMs = 1000, maxReconnectMs = 30000, handshakeTimeoutMs = 15000,

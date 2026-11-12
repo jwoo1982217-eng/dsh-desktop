@@ -826,6 +826,21 @@ var BasicCompactionEngine = class extends CompactionEngine {
 			}
 			return next();
 		});
+		// Price the proposed route before its header is committed. The previous
+		// model can still summarize the history that the smaller model cannot fit.
+		ctx.on("agent/request", async ({agent, signal}, next) => {
+			const config = await next();
+			const previous = routedTarget(agent.session);
+			if (signal.aborted || !previous || !config.provider || !config.model ||
+				(previous.provider === config.provider && previous.model === config.model)) return config;
+			try {
+				await this.compactIfNeeded(agent, "pressure", signal, {provider: config.provider, model: config.model});
+			} catch (cause) {
+				signal.throwIfAborted();
+				throw new LlmError(`切换到 ${config.provider}/${config.model} 前整理上下文失败；原请求模型与历史保留。${cause.message || cause}`, "MODEL_SWITCH_COMPACTION_FAILED", {cause});
+			}
+			return config;
+		}, {prepend: true});
 		ctx.on("agent/status", ({ agent, status }) => {
 			if (status === "idle") {this.overflowRetries.delete(agent);this.pressureFailures.delete(agent);}
 		});
@@ -887,9 +902,12 @@ var BasicCompactionEngine = class extends CompactionEngine {
 	* @param signal - live turn cancellation signal forwarded to summarization.
 	* @returns the latest summary compaction result, or `null` when no summary ran.
 	*/
-	async compactIfNeeded(agent, trigger, signal) {
-		const target = trigger === "pressure" ? this.assembledTargets.get(agent) ?? conversationTarget(agent, this.ctx) : routedTarget(agent.session);
+	async compactIfNeeded(agent, trigger, signal, proposedTarget) {
+		const target = proposedTarget ?? (trigger === "pressure" ? this.assembledTargets.get(agent) ?? conversationTarget(agent, this.ctx) : routedTarget(agent.session));
 		if (target === void 0) return null;
+		const previous = routedTarget(agent.session);
+		const summaryTarget = trigger === "pressure" && previous &&
+			(previous.provider !== target.provider || previous.model !== target.model) ? previous : target;
 		const policy = resolveTargetPolicy(this.config, target);
 		const meter = this.ctx.tokenMeter;
 		const header = pressureHeader(agent, target);
@@ -931,7 +949,7 @@ var BasicCompactionEngine = class extends CompactionEngine {
 				break;
 			}
 			try {
-				result = await this.compactRegion(range.start, range.end, agent, signal, target);
+				result = await this.compactRegion(range.start, range.end, agent, signal, summaryTarget);
 			} catch (error) {
 				if (error instanceof Error && measurement.totalTokens >= info.context.contextWindow - reservedCompletionTokens(agent, info.defaultMaxTokens, target)) error.compactionUnsafe = true;
 				throw error;

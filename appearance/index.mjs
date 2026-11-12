@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AppearanceStore } from './store.mjs';
 import { themes } from './catalog.mjs';
+import {FontLibrary, localFont} from './font-library.mjs';
 import {installOpenCodeCompatibility} from './compat/opencode.mjs';
 
 export const name = 'appearance-center';
@@ -14,21 +15,34 @@ const pages = new Map([
   ['/appearance-center/page.js', ['page.js', 'text/javascript']],
   ['/appearance-center/page.css', ['page.css', 'text/css']],
   ['/appearance-center/visuals.js', ['visuals.js', 'text/javascript']],
+  ['/appearance-center/font-controls.js', ['font-controls.js', 'text/javascript']],
+  ['/appearance-center/color-controls.js', ['color-controls.js', 'text/javascript']],
   ['/appearance-center/runtime.css', ['runtime.css', 'text/css']],
 ]);
 export async function apply(ctx) {
   const home=process.env.DSH_HOME || path.join(homedir(), '.dsh');
   const store = new AppearanceStore(home);
+  const fonts = new FontLibrary(home);
   await store.init();
   let compatibility={present:false},checking;
   const check=()=>checking|| (checking=installOpenCodeCompatibility(ctx.clientModules,home).then(result=>{compatibility=result;}).catch(error=>{compatibility={present:true,adapted:false,warning:error.message};}).finally(()=>{checking=null;}));
   await check();ctx.effect(()=>ctx.clientModules.onGraphChanged(check));
   ctx.connection.rpc.handle('/appearance-center', async (method, payload) => {
     try {
-      if (method !== 'manage' || !payload || !['status', 'select', 'configure', 'reset'].includes(payload.action)) throw Error('外观请求无效');
+      if (method !== 'manage' || !payload || !['status', 'select', 'configure', 'reset', 'font.status', 'font.browse', 'font.scan'].includes(payload.action)) throw Error('外观请求无效');
+      if (payload.action.startsWith('font.')) return {ok: true, value: await fonts[payload.action.slice(5)](payload.directory)};
+      for (const key of ['uiFont', 'codeFont']) if (localFont(payload.options?.[key])) await fonts.read(payload.options[key].slice(6));
       return { ok: true, value: {...(payload.action === 'status' ? store.status() : await store.change(payload)),compatibility} };
     } catch (error) { return { ok: false, error: { code: 'appearance/rejected', message: error.message, details: {} } }; }
   }, { authority: 'loopback' });
+  ctx.effect(() => ctx.webServer.register({kind: 'exact', path: '/appearance-center/font', async handler(req, res) {
+    if (req.method !== 'GET') { res.writeHead(405).end(); return; }
+    try {
+      const id = new URL(req.url, 'http://localhost').searchParams.get('id');
+      const body = await fonts.read(id);
+      res.writeHead(200, {'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff'}).end(body);
+    } catch { res.writeHead(404).end('字体暂不可用，请重新扫描'); }
+  }}));
   const assets = new Map(pages);
   for (const theme of themes.values()) {
     assets.set('/appearance-center/themes/' + theme.file + '.json', ['assets/themes/' + theme.file + '.json', 'application/json']);
@@ -40,7 +54,7 @@ export async function apply(ctx) {
       try {
         const body = await readFile(path.join(root, file));
         res.writeHead(200, { 'content-type': type + '; charset=utf-8', 'cache-control': 'no-store',
-          'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; object-src 'none'" });
+          'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; object-src 'none'" });
         res.end(body);
       } catch { res.writeHead(503).end('外观资源暂不可用'); }
     },

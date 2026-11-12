@@ -6,29 +6,58 @@ import {fileURLToPath, pathToFileURL} from 'node:url';
 import path from 'node:path';
 import {rebaseReleaseLinks} from './release-links.mjs';
 import {JETHUB_PACKAGE, JETHUB_LEGACY_PACKAGE} from '../../scripts/jethub-package.mjs';
+import {patchPocket} from '../../runtime/pocket-update/patch.mjs';
+import {buildDesktopEnhancements} from '../../scripts/build-desktop-enhancements.mjs';
+import {buildInstructionBudget} from '../../scripts/build-instruction-budget.mjs';
+import {wireDesktopEnhancementDependencies} from '../../scripts/install-desktop-enhancements.mjs';
 import {resolveOfmSource, verifyPackagedOfm, resolveJetHubSource, verifyPackagedJetHub} from '../plugin-sources.mjs';
+import {desktopCoreVersion, defaultRc1Runtime, preflightDesktopRc1, prepareDesktopRc1} from '../../scripts/prepare-desktop-rc1.mjs';
+import {assertFreshRc1PluginCompatibility} from './app/rc1-profile.mjs';
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(directory, '../..');
 const require = createRequire(path.join(directory, 'tools/package.json'));
-const {packager} = await import(pathToFileURL(require.resolve('@electron/packager')).href);
 const appInfo = JSON.parse(await readFile(path.join(directory, 'app/package.json'), 'utf8'));
 // Keep the macOS bundle version increasing with product releases. The first
 // delivered 0.1.0 used build 1; subsequent builds and versions compare above it.
 const bundleVersion = appInfo.version.split('.').map((part, index) => Number(part) + (index === 0 ? 1 : 0)).join('.');
 const args = process.argv.slice(2);
-let output = path.join(root, 'build-delivery/macos-20261015'), ourFree, reuseRuntime = false, reuseApp = false;
+let output = path.join(root, 'build-delivery/macos-20261015'), ourFree, reuseRuntime = false, reuseApp = false, coreRuntime = defaultRc1Runtime, preflight = false;
 while (args.length) {
   const arg = args.shift();
   if (arg === '--out' && args[0]) output = path.resolve(args.shift());
   else if (arg === '--our-free-model' && args[0]) ourFree = path.resolve(args.shift());
+  else if (arg === '--core-runtime' && args[0]) coreRuntime = path.resolve(args.shift());
+  else if (arg === '--preflight') preflight = true;
   else if (arg === '--reuse-runtime') reuseRuntime = true;
   else if (arg === '--reuse-app') { reuseRuntime = true; reuseApp = true; }
-  else throw Error('Usage: node desktop/macos/build.mjs [--out DIR] [--our-free-model SOURCE]');
+  else throw Error('Usage: node desktop/macos/build.mjs [--out DIR] [--our-free-model SOURCE] [--core-runtime OFFICIAL_RC1_RUNTIME] [--preflight]');
 }
 if (process.platform !== 'darwin' || process.arch !== 'arm64') throw Error('此安装包需在 Mac arm64 上构建。');
+// Fail before touching the output directory: the old desktop-runtime root is a
+// historical custom-program dependency baseline, never the release core.
+const corePlan = await preflightDesktopRc1(coreRuntime, {target:path.join(output,'work/runtime')});
 const ofmSource = await resolveOfmSource(root, ourFree);
 const jetHubSource = await resolveJetHubSource(root);
+const sources = {
+  'dsh-desktop-core-compatibility': 'runtime/core-compat/plugin',
+  [JETHUB_PACKAGE]: jetHubSource.directory, '@zseven-w/dsh-noema': 'vendor/dsh-noema',
+  'dsh-peer': 'peer', 'dsh-local-knowledge': 'knowledge', 'dsh-desktop-browser': 'desktop-browser', 'dsh-team': 'team',
+  'dsh-desktop-chatgpt': 'desktop-chatgpt', 'dsh-appearance-center': 'appearance',
+  'dsh-model-routing': 'model-routing', 'dsh-knowledge-workbench': 'knowledge-workbench',
+  'dsh-desktop-enhancements': 'desktop-enhancements', 'dsh-our-free-model': ofmSource.directory,
+};
+const plugins = [...Object.keys(sources), 'dsh-channel-qq', 'dsh-pocket'];
+await assertFreshRc1PluginCompatibility(coreRuntime,plugins,{sources:{
+  ...Object.fromEntries(Object.entries(sources).map(([name,directory])=>[name,path.resolve(root,directory)])),
+  'dsh-channel-qq':path.join(root,'desktop-runtime/node_modules/dsh-channel-qq'),
+  'dsh-pocket':path.join(root,'desktop-runtime/node_modules/dsh-pocket'),
+}});
+if (preflight) {
+  console.log(JSON.stringify({coreVersion:corePlan.version,lockSha256:corePlan.lockSha256,officialPackages:corePlan.packages.length,officialBins:corePlan.bins.length,customPlugins:plugins,optionalUnavailable:corePlan.optionalUnavailable,oldOverlaysApplied:false,readOnly:true}));
+  process.exit(0);
+}
+const {packager} = await import(pathToFileURL(require.resolve('@electron/packager')).href);
 const work = path.join(output, 'work');
 await mkdir(output, {recursive: true});
 if (!reuseRuntime) await rm(work, {recursive: true, force: true});
@@ -36,16 +65,11 @@ await mkdir(work, {recursive: true});
 const runtime = path.join(work, 'runtime'), modules = path.join(runtime, 'node_modules');
 console.log('1/6 收集锁定运行时与程序组件');
 if (!reuseRuntime) {
+await buildDesktopEnhancements();
+await buildInstructionBudget();
 await cp(path.join(root, 'desktop-runtime/node_modules'), modules, {recursive: true, verbatimSymlinks: true,
   filter: from => !['.cache', '.install-lock', '.DS_Store'].includes(path.basename(from))});
 
-const sources = {
-  [JETHUB_PACKAGE]: jetHubSource.directory, '@zseven-w/dsh-noema': 'vendor/dsh-noema',
-  'dsh-peer': 'peer', 'dsh-local-knowledge': 'knowledge', 'dsh-desktop-browser': 'desktop-browser', 'dsh-team': 'team',
-  'dsh-desktop-chatgpt': 'desktop-chatgpt', 'dsh-appearance-center': 'appearance',
-  'dsh-model-routing': 'model-routing', 'dsh-knowledge-workbench': 'knowledge-workbench',
-};
-sources['dsh-our-free-model'] = ofmSource.directory;
 const rejected = new Set(['node_modules', '.git', 'build-delivery', '.env', '.DS_Store', 'credentials', 'sessions']);
 for (const [name, relative] of Object.entries(sources)) {
   const source = path.resolve(root, relative), target = path.join(modules, name);
@@ -55,6 +79,7 @@ for (const [name, relative] of Object.entries(sources)) {
     filter: from => !rejected.has(path.basename(from)) && !/\.(?:log|bak|jks|keystore|p12|apk|aab)$/.test(from)});
 }
 // 旧路径只作兼容别名，不能注册第二份 provider/accountPool。
+wireDesktopEnhancementDependencies(path.join(modules, 'dsh-desktop-enhancements'), modules);
 await rm(path.join(modules, JETHUB_LEGACY_PACKAGE), {recursive: true, force: true});
 await symlink(JETHUB_PACKAGE, path.join(modules, JETHUB_LEGACY_PACKAGE));
 for (const file of ['chatgpt.js', 'chatgpt-page.html', 'chatgpt-account.js', 'chatgpt-protocol.js', 'chatgpt-adapter.js'])
@@ -62,13 +87,11 @@ for (const file of ['chatgpt.js', 'chatgpt-page.html', 'chatgpt-account.js', 'ch
 // The desktop version imports the shared skill receiver under this name.
 await cp(path.join(root, 'phone-qq/skill-import.js'), path.join(modules, 'dsh-peer/skill-import.js'));
 
-// Runtime overlays replace their actual pnpm targets, not the symlink itself.
-for (const name of await readdir(path.join(root, 'runtime/overlays/@deepseek-ai'))) {
-  const target = await realpath(path.join(modules, '@deepseek-ai', name));
-  if (!target.startsWith(modules + path.sep)) throw Error(`运行时链接越界：${name}`);
-  await cp(path.join(root, 'runtime/overlays/@deepseek-ai', name), target, {recursive: true});
-}
+// Replace the historical SDK closure using only the official rc.1 lock, then
+// apply audited target-block compatibility. Never copy alpha.4 overlays here.
+await prepareDesktopRc1({source:coreRuntime,target:runtime});
 // Every release link must stay inside the release, so moving the .app is safe.
+await patchPocket(await realpath(path.join(modules, 'dsh-pocket')));
 let links = 0, files = 0;
 async function verifyTree(directory) {
   for (const entry of await readdir(directory, {withFileTypes: true})) {
@@ -85,20 +108,22 @@ async function verifyTree(directory) {
   }
 }
 await verifyTree(runtime);
-const plugins = [...Object.keys(sources), 'dsh-channel-qq', 'dsh-pocket'];
 const bundles = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', '@deepseek-ai/dsh-experimental-agent-team-profile',
   '@deepseek-ai/dsh-experimental-auto-review', '@deepseek-ai/dsh-experimental-inspector-profile', ...plugins];
 const profile = {name: 'dsh-profile-web', private: true, dependencies: {}, dsh: {profile: {bundles}}};
-await writeFile(path.join(runtime, 'bundle.json'), JSON.stringify({version: appInfo.version, coreVersion: '0.2.1-alpha.4', plugins, profile}, null, 2));
+await writeFile(path.join(runtime, 'bundle.json'), JSON.stringify({version: appInfo.version, coreVersion: desktopCoreVersion, plugins, profile}, null, 2));
 await mkdir(path.join(work, 'bin'));
 execFileSync('/usr/bin/lipo', [process.execPath, '-thin', 'arm64', '-output', path.join(work, 'bin/node')]);
 await chmod(path.join(work, 'bin/node'), 0o755);
 const nodeLicense = await fetch('https://raw.githubusercontent.com/nodejs/node/v24.14.0/LICENSE');
 if (!nodeLicense.ok) throw Error('无法取得 Node.js 发行声明');
 await writeFile(path.join(work, 'bin/NODE-LICENSE.txt'), await nodeLicense.text());
-await writeFile(path.join(runtime, 'THIRD-PARTY-NOTICES.txt'), `DSH desktop ${appInfo.version}\nDSH core: @deepseek-ai/dsh 0.2.1-alpha.4\nElectron: 44.7.2 (MIT), Chromium notices are in the application Resources.\nNode.js: ${process.versions.node}; see ../bin/NODE-LICENSE.txt\nDependency license files are retained alongside each package.\nThis package contains program files only. No account, cookie, API key, chat or skill data is included.\n`);
+await writeFile(path.join(runtime, 'THIRD-PARTY-NOTICES.txt'), `DSH desktop ${appInfo.version}\nDSH core: @deepseek-ai/dsh ${desktopCoreVersion}\nElectron: 44.7.2 (MIT), Chromium notices are in the application Resources.\nNode.js: ${process.versions.node}; see ../bin/NODE-LICENSE.txt\nDependency license files are retained alongside each package.\nThis package contains program files only. No account, cookie, API key, chat or skill data is included.\n`);
 await writeFile(path.join(work, 'runtime-receipt.json'), JSON.stringify({files, links}));
 }
+const builtCore = JSON.parse(await readFile(path.join(modules,'@deepseek-ai/dsh/package.json'),'utf8'));
+const builtBundle = JSON.parse(await readFile(path.join(runtime,'bundle.json'),'utf8'));
+if (builtCore.version !== desktopCoreVersion || builtBundle.coreVersion !== desktopCoreVersion) throw Error('拒绝复用旧核心运行时：请重新准备锁定的 rc.1');
 await verifyPackagedOfm(modules, ofmSource);
 await verifyPackagedJetHub(modules, jetHubSource);
 // OpenCode CLI 与 Node 同目录交付，依赖内容由固定哈希核验。
@@ -166,7 +191,7 @@ await writeFile(distribution, `<?xml version="1.0" encoding="utf-8"?>
 const installer = path.join(output, `DSH-${appInfo.version}-macOS-arm64.pkg`);
 execFileSync('/usr/bin/productbuild', ['--distribution', distribution, '--resources', installerResources, '--package-path', work, installer], {stdio: 'inherit'});
 const sha256 = createHash('sha256').update(await readFile(installer)).digest('hex');
-const receipt = {version: appInfo.version, coreVersion: '0.2.1-alpha.4', electronVersion: '44.7.2', nodeVersion: process.versions.node,
+const receipt = {version: appInfo.version, coreVersion: desktopCoreVersion, electronVersion: '44.7.2', nodeVersion: process.versions.node,
   platform: 'darwin-arm64', appPath, installer, sha256, runtimeFiles, internalLinks: runtimeLinks, signed: 'ad-hoc', notarized: false,
   profileDataBundled: false};
 await writeFile(path.join(output, 'build-receipt.json'), JSON.stringify(receipt, null, 2));

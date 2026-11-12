@@ -1,0 +1,273 @@
+{
+  "registry": "https://registry.npmjs.org",
+  "officialRepository": "https://github.com/mscdex/ssh2",
+  "installScriptsExecuted": false,
+  "optionalNativeModulesIncluded": false,
+  "dependencies": [
+    {
+      "name": "ssh2",
+      "version": "1.17.0",
+      "tarball": "https://registry.npmjs.org/ssh2/-/ssh2-1.17.0.tgz",
+      "integrity": "sha512-wPldCk3asibAjQ/kziWQQt1Wh3PgDFpC0XpwclzKcdT1vql6KeYxf5LIt4nlFkUeR8WuphYMKqUA56X4rjbfgQ==",
+      "tarballIntegrityVerified": true,
+      "license": [
+        {
+          "type": "MIT",
+          "url": "http://github.com/mscdex/ssh2/raw/master/LICENSE"
+        }
+      ],
+      "files": 22,
+      "vendoredFiles": [
+        {
+          "path": "LICENSE",
+          "bytes": 1067,
+          "sha256": "d06b5d27bbbbe22c36b1fd88406b1208876e2d37d795f5b8eaed951a459a3111"
+        },
+        {
+          "path": "lib/Channel.js",
+          "bytes": 7132,
+          "sha256": "53e92988a025009b192b72be110bd240b5653f88dbdec93e515e3e401e7f94aa"
+        },
+        {
+          "path": "lib/agent.js",
+          "bytes": 32130,
+          "sha256": "cc6987488bf45f73e0ac5d8bbe59912b70a144cd73b53c83919f188f4cc3f2be"
+        },
+        {
+          "path": "lib/client.js",
+          "bytes": 64168,
+          "sha256": "edd3484daa9d942bc5a6412edc9cf11f85df40b2db10b07877bbfe694beac7f4"
+        },
+        {
+          "path": "lib/http-agents.js",
+          "bytes": 2323,
+          "sha256": "477d34701116572f2af06ac545994f3e2d2f14b26c5ae76bff2b13de2289339d"
+        },
+        {
+          "path": "lib/index.js",
+          "bytes": 767,
+          "sha256": "27e942aba52a13d7b72a846a4b3fd98d69b65431725b651e7523b74499a2ed26"
+        },
+        {
+          "path": "lib/keygen.js",
+          "bytes": 18252,
+          "sha256": "03d0be43e78ca4f82d4c96d084a39c0242f9c56f343da17a819f8bd0d873f06c"
+        },
+        {
+          "path": "lib/protocol/Protocol.js",
+          "bytes": 65576,
+          "sha256": "c1104b49087de7a91cd3ffaac8807c05eebf49f61effd084d0b0caf29fde6af4"
+        },
+        {
+          "path": "lib/protocol/SFTP.js",
+          "bytes": 114059,
+          "sha256": "615871028340d9be98eb564ab6bdd021fe8ae44a4a25df928038e14e3bc5c201"
+        },
+        {
+          "path": "lib/protocol/constants.js",
+          "bytes": 11808,
+          "sha256": "a3894fdd8e294109b55f06fbda69e467741f15a250801b744b6b0487bbf32529"
+        },
+        {
+          "path": "lib/protocol/crypto/poly1305.js",
+          "bytes": 22812,
+          "sha256": "55a579ed6a30022054fd1dd822b1b49e2fc51bfbdfa933bfe441de8b7e4dce40"
+        },
+        {
+          "path": "lib/protocol/crypto.js",
+          "bytes": 47530,
+          "sha256": "a729d2064e787e2a4589c25a284444fe54a58b7434a4e6e5e8e9c73c6d91e28e"
+        },
+        {
+          "path": "lib/protocol/handlers.js",
+          "bytes": 423,
+          "sha256": "b15f990134a4f69b7492d0b875d80d8c28228907045619b01ec30871ac711df9"
+        },
+        {
+          "path": "lib/protocol/handlers.misc.js",
+          "bytes": 39158,
+          "sha256": "8927c504c3c338187f36f0304a3452d6396ec9fc907af3db2be46a5f175c36a1"
+        },
+        {
+          "path": "lib/protocol/kex.js",
+          "bytes": 60351,
+          "sha256": "054ba4b81801596350f0e2e939746d2966297cffd4303b342c25b2fd5d295755"
+        },
+        {
+          "path": "lib/protocol/keyParser.js",
+          "bytes": 47776,
+          "sha256": "ba4f40a5a9edef15ff49a38226e2be2e66f75aa2673840dd18b807bb7943eca9"
+        },
+        {
+          "path": "lib/protocol/node-fs-compat.js",
+          "bytes": 3647,
+          "sha256": "d46a25cc158456c4a82b686ceed9a8267dc7d1bb69b6fd1d1f9b09d467951b4d"
+        },
+        {
+          "path": "lib/protocol/utils.js",
+          "bytes": 10257,
+          "sha256": "402b39e75ede9e3dc99af5e8af008602546f35aa1472bd4232c06f606987f053"
+        },
+        {
+          "path": "lib/protocol/zlib.js",
+          "bytes": 6122,
+          "sha256": "8cd9f4c1825cbc394ddf9cf076a5ba9195ec255db9e904182ae9c25a1036e2d6"
+        },
+        {
+          "path": "lib/server.js",
+          "bytes": 41705,
+          "sha256": "128b58ee54cf97a5ae17e18836ff4472de4a5e4e591f2862a5c9ec7f148befe5"
+        },
+        {
+          "path": "lib/utils.js",
+          "bytes": 9773,
+          "sha256": "bbae8286bc64b049499ce353e8dc4eefbbedefca8f50591432c1057276097aee"
+        },
+        {
+          "path": "package.json",
+          "bytes": 1101,
+          "sha256": "e6fd4e4c3e69e4ad185c87cb5ee1df631e3f4cbd43cf89470f83c1e5d1a76dfb"
+        }
+      ],
+      "vendoredBytesMatchedOfficialTarball": true
+    },
+    {
+      "name": "asn1",
+      "version": "0.2.6",
+      "tarball": "https://registry.npmjs.org/asn1/-/asn1-0.2.6.tgz",
+      "integrity": "sha512-ix/FxPn0MDjeyJ7i/yoHGFt/EX6LyNbxSEhPPXODPL+KB0VPk86UYfL0lMdy+KCnv+fmvIzySwaK5COwqVbWTQ==",
+      "tarballIntegrityVerified": true,
+      "license": "MIT",
+      "files": 8,
+      "vendoredFiles": [
+        {
+          "path": "LICENSE",
+          "bytes": 1076,
+          "sha256": "f4b6bd1a9437d0f66ff46d8f4dca185c31a069ba11e437f3b8506ec4424be9cf"
+        },
+        {
+          "path": "lib/ber/errors.js",
+          "bytes": 240,
+          "sha256": "9408a1b48a19eb728cf9ed781b90bc03ddd111d88156d5b5913ce9b837487164"
+        },
+        {
+          "path": "lib/ber/index.js",
+          "bytes": 469,
+          "sha256": "8da323efc9ac8f5bb3b5fb4f067ca272796b31610c015f36762933551f04594b"
+        },
+        {
+          "path": "lib/ber/reader.js",
+          "bytes": 5650,
+          "sha256": "5d0d7ec2de73921f0bff71872610488b30936b8cc4c98997966224c463046bbc"
+        },
+        {
+          "path": "lib/ber/types.js",
+          "bytes": 638,
+          "sha256": "87c9fbe37ac7a2c83726a952881efd6829dc3a9dc7a1e9e485a9201cd7714c13"
+        },
+        {
+          "path": "lib/ber/writer.js",
+          "bytes": 7666,
+          "sha256": "839731c9473b8c4faf09db9411a6d149bc365a6bde239c80e5993ed63a134878"
+        },
+        {
+          "path": "lib/index.js",
+          "bytes": 320,
+          "sha256": "4db109c1c247a751645717e696e04eab975eef06bdf4713a16e81efc63575d87"
+        },
+        {
+          "path": "package.json",
+          "bytes": 782,
+          "sha256": "9931ef8d2e8857b7be3cc1fb13af4c943165046fe66337a8d7fec50fee8a5764"
+        }
+      ],
+      "vendoredBytesMatchedOfficialTarball": true
+    },
+    {
+      "name": "bcrypt-pbkdf",
+      "version": "1.0.2",
+      "tarball": "https://registry.npmjs.org/bcrypt-pbkdf/-/bcrypt-pbkdf-1.0.2.tgz",
+      "integrity": "sha512-qeFIXtP4MSoi6NLqO12WfqARWWuCKi2Rn/9hJLEmtB5yTNr9DqFWkJRCf2qShWzPeAMRnOgCrq0sg/KLv5ES9w==",
+      "tarballIntegrityVerified": true,
+      "license": "BSD-3-Clause",
+      "files": 3,
+      "vendoredFiles": [
+        {
+          "path": "LICENSE",
+          "bytes": 3195,
+          "sha256": "b5f71fac3ae50115c65ee70551bdbaeed89b4f7a76ac36dc8c576e3036bcd604"
+        },
+        {
+          "path": "index.js",
+          "bytes": 23230,
+          "sha256": "e1589c001f45f4cd8bf569b92a585b48f73e8b85b97302a6e56dfcddb38ce17d"
+        },
+        {
+          "path": "package.json",
+          "bytes": 353,
+          "sha256": "06fc161a503054580e1e975c384436da3901ee5c6cbd9a29454947c669fe8890"
+        }
+      ],
+      "vendoredBytesMatchedOfficialTarball": true
+    },
+    {
+      "name": "safer-buffer",
+      "version": "2.1.2",
+      "tarball": "https://registry.npmjs.org/safer-buffer/-/safer-buffer-2.1.2.tgz",
+      "integrity": "sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==",
+      "tarballIntegrityVerified": true,
+      "license": "MIT",
+      "files": 4,
+      "vendoredFiles": [
+        {
+          "path": "LICENSE",
+          "bytes": 1094,
+          "sha256": "4bc935e71be198c67ddf3c2b5fddb195f6edc182bfc155a96a6db61b44b494b9"
+        },
+        {
+          "path": "dangerous.js",
+          "bytes": 1483,
+          "sha256": "1dc2900bcc8ffc375af0d2fc99a03ecad2dcbb85d278fbf26982e87707bea53f"
+        },
+        {
+          "path": "package.json",
+          "bytes": 822,
+          "sha256": "4247a3a63c45a6a7ced1557fe4dd9d2a163af4915d594b95e5867b69a53edb52"
+        },
+        {
+          "path": "safer.js",
+          "bytes": 2110,
+          "sha256": "37f9716144105051ab302f6a0c30a52ff5de7269b9e1173ac22be798fc11ccad"
+        }
+      ],
+      "vendoredBytesMatchedOfficialTarball": true
+    },
+    {
+      "name": "tweetnacl",
+      "version": "0.14.5",
+      "tarball": "https://registry.npmjs.org/tweetnacl/-/tweetnacl-0.14.5.tgz",
+      "integrity": "sha512-KXXFFdAbFXY4geFIwoyNK+f5Z1b7swfXABfL7HXCmoIWMKU3dmS26672A4EeQtDzLKy7SXmfBu51JolvEKwtGA==",
+      "tarballIntegrityVerified": true,
+      "license": "Unlicense",
+      "files": 3,
+      "vendoredFiles": [
+        {
+          "path": "LICENSE",
+          "bytes": 1210,
+          "sha256": "88d9b4eb60579c191ec391ca04c16130572d7eedc4a86daa58bf28c6e14c9bcd"
+        },
+        {
+          "path": "nacl-fast.js",
+          "bytes": 62257,
+          "sha256": "432333a18cef679d16c71328fcc18cc547e58d7d1c2b880a581b2d7ee4248027"
+        },
+        {
+          "path": "package.json",
+          "bytes": 1822,
+          "sha256": "4d4e7122e483ab7bed48c884bb0de1471d3cb3753e1a334e3aafa3c32c22923e"
+        }
+      ],
+      "vendoredBytesMatchedOfficialTarball": true
+    }
+  ]
+}

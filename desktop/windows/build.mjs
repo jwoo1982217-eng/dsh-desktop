@@ -26,7 +26,8 @@ if (!options.reuse) {
   await chmod(sevenzip, 0o755);
   execFileSync('python3', [path.join(directory, 'stage.py'), '--runtime', options.runtime, '--out', stage, '--cache', path.join(options.out, 'cache'), '--sevenzip', sevenzip], {stdio: 'inherit'});
 }
-const appInfo = JSON.parse(await readFile(path.join(directory, '../macos/app/package.json'), 'utf8'));
+const release = JSON.parse(await readFile(path.join(directory, 'package.json'), 'utf8'));
+const appInfo = {...JSON.parse(await readFile(path.join(directory, '../macos/app/package.json'), 'utf8')), version: release.version};
 const bundle = JSON.parse(await readFile(path.join(stage, 'resources/runtime/bundle.json'), 'utf8'));
 if (bundle.version !== appInfo.version) throw Error('Runtime and app versions differ');
 const app = path.join(options.out, 'app-source');

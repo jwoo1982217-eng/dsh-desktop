@@ -1,4 +1,4 @@
-DSH 桌面版 0.1.6 · Windows x64
+DSH 桌面版 0.1.8 · Windows x64 · 2026-10-27
 
 适用系统：64 位 Windows 10 / Windows 11。
 双击安装包，安装后打开桌面或开始菜单中的 DSH。
@@ -9,6 +9,9 @@ DSH 桌面版 0.1.6 · Windows x64
 本安装包不包含任何人的账号、API 密钥、聊天或记忆。
 新对话记忆范围与跨 Agent 来源可分别选择，包含 ZCode。
 浏览器面板调用系统 Chrome 或 Edge；模型调用和在线登录需要联网。
+本版同步桌面最新手机长期连接与重连、浏览器上传附件和文件保存、模型选择器、Pocket 更新，以及 JetHub 和 Our Free Model 2.5.7。
+Windows 命令使用系统 PowerShell，无需另外安装 Git Bash。
+程序内部命令可直接使用捆绑的 dsh、node、npm 和 OpenCode。
 
 升级或卸载前，请先关闭 DSH 窗口；关闭窗口会结束本应用启动的后台服务。
 账号、聊天、记忆等数据默认保存在 %USERPROFILE%\.dsh；卸载保留这些数据。
@@ -20,4 +23,4 @@ DSH 桌面版 0.1.6 · Windows x64
 2. 若提示 3080 端口被占用，请关闭旧版 DSH 后重试。
 3. 日志位于 %APPDATA%\DSH\logs\desktop.log。
 
-此版本为未签名测试安装包，尚未完成 Windows 真机安装与启动验收。
+此版本为未签名安装包，尚未完成 Windows 真机安装与启动验收。

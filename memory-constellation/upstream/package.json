@@ -1,0 +1,73 @@
+{
+  "name": "dsh-meow-constellation",
+  "version": "0.1.0",
+  "description": "记忆星图：把 meow-memory 的七层 SQLite 记忆实时画成可拖拽、可点击、分层旋转的 3D 星图面板，点开任意光点看全文与元数据。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "lib/constellation.html",
+    "cordis.patch.yml",
+    "test/serve.mjs",
+    "test/smoke.mjs",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "听澜 / DeepSeek Harness user",
+    "url": "https://github.com/deepseek-ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yuyun-git/dsh-meow-constellation.git"
+  },
+  "homepage": "https://github.com/yuyun-git/dsh-meow-constellation#readme",
+  "bugs": {
+    "url": "https://github.com/yuyun-git/dsh-meow-constellation/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "meow-memory",
+    "memory",
+    "记忆星图",
+    "visualization",
+    "3d",
+    "constellation",
+    "canvas",
+    "sqlite"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "check": "node --check lib/index.js && node --check lib/client.js",
+    "smoke": "node test/smoke.mjs",
+    "serve": "node test/serve.mjs"
+  },
+  "dependencies": {}
+}

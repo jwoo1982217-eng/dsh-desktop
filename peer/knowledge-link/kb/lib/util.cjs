@@ -39,8 +39,8 @@ function lock(dir) {
 }
 function parseArgs(args) {
   const opts = {}, words = [];
-  const flags = new Set(['json','lexical','offline','refresh','download','force']);
-  const values = new Set(['config','workspace','sessions-root','data-dir','cat','sub','kind','top','legacy','legacy-sessions','shard-size']);
+  const flags = new Set(['json','lexical','offline','refresh','download','force','apply']);
+  const values = new Set(['config','workspace','sessions-root','data-dir','cat','sub','kind','top','legacy','legacy-sessions','shard-size','source-root']);
   for (let i=0;i<args.length;i++) {
     const a=args[i];
     if (!a.startsWith('--')) { words.push(a); continue; }

@@ -1,7 +1,9 @@
 /** Transport-independent controller. The DSH adapter must authenticate every call. */
+import { BrowserFiles, FILE_LIMITS } from './browser-files.mjs';
 export class BrowserPanelService {
   constructor(browser) {
     this.browser = browser;
+    this.files = new BrowserFiles();
     this.panels = new Map();
     this.frames = new Map();
     this.revision = 0;
@@ -12,7 +14,17 @@ export class BrowserPanelService {
       }
       if (tab) this.frames.set(frame.id, { revision: ++this.revision, data: frame.data, width: tab.width, height: tab.height });
     };
-    this.onClosed = () => { this.frames.clear(); this.panels.clear(); };
+    this.onClosed = () => { this.frames.clear(); this.panels.clear(); void this.files.clear().catch(() => {}); };
+    this.onTabClosed = id => {
+      this.frames.delete(id);
+      for (const panel of this.panels.values()) if (panel.tabs.delete(id) && panel.active === id) {
+        panel.active = undefined;
+        const next = [...panel.tabs].at(-1);
+        if (next) panel.queue = panel.queue.then(async () => { if (panel.tabs.has(next) && this.browser.tabs.has(next)) await this.activate(panel, next); }).catch(() => {});
+      }
+      void this.files.release(id).catch(() => {});
+    };
+    this.onDocumentChanged = ({ id, documentId }) => { void this.files.release(id, documentId, true).catch(() => {}); };
     this.onPopup = ({ openerId, tab }) => {
       for (const panel of this.panels.values()) if (panel.tabs.has(openerId)) {
         panel.tabs.add(tab.id);
@@ -22,6 +34,8 @@ export class BrowserPanelService {
     };
     browser.on('frame', this.onFrame);
     browser.on('closed', this.onClosed);
+    browser.on('tabClosed', this.onTabClosed);
+    browser.on('documentChanged', this.onDocumentChanged);
     browser.on('popup', this.onPopup);
   }
   panel(key) {
@@ -36,7 +50,7 @@ export class BrowserPanelService {
   status(panel) {
     const tabs = this.browser.list().filter(tab => panel.tabs.has(tab.id));
     if (!tabs.some(tab => tab.id === panel.active)) panel.active = tabs.at(-1)?.id;
-    return { tabs, active: panel.active ?? null,
+    return { tabs, active: panel.active ?? null, fileChooser: panel.active ? this.browser.fileChooser?.(panel.active) ?? null : null, fileLimits: FILE_LIMITS,
       loginProfile: 'DSH 专用浏览器资料：右侧面板、登录窗口与 AI 标签共享网站登录；普通 Chrome/Edge 资料不共享。',
       loginHelp: '安全验证加载失败时，可在右侧“浏览网站”点击“登录窗口”，由用户完成验证后刷新原网页。关闭单个标签页不会主动清除登录 Cookie。' };
   }
@@ -79,6 +93,7 @@ export class BrowserPanelService {
           break;
         }
         case 'close':
+          await this.files.release(id);
           await this.browser.closeTab(id); panel.tabs.delete(id); this.frames.delete(id);
           if (id === panel.active) {
             panel.active = undefined;
@@ -94,10 +109,16 @@ export class BrowserPanelService {
         case 'pointer': await this.browser.pointer(id, payload); break;
         case 'text': await this.browser.text(id, payload.text); break;
         case 'key': await this.browser.key(id, payload); break;
+        case 'file.begin': return this.files.begin(key, id, await this.browser.fileContext(id, payload), payload.files);
+        case 'file.chunk': return this.files.append(key, id, payload);
+        case 'file.commit': return this.files.commit(key, id, payload.uploadId, (context, files) => this.browser.deliverFiles(id, context, files));
+        case 'file.cancel': return this.files.cancel(key, id, payload.uploadId);
+        case 'file.cancelChooser': await this.browser.cancelFileChooser(id, payload.requestId); break;
         case 'pause': await this.browser.stopFrames(id); break;
         case 'resume': await this.browser.startFrames(id); break;
         case 'release':
           for (const owned of panel.tabs) {
+            await this.files.release(owned);
             if (this.browser.tabs.has(owned)) await this.browser.closeTab(owned);
             this.frames.delete(owned);
           }
@@ -117,8 +138,11 @@ export class BrowserPanelService {
   async close() {
     this.browser.off('frame', this.onFrame);
     this.browser.off('closed', this.onClosed);
+    this.browser.off('tabClosed', this.onTabClosed);
+    this.browser.off('documentChanged', this.onDocumentChanged);
     this.browser.off('popup', this.onPopup);
     this.frames.clear(); this.panels.clear();
+    await this.files.close();
     await this.browser.close();
   }
 }

@@ -1,0 +1,24 @@
+import { tmpdir as __publicTmpdir } from 'node:os';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {prepareProgramLinks,programLinkHash} from './app/program-links.mjs';
+
+const generated=process.env.DSH_PROGRAM_LINK_TEST_DIR??(process.platform==='darwin'?(__publicTmpdir() + '/dsh-go-capability-absorption-20261031/generated/program-review'):path.join(os.tmpdir(),'dsh-program-review'));
+const mapping=[['node_modules/dsh-peer/node_modules/@deepseek-ai/dsh-http-proxy','@deepseek-ai/dsh-http-proxy'],['node_modules/dsh-phone-features/node_modules/@deepseek-ai/dsh-session','@deepseek-ai/dsh-session'],['node_modules/dsh-phone-features/node_modules/@deepseek-ai/dsh','@deepseek-ai/dsh']];
+async function fixture(t){await fs.mkdir(generated,{recursive:true});const directory=await fs.mkdtemp(path.join(generated,'links-'));t.after(()=>fs.rm(directory,{recursive:true,force:true}));const profile=path.join(directory,'含 空格 profile'),runtime=path.join(directory,'runtime'),old=path.join(directory,'old-sdk');await fs.mkdir(profile,{recursive:true});await fs.mkdir(old);for(const[,module]of mapping){const target=path.join(runtime,'node_modules',module);await fs.mkdir(target,{recursive:true});await fs.writeFile(path.join(target,'package.json'),JSON.stringify({name:module,version:'test'}));}const peer=path.join(profile,mapping[0][0]),oldRaw=path.join(old,'http-proxy');await fs.mkdir(path.dirname(peer),{recursive:true});await fs.symlink(oldRaw,peer);await fs.writeFile(path.join(profile,'unrelated-user-file'),'preserved');const rows=mapping.map(([path,module],i)=>({path,module,before:[i?'missing':programLinkHash(oldRaw)]}));return {directory,profile,runtime,oldRaw,peer,rows,backup:path.join(directory,'private-backup','links.json')};}
+
+test('three validated links use one runtime, second start is idempotent and private rollback restores exact raw link/missing entries',async t=>{
+ const f=await fixture(t),tx=await prepareProgramLinks(f.profile,f.runtime,f.rows);assert.equal(tx.plans.length,3);assert.equal(await fs.readlink(f.peer),f.oldRaw);assert.equal((await tx.apply({rollbackFile:f.backup})).changed,3);assert.equal((await fs.stat(f.backup)).mode&0o777,0o600);for(const [rel,module]of mapping)assert.equal(await fs.realpath(path.join(f.profile,rel)),await fs.realpath(path.join(f.runtime,'node_modules',module)));
+ const again=await prepareProgramLinks(f.profile,f.runtime,f.rows);assert.equal(again.plans.length,0);assert.equal((await again.apply()).current,true);assert.equal((await tx.rollback()).restored,3);assert.equal(await fs.readlink(f.peer),f.oldRaw);for(const[rel]of mapping.slice(1))await assert.rejects(fs.lstat(path.join(f.profile,rel)),{code:'ENOENT'});assert.equal(await fs.readFile(path.join(f.profile,'unrelated-user-file'),'utf8'),'preserved');
+});
+test('unknown links/ordinary SDK directories and runtime escapes fail before any publish',async t=>{
+ const f=await fixture(t);await fs.unlink(f.peer);await fs.symlink('user-custom-link',f.peer);await assert.rejects(prepareProgramLinks(f.profile,f.runtime,f.rows),{code:'PROGRAM_LINK_UNKNOWN_INPUT'});assert.equal(await fs.readlink(f.peer),'user-custom-link');await fs.unlink(f.peer);await fs.mkdir(f.peer);await assert.rejects(prepareProgramLinks(f.profile,f.runtime,f.rows),{code:'PROGRAM_LINK_CUSTOM_ENTRY'});await fs.rmdir(f.peer);await fs.symlink(f.oldRaw,f.peer);
+ const sdk=path.join(f.runtime,'node_modules',mapping[2][1]),outside=path.join(f.directory,'outside');await fs.mkdir(outside);await fs.writeFile(path.join(outside,'package.json'),JSON.stringify({name:mapping[2][1]}));await fs.rm(sdk,{recursive:true});await fs.symlink(outside,sdk);await assert.rejects(prepareProgramLinks(f.profile,f.runtime,f.rows),{code:'PROGRAM_LINK_SDK_OUTSIDE_RUNTIME'});assert.equal(await fs.readlink(f.peer),f.oldRaw);
+});
+test('publish failure rolls back exact links; rollback refuses a concurrent user replacement and keeps recovery bytes',async t=>{
+ const f=await fixture(t);let tx=await prepareProgramLinks(f.profile,f.runtime,f.rows);await assert.rejects(tx.apply({rollbackFile:f.backup,checkpoint:phase=>{if(phase==='link-published-2')throw Error('injected publish failure');}}),/injected/);assert.equal(await fs.readlink(f.peer),f.oldRaw);
+ tx=await prepareProgramLinks(f.profile,f.runtime,f.rows);await tx.apply({rollbackFile:f.backup+'.retry'});await fs.unlink(f.peer);await fs.symlink('user-concurrent-link',f.peer);await assert.rejects(tx.rollback(),{code:'PROGRAM_LINK_ROLLBACK_CONCURRENT'});assert.equal(await fs.readlink(f.peer),'user-concurrent-link');assert.equal(await fs.realpath(path.join(f.profile,mapping[1][0])),await fs.realpath(path.join(f.runtime,'node_modules',mapping[1][1])));assert.equal(JSON.parse(await fs.readFile(f.backup+'.retry','utf8')).links.length,3);
+});

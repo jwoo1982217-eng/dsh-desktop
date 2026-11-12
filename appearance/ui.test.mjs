@@ -96,9 +96,28 @@ try{
   await currentFrame.getByRole('searchbox').fill('local:mint');await currentFrame.locator('[data-theme="local:mint"]').click();await currentFrame.locator('[data-theme="local:mint"][aria-pressed=true]').waitFor();await currentFrame.getByRole('searchbox').fill('');
   await currentFrame.locator('#notice').filter({hasText:'外观已应用并保存'}).waitFor();
   await page.evaluate(()=>window.__opencodePalette.setTheme('dracula'));assert.equal(await page.locator('style[data-plugin="dsh-opencode-palette"]').count(),0);
+  // Load a real local font through the host ThemeRuntime, not only the settings preview.
+  await manage('manage',{action:'font.scan',directory:'/System/Library/Fonts'});
+  await currentFrame.locator('#browse-font-folder').click();
+  await currentFrame.locator('#font-search').fill('SFNSMono.ttf');
+  await currentFrame.getByRole('button',{name:'SFNSMono.ttf',exact:true}).click();
+  await currentFrame.locator('#use-local-font:not([disabled])').waitFor();
+  await currentFrame.locator('#use-local-font').click();
+  await currentFrame.locator('#notice').filter({hasText:'外观已应用并保存'}).waitFor();
+  const selectedLocal=await currentFrame.locator('select[name=uiFont]').inputValue();assert.match(selectedLocal,/^local:/);
+  await page.waitForFunction(id=>[...document.fonts].some(f=>f.family==='dshLocal_'+id&&f.status==='loaded'),selectedLocal.slice(6));
+  assert((await page.evaluate(()=>window.fixture.theme.getTheme().active.tokens['--dsw-font-family'])).includes('dshLocal_'));
+  assert.equal(await page.locator('#draft').inputValue(),'保留未发送的草稿');
+  await page.reload();await page.waitForFunction(()=>window.ready);
+  await page.waitForFunction(id=>[...document.fonts].some(f=>f.family==='dshLocal_'+id&&f.status==='loaded'),selectedLocal.slice(6));
+  assert.equal(await currentFrame.locator('select[name=uiFont]').inputValue(),selectedLocal);
+  await currentFrame.locator('select[name=uiFont]').selectOption('');
+  await currentFrame.getByRole('button',{name:'保存调整',exact:true}).click();
+  await currentFrame.locator('#notice').filter({hasText:'外观已应用并保存'}).waitFor();
+  assert.equal(await page.evaluate(()=>[...document.fonts].some(f=>f.family.startsWith('dshLocal_'))),false);
   await page.screenshot({path:path.join(report,'appearance-'+viewport.width+'.png'),fullPage:true});
   await page.evaluate(()=>window.fixture.dispose());assert.deepEqual(await page.evaluate(()=>({...window.fixture.theme.getTheme().fontSizes})),{text:14,code:11,terminal:13});assert.equal(await page.locator('style[data-plugin="dsh-opencode-palette"]').count(),1);assert.equal(await page.evaluate(()=>window.__opencodePalette.getState().theme),'dracula');assert.equal(await page.evaluate(()=>window.fixture.slots.entries('settings.section').filter(e=>e.options.id==='opencode-palette').length),1);
-  results.push({width:viewport.width,providerSwitches:7,draftPreserved:true,noStyleAccumulation:true,noOverflow:true,saveReload:true,restoreOriginal:true,lateLegacyIgnored:true,missingAssetRecovery:true,writeFailureRecovery:true});await context.close();
+  results.push({width:viewport.width,providerSwitches:7,draftPreserved:true,noStyleAccumulation:true,noOverflow:true,saveReload:true,restoreOriginal:true,lateLegacyIgnored:true,missingAssetRecovery:true,writeFailureRecovery:true,realHostFontLoaded:true,hostLocalFontReloaded:true,localFontResetReleased:true});await context.close();
  }
  assert.deepEqual(errors,[]);
  await writeFile(path.join(report,'verification.json'),JSON.stringify({sdk:'0.2.1-alpha.4',actualThemeRuntime:true,actualSlotCore:true,pinnedReact:true,phonePresentation:phone,realComputedCodeFontAndSize:true,realLegacyOpenCode:true,legacySettingsPreserved:true,legacyRendererSuspended:true,legacyRendererAndNavigationRestored:true,results,pageErrors:errors},null,2));console.log(JSON.stringify({results,pageErrors:errors}));

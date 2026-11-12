@@ -109,6 +109,13 @@ test('human login window inherits only its owner URL, remains owned, and reopens
   await service.close();
 });
 
+test('原生窗口关闭当前页后，仍为同面板的剩余页恢复画面',async()=>{
+  const {browser,service}=setup();await call(service,'pane','new');await call(service,'pane','new');
+  browser.tabs.delete('2');browser.emit('tabClosed','2');await service.panels.get('pane').queue;
+  assert.equal((await call(service,'pane','status')).active,'1');assert.deepEqual(browser.operations.at(-1),['start','1']);
+  await service.close();
+});
+
 test('尺寸通知和失败重试期间仍可交付最后有效画面，关闭后清除',async()=>{
   const {browser,service}=setup();
   await call(service,'pane','new');

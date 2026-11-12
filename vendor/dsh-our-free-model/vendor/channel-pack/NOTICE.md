@@ -7,6 +7,7 @@
 
 - 上游仓库：`https://gitee.com/iJetLi/deepseek-harness-codearts`
 - 吸收的提交：`2bf76ce66f1214f18ee3202238fb0f2d02cc791f`（2026-11-01），与用户既有桌面和手机定制逻辑合并；OFM 上游 `999e9f784ea3ea7a11cae383b142697b1ff2c42f`（2.8.0）
+- 本次本地适配升级到 OFM 上游 `efea046244d9b165f097af99a66c31e852731cb9`（2026-11-07）：并入 undici 8.12.2、跨天签到巡检、Kilo 会话隔离与 Bun worker 重建修复
 - 许可证：MIT（见 `LICENSE`，与上游一致）
 
 ## 目录内容
@@ -44,7 +45,8 @@ rm -rf vendor/channel-pack/node_modules
 - `src/index.ts`：增加可选 `disableOpencode` 挂载配置；OFM 开启它时跳过重复 OpenCode adapter、默认匿名账号和能力表预热，保留历史账号及凭据。省略时维持上游行为。
 - `src/channel-pack-rpc.ts`：追加同一配置，关闭时拒绝 `opencode.*` 与通用 `account.create(provider=opencode)`。
 - 打包入口改为 `src/index.ts`；宿主模块仍保持外部，jose/undici 内联。
-- 构建依赖固定为 esbuild 0.24.2、jose 6.2.9、undici 8.11.2；本次重构建核对了原包的依赖代码，未借此升级运行依赖。
+- 再构建使用 esbuild 0.25.12；undici 8.12.2 以根目录锁文件为准，与插件和独立端的运行产物保持一致。
+- `src/credential-expiry.ts` 与 `src/credit-expiry-window.ts` 提供渠道间共享的纯函数。积分临时窗口默认 15 天，可通过 `DSH_CREDIT_EXPIRING_WINDOW_DAYS` 显式设置为非负天数。
 
 本目录**不含**上游的浏览器半身（`plugin-src/client`）与其设置页——
 界面由 `dsh-our-free-model` 自己的三页界面取代，渠道操作经上游的

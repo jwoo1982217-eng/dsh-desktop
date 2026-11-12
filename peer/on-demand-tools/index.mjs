@@ -1,4 +1,6 @@
-import {defineTool, renderToolsSdk, renderToolsSdkPy} from '@deepseek-ai/dsh-tools';
+import * as toolApi from '@deepseek-ai/dsh-tools';
+import {installStepAdmission} from './step-admission.mjs';
+const {defineTool, renderToolsSdk, renderToolsSdkPy} = toolApi;
 
 export const name = 'dsh-on-demand-tools';
 export const inject = ['tools', 'systemPrompt'];
@@ -78,7 +80,9 @@ export function applyOnDemandTools(ctx) {
     parameters: {names: {type: 'array', items: {type: 'string'}, required: true, description: 'Exact names from tool_search or current task instructions'}}, output, execute: load,
     presentCall: () => ({card: 'generic', title: '加载工具定义', kind: 'read'})}));
   ctx.systemPrompt.context({name: 'dsh:on-demand-tools', order: 111, text: context => canDiscover(context.agent || context.scope) ? instructions : '当前作用域的工具已按原权限清单提供，直接使用可见工具完成任务。发现入口若未获许可，不扩展权限。技能只提供简介，匹配任务时通过可用的 skill 工具加载正文。'});
-  ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+  if (typeof ctx.tools.modeFor !== 'function') {
+    installStepAdmission(ctx, visible);
+  } else ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
     const assembly = await next(), agent = context.agent || context.scope;
     if (!agent?.session) return assembly;
     context.signal?.throwIfAborted();

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, writeFile, rm, symlink, realpath, chmod } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, symlink, realpath, chmod, cp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { installDesktopPocket } from './install-desktop-pocket.mjs';
@@ -10,7 +10,8 @@ async function fixture(t) {
   const profile = path.join(directory, 'profile'), modules = path.join(directory, 'modules');
   await mkdir(path.join(profile, 'node_modules'), { recursive: true });
   await mkdir(modules);
-  await symlink(path.resolve('desktop-runtime/node_modules/dsh-pocket'), path.join(modules, 'dsh-pocket'));
+  await cp(path.resolve('desktop-runtime/node_modules/dsh-pocket'), path.join(modules, 'dsh-pocket'), {recursive:true});
+  await symlink(path.resolve('desktop-runtime/node_modules'), path.join(modules, 'dsh-pocket/node_modules'), 'dir');
   const manifest = JSON.stringify({ dependencies: { existing: '1.0.0' }, dsh: { profile: { bundles: ['existing'] } } });
   await writeFile(path.join(profile, 'package.json'), manifest);
   await writeFile(path.join(profile, 'credentials-marker'), 'keep');
@@ -45,7 +46,7 @@ test('missing runtime package leaves profile and previous plugin untouched', asy
   const { profile, modules, manifest } = await fixture(t);
   await mkdir(path.join(profile, 'node_modules/dsh-pocket'));
   await writeFile(path.join(profile, 'node_modules/dsh-pocket/old'), 'original');
-  await rm(path.join(modules, 'dsh-pocket'));
+  await rm(path.join(modules, 'dsh-pocket'), {recursive:true});
   await assert.rejects(installDesktopPocket(profile, modules), { code: 'ENOENT' });
   assert.equal(await readFile(path.join(profile, 'package.json'), 'utf8'), manifest);
   assert.equal(await readFile(path.join(profile, 'node_modules/dsh-pocket/old'), 'utf8'), 'original');

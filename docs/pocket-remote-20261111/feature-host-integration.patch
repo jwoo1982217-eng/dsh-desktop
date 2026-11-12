@@ -1,0 +1,15 @@
+--- a/peer/feature-absorption/index.mjs
++++ b/peer/feature-absorption/index.mjs
+@@ -1,3 +1,4 @@
++import {apply as applyPocketLayoutCompat} from './pocket-layout-compat.mjs';
+ import fs from 'node:fs';
+ import path from 'node:path';
+ import {homedir} from 'node:os';
+@@ -55,6 +56,7 @@
+  http.registerApi({path:'/phone-features/notifications/observe',maxBytes:16384,handler:value=>{if(!runtime||!ordinary(value.sessionId)||value.remote!==true||typeof value.source!=='string'||!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value.source)||Object.keys(value).some(k=>!['sessionId','source','remote','frame'].includes(k)))throw Error();const frame=value.frame,allowed=frame?.type==='snapshot'?['type','cursor','active']:['type','seq','kind','active','settles','clearAttention'];if(!frame||Object.keys(frame).some(k=>!allowed.includes(k)))throw Error();return runtime.observe(value);}});
+  const tap=web.tapIndex(html=>html.replace(/<head(?:\s[^>]*)?>/i,head=>head+'<script src="/phone-features/settings/model-catalog-budget.js"></script>').replace('</head>','<script src="/phone-features/security.js"></script></head>').replace('</body>','<script src="/phone-features/bootstrap.js" defer></script></body>'));
+  ctx.effect(()=>tap);
++ applyPocketLayoutCompat(ctx);
+  if(nativeEnabled){
+   let controlCall=options.controlCall;
+   if(!controlCall)try{const {NativeControlBridge}=await import('dsh-phone-control/bridge');const bridge=new NativeControlBridge(undefined,{timeout:1500});controlCall=(command,value)=>bridge.call(command,value);}catch{}

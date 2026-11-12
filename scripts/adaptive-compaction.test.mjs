@@ -150,7 +150,7 @@ test('real model-selection projection triggers compaction before a switch from 1
   for(let i=0;i<12;i++)session.append('user/message',createUserMessage({content:[{type:'text',text:'source '+i+'x'.repeat(12000)}],source:{kind:'user'}}),{surfaceOp:'append'});
   session.append('model/selection',{provider:'fixture',model:'small'});
   const engine=new BasicCompactionEngine(ctx,{auto:false,maxTokens:1024,headroomTokens:2048,retainTokens:2048});
-  assert(await engine.compactIfNeeded(agent,'pressure',signal()));assert(calls.length>1);assert(calls.every(c=>c.model==='small'));
+  assert(await engine.compactIfNeeded(agent,'pressure',signal()));assert(calls.length>=1);assert(calls.every(c=>c.model==='large'),'previous model summarizes before admitting the smaller route');
   assert.equal(session.requestHeader().config.model,'large','maintenance does not fake a routed request header');
   assert.equal(ctx.sessionProjections.stateOf(session,'modelSelection').pending.model,'small','human selection is preserved');
 });
@@ -205,7 +205,7 @@ test('the real Agent loop compacts for the selected model, then executes one too
   const events=agent.session.snapshotEvents(),end=events.filter(e=>e.type==='turn/end').at(-1);
   assert.equal(end.data.reason.kind,'completed',JSON.stringify(end.data));assert.equal(reads,1);
   assert(events.some(e=>e.type==='compaction/summary'),'automatic compaction committed');
-  const main=calls.filter(c=>c.purpose!=='compaction');assert.equal(main.length,2);assert(calls.every(c=>c.model==='small'));
+  const main=calls.filter(c=>c.purpose!=='compaction');assert.equal(main.length,2);assert(main.every(c=>c.model==='small'));assert(calls.filter(c=>c.purpose==='compaction').every(c=>c.model==='large'));
   assert(calls.indexOf(main[0])>0,'summaries precede the first main request');
   assert(main.every(c=>c.messages.reduce((n,m)=>n+estimateMessage(m),0)+(c.maxTokens??1024)<32768),'input plus reserved output fits the new window');
   assert(main[0].messages.some(m=>JSON.stringify(m).includes('Read the local fixture once')),'latest user task survives');

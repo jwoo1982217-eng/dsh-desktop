@@ -5,6 +5,13 @@ from pathlib import Path, PurePosixPath
 
 HERE = Path(__file__).resolve().parent
 
+def windows_key(relative):
+    reserved = {'CON', 'PRN', 'AUX', 'NUL', *[f'COM{i}' for i in range(1, 10)], *[f'LPT{i}' for i in range(1, 10)]}
+    for name in relative.parts:
+        if name.split('.')[0].upper() in reserved or any(c in name for c in '<>:"|?*') or name.endswith((' ', '.')):
+            raise ValueError('Windows-incompatible path: ' + str(relative))
+    return str(relative).casefold()
+
 def safe_name(value):
     p = PurePosixPath(value)
     if p.is_absolute() or '..' in p.parts or '\\' in value:
@@ -72,7 +79,7 @@ def main():
     stage = args.out.resolve()
     if source == stage or source in stage.parents or stage in source.parents:
         raise ValueError('Source and staging directories must be separate')
-    version = json.loads((HERE / '../macos/app/package.json').read_text())['version']
+    version = json.loads((HERE / 'package.json').read_text())['version']
     if json.loads((source / 'bundle.json').read_text())['version'] != version:
         raise ValueError('Runtime and app versions differ')
     lock = json.loads((HERE / 'runtime-lock.json').read_text())
@@ -150,6 +157,8 @@ def main():
     shutil.copytree(node_root, bin_dir)
     shutil.rmtree(unpacked)
     shutil.copy2(HERE / 'backend-runner.mjs', bin_dir / 'backend-runner.mjs')
+    # A bundled CLI is available from the same PATH as node/npm, including spaces and Chinese paths.
+    (bin_dir / 'dsh.cmd').write_text('@echo off\r\n"%~dp0node.exe" --expose-internals "%~dp0..\\runtime\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js" %*\r\n', encoding='utf-8', newline='')
     vcrt = next(file for item, file in archives if item.get('kind') == 'vc-redist')
     stage_vcrt(vcrt, bin_dir, args.sevenzip.resolve(), stage.parent / 'vcrt-unpacked')
     shutil.copy2(modules / 'opencode-windows-x64-baseline/bin/opencode.exe', bin_dir / 'opencode.exe')
@@ -164,8 +173,8 @@ def main():
     seen = set()
     for p in stage.rglob('*'):
         relative = p.relative_to(stage)
-        key = str(relative).casefold()
-        if key in seen or any(c in p.name for c in '<>:"|?*') or p.name.endswith((' ', '.')):
+        key = windows_key(relative)
+        if key in seen:
             raise ValueError('Windows-incompatible path: ' + str(relative))
         seen.add(key)
         if p.is_symlink():

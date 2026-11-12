@@ -79,6 +79,22 @@ test('fresh profile initialization is independent of the source checkout', async
   assert.equal(await readFile(path.join(home, 'profiles/web/cordis.patch.yml'), 'utf8'), '[]\n');
 });
 
+test('reopening the app preserves a managed Pocket update instead of restoring its bundled older version',async t=>{
+  const {home,runtime}=await fixture(t),profile=path.join(home,'profiles/web');
+  const next=path.join(home,'dsh-pocket/updates/pocket-test/profiles/pocket-update/node_modules/dsh-pocket');
+  const bundled=path.join(runtime,'node_modules/dsh-pocket');
+  for(const [directory,version] of [[next,'2.12.0'],[bundled,'2.10.6']]){
+    await mkdir(directory,{recursive:true});await writeFile(path.join(directory,'package.json'),JSON.stringify({name:'dsh-pocket',version}));
+  }
+  await writeFile(path.join(next,'desktop-update.json'),JSON.stringify({version:1,packageVersion:'2.12.0'}));
+  await writeFile(path.join(runtime,'bundle.json'),JSON.stringify({version:'test',plugins:['local-plugin','dsh-pocket'],profile:{dependencies:{},dsh:{profile:{bundles:['local-plugin','dsh-pocket']}}}}));
+  await mkdir(path.join(profile,'node_modules'),{recursive:true});await symlink(next,path.join(profile,'node_modules/dsh-pocket'));
+  await writeFile(path.join(profile,'package.json'),JSON.stringify({dependencies:{'dsh-pocket':'file:'+next},dsh:{profile:{bundles:['dsh-pocket']}}}));
+  await prepareProfile(home,runtime);
+  assert.equal(JSON.parse(await readFile(path.join(profile,'node_modules/dsh-pocket/package.json'))).version,'2.12.0');
+  assert.equal(JSON.parse(await readFile(path.join(profile,'package.json'))).dependencies['dsh-pocket'],'file:'+next);
+});
+
 test('a busy existing DSH remains reusable when authentication takes more than three seconds', async t => {
   const {home} = await fixture(t);
   await mkdir(home, {recursive: true});

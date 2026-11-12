@@ -15,12 +15,26 @@ export function validateConfig(input,allowed){
  const providerGroups=new Map();
  const routes=input.routes.map(r=>{check(r&&typeof r.provider==='string'&&r.provider.length>0&&r.provider.length<=200&&typeof r.model==='string'&&r.model.length>0&&r.model.length<=512,'模型线路无效');const key=keyOf(r);check(!seen.has(key),'模型线路重复');seen.add(key);if(allowed)check(allowed.some(x=>keyOf(x)===key),'线路不在已授权目录：'+r.provider+'/'+r.model);
  check(Array.isArray(r.tasks)&&r.tasks.length>0&&r.tasks.length<=6&&r.tasks.every(t=>Object.hasOwn(TASKS,t)),'请选择工作类型');const quotaGroup=(r.quotaGroup||r.provider).trim();check(/^[\p{L}\p{N}_.:/ -]{1,100}$/u.test(quotaGroup),'额度组名称无效');check(!providerGroups.has(r.provider)||providerGroups.get(r.provider)===quotaGroup,'同一 API 来源的模型需使用相同额度组');providerGroups.set(r.provider,quotaGroup);return {provider:r.provider,model:r.model,tasks:[...new Set(r.tasks)],quotaGroup};});
- return {enabled:input.enabled,delegationEnabled:input.delegationEnabled??true,maxConcurrent:input.maxConcurrent,providerConcurrency:input.providerConcurrency,modelConcurrency:input.modelConcurrency,minIntervalMs:input.minIntervalMs,cooldownMs:input.cooldownMs,routes};
+ return {enabled:input.enabled,delegationEnabled:input.delegationEnabled??false,maxConcurrent:input.maxConcurrent,providerConcurrency:input.providerConcurrency,modelConcurrency:input.modelConcurrency,minIntervalMs:input.minIntervalMs,cooldownMs:input.cooldownMs,routes};
+}
+/** Read SDK-owned identity rather than trusting a caller's route or model. */
+export function isSubagentSession(session){
+ const h=session?.header;
+ return !!h&&(h.origin==='subagent'||(Number.isInteger(h.delegationDepth)&&h.delegationDepth>0));
+}
+function abortable(promise,signal){
+ if(!signal)return Promise.resolve(promise);
+ return new Promise((resolve,reject)=>{
+  const abort=()=>{signal.removeEventListener('abort',abort);reject(signal.reason||Error('请求已取消'));};
+  signal.addEventListener('abort',abort,{once:true});
+  Promise.resolve(promise).then(v=>{signal.removeEventListener('abort',abort);resolve(v);},e=>{signal.removeEventListener('abort',abort);reject(e);});
+  if(signal.aborted)abort();
+ });
 }
 export class Scheduler{
- constructor(home,{allowed=()=>[],clock=()=>Date.now()}={}){
-  this.allowed=allowed;this.clock=clock;this.file=path.join(home,'storage/subagent-scheduler/config.json');this.revision=0;this.active=new Map();this.pending=[];this.groups=new Map();this.models=new Map();this.total=0;this.events=[];this.closed=false;this.local=new AsyncLocalStorage();
-  const defaults={enabled:true,delegationEnabled:true,maxConcurrent:2,providerConcurrency:1,modelConcurrency:1,minIntervalMs:1000,cooldownMs:30000,routes:[]};
+ constructor(home,{allowed=()=>[],clock=()=>Date.now(),isSubagent=()=>false}={}){
+  this.allowed=allowed;this.clock=clock;this.isSubagent=isSubagent;this.file=path.join(home,'storage/subagent-scheduler/config.json');this.revision=0;this.active=new Map();this.pending=[];this.groups=new Map();this.models=new Map();this.total=0;this.events=[];this.closed=false;this.local=new AsyncLocalStorage();
+  const defaults={enabled:true,delegationEnabled:false,maxConcurrent:2,providerConcurrency:1,modelConcurrency:1,minIntervalMs:1000,cooldownMs:30000,routes:[]};
   // A starter pool uses only the two already-authorized first-party routes.
   // It never adds arbitrary catalog entries or calls a model to test it.
   for(const [model,tasks]of [['deepseek-flash',['general','extract','text']],['deepseek-v4-pro',['planning','code-reading','tool-schema']]])if(allowed().some(r=>r.provider==='deepseek-official'&&r.model===model))defaults.routes.push({provider:'deepseek-official',model,tasks,quotaGroup:'deepseek-official'});
@@ -28,6 +42,7 @@ export class Scheduler{
  }
  save(input,revision){check(revision===this.revision,'设置已变化，请刷新后重试');const config=validateConfig(input,this.allowed());check(!(this.active.size||this.pending.length)||JSON.stringify(config.routes)===JSON.stringify(this.config.routes),'有请求正在执行或排队，请等待完成后修改模型池和额度组');fs.mkdirSync(path.dirname(this.file),{recursive:true,mode:0o700});const tmp=this.file+'.'+randomUUID();try{fs.writeFileSync(tmp,JSON.stringify({revision:this.revision+1,config},null,2)+'\n',{mode:0o600});fs.renameSync(tmp,this.file);}finally{fs.rmSync(tmp,{force:true});}this.config=config;this.revision++;this.pump();return this.status();}
  assertDelegation(){check(this.config.delegationEnabled,'子代理已关闭，请由主模型完成任务；可在设置→子代理调度重新开启。');}
+ assertRoute(route){check(this.config.routes.some(r=>keyOf(r)===keyOf(route)),'子模型未在设置中明确选择：'+route.provider+'/'+route.model);check(this.allowed().some(r=>keyOf(r)===keyOf(route)),'子模型线路不在已授权目录：'+route.provider+'/'+route.model);}
  group(route){return this.config.routes.find(r=>r.provider===route.provider)?.quotaGroup||route.provider;}
  bucket(group){if(!this.groups.has(group))this.groups.set(group,{active:0,lastStart:0,cooldownUntil:0});return this.groups.get(group);}
  candidates(task='general',allowed=this.allowed()){
@@ -53,8 +68,30 @@ export class Scheduler{
    j.resolve({token,release:()=>{if(released)return;released=true;b.active--;const n=(this.models.get(j.key)||1)-1;n?this.models.set(j.key,n):this.models.delete(j.key);if(!j.parent)this.total--;this.active.delete(id);this.pump();}});
   }if(Number.isFinite(delay)&&this.pending.length)this.timer=setTimeout(()=>this.pump(),Math.max(1,delay));
  }
- async *stream(options,next){const route={provider:options.provider||'default',model:options.model||'default'},lease=await this.acquire(route,options.signal);let iterator,done=false;
-  try{iterator=next()[Symbol.asyncIterator]();for(;;){const item=await this.local.run(lease.token,()=>iterator.next());if(item.done){done=true;break;}const chunk=item.value;if(chunk.type==='finish')this.rateLimit(route,chunk.reason?.failure);yield chunk;}}catch(e){this.rateLimit(route,e);throw e;}finally{try{if(iterator&&!done)await this.local.run(lease.token,()=>iterator.return?.());}finally{lease.release();}}
+ async *stream(options,next){
+  // Ordinary chat and its auxiliary calls never use the child collaboration quota.
+  if(!this.isSubagent(options)){yield* next();return;}
+  this.assertDelegation();
+  const route={provider:options.provider||'default',model:options.model||'default'};
+  this.assertRoute(route);
+  const lease=await this.acquire(route,options.signal);let iterator,done=false;
+  try{
+   options.signal?.throwIfAborted();
+   iterator=next()[Symbol.asyncIterator]();
+   for(;;){
+    const item=await abortable(this.local.run(lease.token,()=>iterator.next()),options.signal);
+    options.signal?.throwIfAborted();
+    if(item.done){done=true;break;}
+    const chunk=item.value;if(chunk.type==='finish')this.rateLimit(route,chunk.reason?.failure);yield chunk;
+   }
+  }catch(e){this.rateLimit(route,e);throw e;}
+  finally{
+   try{if(iterator&&!done){const cleanup=this.local.run(lease.token,()=>iterator.return?.());
+    // An uncooperative upstream must not hold the scheduler's logical permit forever.
+    if(options.signal?.aborted)Promise.resolve(cleanup).catch(()=>{});
+    else await abortable(cleanup,options.signal);
+   }}finally{lease.release();}
+  }
  }
  status(){return {revision:this.revision,config:structuredClone(this.config),active:[...this.active.values()],queued:this.pending.map(j=>({provider:j.route.provider,model:j.route.model,group:j.group,queuedAt:j.at})),cooldowns:[...this.groups].filter(([,b])=>b.cooldownUntil>this.clock()).map(([group,b])=>({group,until:b.cooldownUntil})),events:this.events.slice(-20)};}
  close(){this.closed=true;clearTimeout(this.timer);for(const j of this.pending.splice(0)){j.signal?.removeEventListener('abort',j.abort);j.reject(Error('子代理调度已卸载，请重试'));}}

@@ -5,10 +5,13 @@ function appearanceRequestId(){
   return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20);
 }
 import {createVisuals,composeTokens,recipeFor} from './visuals.js';
+import {colorControls} from './color-controls.js';
+import {fontControls} from './font-controls.js';
 let state,recipe,pending=false,wallpaper='',sequence=0,requestedRevision=-1;
 const visual=createVisuals(document),channel=typeof BroadcastChannel!=='undefined'?new BroadcastChannel('dsh:appearance-center'):null;
 const byId=id=>document.getElementById(id),form=byId('options');
 const acknowledgements=new Map();
+const colors=colorControls(form),localFonts=fontControls({manage,save,form});
 const announce=(message,error=false)=>{byId('notice').textContent=message;byId('notice').toggleAttribute('data-error',error);};
 const loaded=()=>announce(state.compatibility?.warning||'已加载 '+state.providers.length+' 个来源，共 '+state.providers.reduce((n,p)=>n+p.themes.length,0)+' 套主题。',!!state.compatibility?.warning);
 async function manage(payload){
@@ -16,8 +19,8 @@ async function manage(payload){
   const result=(await response.json()).result;if(!response.ok||!result?.ok)throw Error(result?.error?.message||'外观未保存');return result.value;
 }
 const mode=()=>recipe.mode==='dual'?(state.options.mode==='system'?(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'):state.options.mode):recipe.mode;
-async function preview(next){if(next.revision<requestedRevision)return;requestedRevision=next.revision;const id=++sequence,nextRecipe=await recipeFor(next),prepared=await visual.prepare(nextRecipe);if(id!==sequence){prepared.cancel();return;}recipe=nextRecipe;state=next;prepared.commit(state,mode(),composeTokens(recipe,state.options));}
-function fields(){for(const [key,value] of Object.entries(state.options)){const element=form.elements.namedItem(key);if(!element)continue;if(element.type==='checkbox')element.checked=value;else element.value=value??'';}
+async function preview(next){if(next.revision<requestedRevision)return;requestedRevision=next.revision;const id=++sequence,nextRecipe=await recipeFor(next),prepared=await visual.prepare(nextRecipe,next.options);if(id!==sequence){prepared.cancel();return;}recipe=nextRecipe;state=next;prepared.commit(state,mode(),composeTokens(recipe,state.options));}
+function fields(){localFonts.refresh(state);for(const [key,value] of Object.entries(state.options)){const element=form.elements.namedItem(key);if(!element)continue;if(element.type==='checkbox')element.checked=value;else element.value=value??'';}colors.refresh();
   wallpaper=state.options.wallpaper;byId('wallpaper-info').textContent=wallpaper?'本机图片已保存':'未设置壁纸';
   form.elements.mode.disabled=recipe.mode!=='dual';byId('mode-hint').textContent=recipe.mode==='dual'?'':recipe.mode==='dark'?'这套主题采用独立深色配色':'这套主题采用独立浅色配色';
 }
@@ -51,6 +54,7 @@ function renderProviders(){
 }
 async function save(payload){if(pending)return;pending=true;renderProviders();announce('正在保存…');
   try{
+    if(payload.options&&(Object.hasOwn(payload.options,'uiFont')||Object.hasOwn(payload.options,'codeFont'))){const p=await visual.prepare(recipe,{...state.options,...payload.options});p.cancel();}
     // Read and stage the selected asset before persisting its choice.
     if(payload.theme){const theme=state.providers.flatMap(p=>p.themes).find(t=>t.id===payload.theme);const r=await recipeFor({theme:theme.id,selected:theme}),p=await visual.prepare(r);p.cancel();}
     const next=await manage({...payload,revision:state.revision});await preview(next);render();
@@ -74,5 +78,5 @@ window.addEventListener('message',event=>{if(event.origin!==location.origin||eve
   if(['dsh:appearance-applied','dsh:appearance-error'].includes(event.data?.type)){const pending=acknowledgements.get(event.data.requestId);if(pending){clearTimeout(pending.timer);acknowledgements.delete(event.data.requestId);event.data.type==='dsh:appearance-applied'?pending.resolve():pending.reject(Error(event.data.message));}else if(event.data.type==='dsh:appearance-error')announce(event.data.message,true);}});
 const media=matchMedia('(prefers-color-scheme:dark)');media.addEventListener('change',()=>{if(state)visual.sync(mode());});
 channel&&(channel.onmessage=async()=>{if(!pending){try{await preview(await manage({action:'status'}));render();announce('已同步另一页面的外观调整。');}catch(error){announce(error.message,true);}}});
-window.addEventListener('pagehide',()=>{visual.dispose();channel?.close();});
+window.addEventListener('pagehide',()=>{localFonts.dispose();visual.dispose();channel?.close();});
 manage({action:'status'}).then(preview).then(()=>{if(!state)return;render();loaded();}).catch(error=>announce(error.message,true));

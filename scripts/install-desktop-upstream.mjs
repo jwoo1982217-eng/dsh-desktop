@@ -14,12 +14,20 @@ import { installDesktopTeam } from './install-desktop-team.mjs';
 import { buildTeamClient } from '../team/build-client.mjs';
 import { buildModelPicker } from './build-model-picker.mjs';
 import { buildCodeProgress } from './build-code-progress.mjs';
+import { buildDesktopEnhancements } from './build-desktop-enhancements.mjs';
+import { buildInstructionBudget } from './build-instruction-budget.mjs';
+import { installDesktopEnhancements } from './install-desktop-enhancements.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 
 /** 部署已验证的新核心，保留原插件源码和可恢复的启动入口。 */
 export async function installDesktopUpstream(desktop, profile) {
+  // This historical alpha.4 installer must never overwrite a migrated rc.1 profile.
+  try {
+    await readFile(path.join(path.resolve(profile), '.desktop-core-rc1.json'));
+    throw Error('此配置已升级到 0.2.2-rc.1；旧 alpha.4 安装入口已拒绝降级，请使用当前桌面版构建入口');
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
   // Every profile uses the same pinned runtime. Serialize its file updates,
   // including installers running in separate terminals or test processes.
   const lock = path.join(root, 'desktop-runtime/.install-lock');
@@ -77,7 +85,7 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
   await writeFile(path.join(backup, 'package.json'), original, { mode: 0o600 });
   const swapped = [], copied = [];
   // 子安装器会替换本地自带插件，先保留完整副本，失败时连同清单一起恢复。
-  for (const name of ['dsh-peer', 'dsh-desktop-chatgpt', 'dsh-desktop-browser', 'dsh-pocket', 'dsh-team']) {
+  for (const name of ['dsh-peer', 'dsh-desktop-chatgpt', 'dsh-desktop-browser', 'dsh-pocket', 'dsh-team', 'dsh-desktop-enhancements']) {
     const target = path.join(profile, 'node_modules', name), saved = path.join(backup, name);
     let existed = false;
     try { await lstat(target); await cp(target, saved, { recursive: true }); existed = true; }
@@ -126,6 +134,8 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
     const { readdir } = await import('node:fs/promises');
     await buildModelPicker();
     await buildCodeProgress();
+    await buildInstructionBudget();
+    await buildDesktopEnhancements();
     for (const name of await readdir(path.join(root, 'runtime/overlays/@deepseek-ai'))) {
       await cp(path.join(root, 'runtime/overlays/@deepseek-ai', name), path.join(modules, '@deepseek-ai', name), { recursive: true });
     }
@@ -147,6 +157,8 @@ async function installDesktopUpstreamUnlocked(desktop, profile) {
     await installDesktopChatGpt(profile, modules);
     await installDesktopBrowser(profile, modules);
     await installDesktopPocket(profile, modules);
+    const enhancementHome = path.basename(path.dirname(profile)) === 'profiles' ? path.resolve(profile, '../..') : path.dirname(profile);
+    installDesktopEnhancements(enhancementHome, modules, {profile});
     if (desktop) {
       const source = path.join(modules, '@deepseek-ai/dsh');
       const target = path.join(desktop, 'node_modules/@deepseek-ai/dsh');

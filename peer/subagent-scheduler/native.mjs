@@ -1,7 +1,7 @@
-// 适配已验证的 alpha.1 旧接口和 alpha.4 activation 接口，不修改 SDK。
+// 适配已验证的 alpha.1 旧接口和 alpha.4/rc.1 activation 接口，不修改 SDK。
 // Model selection happens before creation; prepared LLM requests are immutable.
 export function installNativeSelection(ctx,scheduler){
- const service=ctx.get('subagents'),restore=[];
+ const provided=ctx.get('subagents'),service=provided[Symbol.for('cordis.original')]??provided,restore=[];
  const starts=typeof service.startActivation==='function'?['startActivation']:['start','startContinuable'];
  try { for(const method of [...starts,'sendMessage']){
   const original=service[method],descriptor=Object.getOwnPropertyDescriptor(service,method);
@@ -17,14 +17,9 @@ export function installNativeSelection(ctx,scheduler){
    scheduler.assertDelegation();
    const policy=request?.parent?.session&&ctx.get('sessionProjections')?.stateOf(request.parent.session,'subagentModelSelectionPolicy');
    const route=request?.agentOptions;
-   if(route?.provider!==undefined||route?.model!==undefined){
-    if(typeof route.provider!=='string'||!route.provider.length||typeof route.model!=='string'||!route.model.length)throw Error('子模型 provider 和 model 必须同时提供且非空。');
-    if(Array.isArray(policy)&&!policy.some(p=>p.provider===route.provider&&p.model===route.model))throw Error('子模型线路不在本会话授权列表：'+route.provider+'/'+route.model);
-   }
-   if(scheduler.config.routes.length&&Array.isArray(policy)&&!request?.agentOptions?.provider&&!request?.agentOptions?.model){
-    const routes=scheduler.config.routes.filter(r=>policy.some(p=>p.provider===r.provider&&p.model===r.model));
-    if(routes.length)throw Error('请根据子任务内容选择模型，不能默认并发继承主模型。调用 subagent_model_routes 查看候选，然后在 subagent、subagent_fork 或 spawn_teammate 中同时传 provider 和 model。可用线路：'+routes.map(r=>r.provider+'/'+r.model+'（'+r.tasks.join(',')+'）').join('；'));
-   }
+   if(typeof route?.provider!=='string'||!route.provider.length||typeof route?.model!=='string'||!route.model.length)throw Error('子代理需要明确选择 provider 和 model，不能自动继承主对话的账号线路。');
+   scheduler.assertRoute(route);
+   if(Array.isArray(policy)&&!policy.some(p=>p.provider===route.provider&&p.model===route.model))throw Error('子模型线路不在本会话授权列表：'+route.provider+'/'+route.model);
    return original.apply(this,args);
   };
   if(!Reflect.defineProperty(service,method,{value:wrapped,writable:true,configurable:true}))throw Error('当前SDK不能安装子代理路由适配');

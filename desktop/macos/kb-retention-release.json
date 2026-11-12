@@ -1,0 +1,52 @@
+{
+  "version": "0.1.10",
+  "baseVersion": "0.1.9",
+  "baseAsarSha256": "40f938d7d31cc0beddf26e90fed94e587a1fea19ac9280281fd1e55da3872fb1",
+  "baseProgramUpdateSha256": "c11dfbf099eaa4cb8ef1861f74436ec006d39b444ce13070ce5be74d748ce85a",
+  "baseBundleSha256": "1cb4abbad74f19f8126d1273a781f3cee7dbd8f158a209f9ce371e4f174436a4",
+  "files": [
+    {
+      "path": "automatic-recall.mjs",
+      "sha256": "14321bda772e677f1d0bc23731ba06bf1adc0a4d9c67728b2c2a1f76ba0de2aa",
+      "bytes": 10659,
+      "before": "c1da94c2c7bc117548baf4ea0f47a5ce5012515f76e7551be514b38450d4ebdd"
+    },
+    {
+      "path": "kb/kb.cjs",
+      "sha256": "5e195e12db63d7f37ce2f4866e5a1e05b0c5a0bd7333c71c254214f300f78082",
+      "bytes": 6708,
+      "before": "5084783d38a5ac9588c4f9c24aedfc4eb64da6b99da187ed9d450110cb2c4ec2"
+    },
+    {
+      "path": "kb/lib/migrate.cjs",
+      "sha256": "2385480d2e8bdf88abc9014b08fcd8bec36dc12cdd6c2b9996a28f7ac8e83130",
+      "bytes": 2926,
+      "before": "6859674c448f5943957b38947cf03c7768b59620f4c3e874aa9bf3a47aabe59e"
+    },
+    {
+      "path": "kb/lib/retention.cjs",
+      "sha256": "382c52ab5cd7fd03b4ea97415fa0e9e8191b1a522e9467d0da23c59e7a852797",
+      "bytes": 5543,
+      "before": "missing"
+    },
+    {
+      "path": "kb/lib/search.cjs",
+      "sha256": "4a0388ea9bfa94cbaffcc44ca09a2ead260f157ad9d37d8f7dcecb81f2f2db5e",
+      "bytes": 4622,
+      "before": "b90c5707775d7dc641465685ab49da447c97adb5fa118f8d71e8e9c8d4095d0e"
+    },
+    {
+      "path": "kb/lib/store.cjs",
+      "sha256": "34e8ac3ee93a83fe6d2afa262ddcc801a9c65dcb8f7181321d2c10bb7f7dca82",
+      "bytes": 10139,
+      "before": "2fa159fed7583328bde564536da731d1a8cea39fcab66f259e4d34b1cf038d82"
+    },
+    {
+      "path": "kb/lib/util.cjs",
+      "sha256": "9e1dc58d03dc6bc8bec6c1f7c7ab82054b0bc38df7cf62661fc22912a070a82e",
+      "bytes": 2694,
+      "before": "92b8661465af0d785308ff5afdd7824258b4e417c14c0cd4c283af083dcd3967"
+    }
+  ],
+  "baseProgramRecoverySha256": "8e44e7300310381acc682931cd1976eeeec4c658d3d697c016b52c1522ee8d71"
+}

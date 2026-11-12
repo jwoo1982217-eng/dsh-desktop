@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>记忆星图 · Memory Constellation</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #05070f; }
+  body { font-family: 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif; color: #e8ecff; }
+  #sky { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; }
+
+  .topbar { position: absolute; top: 26px; left: 42px; right: 42px; display: flex; align-items: flex-start; gap: 28px; z-index: 10; pointer-events: none; }
+  .brand { font-size: 34px; font-weight: 600; letter-spacing: 9px; text-shadow: 0 0 26px rgba(140,170,255,.55); white-space: nowrap; }
+  .brand small { display: block; margin-top: 6px; font-size: 11px; font-weight: 400; letter-spacing: 5px; color: #6b76a0; }
+  .status { margin-left: auto; padding-top: 10px; text-align: right; font-size: 12px; letter-spacing: 1.5px; color: #8b96c4; line-height: 1.9; }
+  .status b { color: #cdd8ff; font-weight: 500; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #7ee8fa; box-shadow: 0 0 10px #7ee8fa; margin-right: 7px; animation: blink 2s ease-in-out infinite; }
+  .dot.demo { background: #ffc86b; box-shadow: 0 0 10px #ffc86b; }
+  @keyframes blink { 50% { opacity: .35; } }
+
+  .left { position: absolute; left: 42px; top: 132px; width: 232px; z-index: 12; display: flex; flex-direction: column; gap: 14px; }
+  .card { padding: 18px 18px 16px; border-radius: 16px; background: rgba(13,18,40,.92); border: 1px solid rgba(150,175,255,.2); box-shadow: 0 16px 44px rgba(0,0,0,.42); }
+  .card-title { font-size: 12px; letter-spacing: 3px; color: #8b96c4; margin-bottom: 14px; display: flex; justify-content: space-between; }
+  .card-title span { color: #cdd8ff; letter-spacing: 1px; }
+  .legend-row { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 9px; cursor: pointer; font-size: 13px; transition: background .2s, opacity .2s; user-select: none; }
+  .legend-row:hover { background: rgba(255,255,255,.06); }
+  .legend-row.off { opacity: .32; }
+  .swatch { width: 11px; height: 11px; border-radius: 50%; flex: 0 0 11px; box-shadow: 0 0 10px currentColor; }
+  .legend-row .name { flex: 1; letter-spacing: 1px; }
+  .legend-row .num { font-size: 12px; color: #8b96c4; font-variant-numeric: tabular-nums; }
+
+  input[type=text], select { width: 100%; padding: 9px 11px; margin-bottom: 11px; border-radius: 9px; border: 1px solid rgba(150,175,255,.24); background: rgba(8,12,30,.72); color: #e8ecff; font: 13px/1.4 inherit; outline: none; }
+  input[type=text]:focus, select:focus { border-color: rgba(150,175,255,.6); }
+  input::placeholder { color: #5b648c; }
+  select option { background: #10162f; }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #b6c0e6; letter-spacing: 1px; margin: 4px 0 10px; cursor: pointer; }
+  .check input { accent-color: #8ab4ff; }
+  .btns { display: flex; gap: 8px; }
+  .btns button { flex: 1; padding: 8px 4px; border-radius: 9px; border: 1px solid rgba(150,175,255,.28); background: rgba(255,255,255,.06); color: #cdd8ff; font: 12px inherit; letter-spacing: 1px; cursor: pointer; }
+  .btns button:hover { background: rgba(140,170,255,.2); color: #fff; }
+
+  .hint { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 10; font-size: 12px; letter-spacing: 2px; color: #6b76a0; pointer-events: none; white-space: nowrap; }
+  .toast { position: absolute; left: 50%; top: 92px; transform: translateX(-50%); z-index: 20; padding: 8px 20px; border-radius: 999px; background: rgba(16,22,48,.85); border: 1px solid rgba(150,175,255,.3); font-size: 12px; letter-spacing: 2px; color: #cdd8ff; opacity: 0; transition: opacity .35s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .tip { position: absolute; z-index: 20; padding: 6px 12px; border-radius: 8px; background: rgba(12,17,40,.92); border: 1px solid rgba(150,175,255,.3); font-size: 12px; letter-spacing: 1px; color: #e8ecff; pointer-events: none; display: none; max-width: 260px; }
+
+  .detail { position: absolute; top: 50%; right: 42px; transform: translateY(-50%) translateX(18px); width: 372px; max-height: 76vh; overflow: auto; padding: 28px 28px 26px; border-radius: 20px; background: rgba(13,18,40,.94); border: 1px solid rgba(150,175,255,.26); box-shadow: 0 22px 66px rgba(0,0,0,.55); z-index: 15; opacity: 0; pointer-events: none; transition: opacity .35s, transform .35s; }
+  .detail.show { opacity: 1; transform: translateY(-50%) translateX(0); pointer-events: auto; }
+  .detail::-webkit-scrollbar { width: 6px; }
+  .detail::-webkit-scrollbar-thumb { background: rgba(150,175,255,.3); border-radius: 3px; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .badge { padding: 5px 13px; border-radius: 999px; font-size: 12px; letter-spacing: 2px; border: 1px solid; }
+  .badge.ghost { color: #8b96c4; border-color: rgba(150,175,255,.25); }
+  .d-time { margin-top: 15px; font-size: 12px; letter-spacing: 1.5px; color: #8b96c4; }
+  .d-title { margin-top: 8px; font-size: 23px; font-weight: 600; letter-spacing: 1.5px; line-height: 1.5; }
+  .rule { margin: 18px 0; height: 1px; background: linear-gradient(90deg, rgba(150,175,255,.5), transparent); }
+  .grid { display: grid; grid-template-columns: 76px 1fr; gap: 9px 12px; font-size: 12.5px; line-height: 1.6; }
+  .grid dt { color: #6b76a0; letter-spacing: 1px; }
+  .grid dd { margin: 0; color: #c5cdef; word-break: break-all; }
+  .stars { color: #ffd166; letter-spacing: 2px; }
+  .kw { display: flex; flex-wrap: wrap; gap: 6px; margin: 18px 0; }
+  .kw span { padding: 4px 10px; border-radius: 7px; background: rgba(255,255,255,.06); border: 1px solid rgba(150,175,255,.18); font-size: 11.5px; color: #aab6dd; }
+  .d-content { font-size: 14px; line-height: 2; letter-spacing: .6px; color: #d6ddf7; white-space: pre-wrap; word-break: break-word; }
+  .rel { margin-top: 18px; }
+  .rel .t { font-size: 12px; letter-spacing: 2px; color: #6b76a0; margin-bottom: 9px; }
+  .rel a { display: block; padding: 7px 10px; margin-bottom: 5px; border-radius: 8px; background: rgba(255,255,255,.04); border: 1px solid rgba(150,175,255,.14); color: #b9c5ee; font-size: 12px; cursor: pointer; text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rel a:hover { background: rgba(140,170,255,.16); color: #fff; }
+  .d-foot { margin-top: 20px; padding-top: 14px; border-top: 1px solid rgba(150,175,255,.14); display: flex; align-items: center; gap: 10px; font-size: 11px; color: #5b648c; word-break: break-all; }
+  .d-foot button { margin-left: auto; flex: 0 0 auto; padding: 5px 11px; border-radius: 7px; border: 1px solid rgba(150,175,255,.25); background: rgba(255,255,255,.05); color: #aab6dd; font-size: 11px; cursor: pointer; }
+  @media (max-width: 980px) { .left { display: flex; left: 16px; width: 205px; } .detail { right: 16px; width: 320px; } .brand { font-size: 24px; } }
+
+#results{max-height:170px;overflow:auto;margin:10px 0}#results button{display:block;width:100%;text-align:left;margin:5px 0;padding:7px;color:#d5dfff;background:#14213b;border:1px solid #31466b;border-radius:7px;cursor:pointer}.d-content{max-height:40vh;overflow:auto}.d-source{color:#9bb9ff}.left{max-height:calc(100vh - 150px);overflow:auto}.detail button{cursor:pointer}.empty-note{color:#bccbe8;font-size:12px;line-height:1.7}@media(max-width:700px){.topbar{left:16px;right:16px}.brand{font-size:20px;letter-spacing:3px}.status{font-size:10px;max-width:52%}.left{width:170px}.card{padding:12px}.detail{right:8px;width:min(310px,calc(100vw - 190px))}.hint{white-space:normal;width:90%;text-align:center;font-size:10px}.legend-row{padding:3px}.detail{padding:16px}}
+
+.embedded .brand{display:none}.embedded .topbar{top:16px;left:16px;right:16px;justify-content:flex-end}.embedded .status{font-size:11px;max-width:70%;text-align:right}.embedded .left{top:60px;left:16px;width:210px;gap:10px;max-height:calc(100vh - 92px)}.embedded .card{padding:12px}.embedded .legend-row{padding:4px}.embedded .card-title{margin-bottom:8px}.embedded .detail{right:16px;width:min(380px,calc(100vw - 250px));max-height:85vh;padding:20px}.embedded .hint{bottom:10px;letter-spacing:0;font-size:11px}.embedded .d-source{padding:8px 12px;border:1px solid #526b9c;border-radius:8px;background:#14213b}.embedded #results{max-height:110px}@media(max-width:600px){.embedded .left{width:155px}.embedded .detail{width:calc(100vw - 190px);padding:12px}.embedded .d-title{font-size:18px}.embedded .status{max-width:100%}}
+</style>
+</head>
+<body>
+<canvas id="sky"></canvas>
+
+<div class="topbar">
+  <div class="brand">记忆星图<small>MEMORY CONSTELLATION</small></div>
+  <div class="status" id="status"><span class="dot"></span>连接中…<br><b id="status-sub">读取 DSH 知识库与记忆摘要</b></div>
+</div>
+
+<aside class="left">
+  <div class="card">
+    <div class="card-title">记忆层级 <span id="layer-total">—</span></div>
+    <div id="legend"></div>
+  </div>
+  <div class="card">
+    <div class="card-title">筛选与控制</div>
+    <input aria-label="搜索记忆" type="text" id="search" placeholder="搜索内容 / 关键词 / 项目…" autocomplete="off">
+    <select aria-label="记忆来源" id="workspace" title="切换记忆库"></select>
+    <label class="check"><input type="checkbox" id="all"> 包含归档笔记</label>
+    <label class="check"><input type="checkbox" id="autorotate"> 自动旋转星空</label>
+    <div id="results" aria-live="polite"></div><div class="btns"><button id="reset">重置视角</button><button id="refresh">立即同步</button></div>
+  </div>
+</aside>
+
+<div class="hint">拖拽空白处旋转视角 · 拖住光点可移位 · 滚轮缩放 · 点击光点查看原文 · 连线沿用知识库链接与共同标签</div>
+<div class="toast" id="toast">已同步</div>
+<div class="tip" id="tip"></div>
+
+<section class="detail" id="detail"></section>
+
+<script src="/meow-constellation/page.js"></script>
+</body>
+</html>

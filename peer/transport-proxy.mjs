@@ -1,6 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { isIP } from 'node:net';
+import { createPhysicalLanAgent } from './android-lan-agent.mjs';
 
 const loopback = host => host === 'localhost' || host === '::1' || host === '[::1]' || (isIP(host) === 4 && host.startsWith('127.'));
 const read = (env, name) => env[name.toLowerCase()] ?? env[name] ?? '';
@@ -52,6 +53,6 @@ export async function transportOptions(value, { routeFor = runtimeRoute, nodeVer
     proxyEnv = { HTTP_PROXY: proxy.href, HTTPS_PROXY: proxy.href, NO_PROXY: '' };
   }
   const Agent = url.protocol === 'https:' ? https.Agent : http.Agent;
-  const agent = new Agent({ proxyEnv, keepAlive: false });
+  const agent = (!route.proxied && createPhysicalLanAgent(url)) || new Agent({ proxyEnv, keepAlive: false });
   return { agent, release: () => agent.destroy() };
 }

@@ -1,0 +1,9 @@
+{
+  "name": "dsh-desktop-core-compatibility",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.mjs",
+  "engines": {"dsh": "0.2.2-rc.1"},
+  "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
+  "license": "MIT"
+}

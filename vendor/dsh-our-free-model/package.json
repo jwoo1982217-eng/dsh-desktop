@@ -1,9 +1,9 @@
 {
   "name": "dsh-our-free-model",
-  "version": "2.8.0",
+  "version": "2.8.1",
   "private": true,
   "type": "module",
-  "description": "Our Free Model — DSH owner-managed 2.8.0 integration, preserving account pools, 24 account-channel cards, routing/token savers and Android/shared-backend compatibility.",
+  "description": "Our Free Model — DSH owner-managed 2.8.0 integration (OFM upstream efea046), preserving account pools, 24 account-channel cards, routing/token savers and Android/shared-backend compatibility.",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
@@ -75,7 +75,7 @@
   },
   "devDependencies": {
     "jose": "6.1.3",
-    "undici": "8.11.2",
+    "undici": "8.12.2",
     "typescript": "^5.9.2",
     "esbuild": "0.25.9",
     "dsh-llm-legacy": "npm:@deepseek-ai/dsh-llm@0.1.5-rc.2"
@@ -87,7 +87,7 @@
   "dshCustomization": {
     "id": "dsh-owner-managed-channels-mobile-v1",
     "contract": "customization-contract.json",
-    "ofmUpstream": "999e9f784ea3ea7a11cae383b142697b1ff2c42f",
+    "ofmUpstream": "efea046244d9b165f097af99a66c31e852731cb9",
     "jetHubUpstream": "2bf76ce66f1214f18ee3202238fb0f2d02cc791f",
     "distribution": "locally managed; not an official upstream release-sign artifact"
   }

@@ -5,6 +5,8 @@ import { createGzip, gunzipSync } from 'node:zlib';
 import { Readable } from 'node:stream';
 import WebSocket, { WebSocketServer } from 'ws';
 import { MAX_BODY } from './protocol.mjs';
+import {createQuietSessionBridge} from './quiet-session-bridge.mjs';
+import {createWsMessageBridge, configureWs, wsOffer, wsCapabilities, WS_MESSAGE_LIMIT, WS_QUEUE_LIMIT} from './ws-message-bridge.mjs';
 
 const loopback = address => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address);
 const HOP = new Set(['host', 'connection', 'upgrade', 'transfer-encoding', 'keep-alive', 'proxy-authorization', 'proxy-authenticate', 'te', 'trailer', 'cookie', 'set-cookie', 'origin', 'referer', 'sec-fetch-site', 'accept-encoding', 'content-length']);
@@ -17,7 +19,6 @@ function safePath(value) {
 }
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const comboPath = path => path.startsWith('/plugins/??') && /&rev=[a-f0-9]{12}$/.test(path) && path.length <= 8192;
-const WS_MESSAGE_LIMIT = 1024 * 1024, WS_CHUNK_BYTES = 65536;
 const requestLimit = (service,method,url) => service === 'ui' && method === 'POST' && url.split('?')[0] === '/phone-chat-files/upload' ? 64*1024*1024 : MAX_BODY;
 const recoveryClient = `(function(){
   var stopped=false,running=false,timer=null,checks=0;
@@ -48,44 +49,14 @@ const bootstrapRecovery = `<script id="dsh-peer-bootstrap-recovery">(function(){
     location.replace('/__dsh_peer_recover'+location.hash);
   },true);
 })();</script>`;
-export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, uiHeaders = async () => ({}), gatewayPort = 8326, gatewayKey = async () => undefined, allowGateway = () => true, transformHtml = html => html, assets = new Map(), reusableScripts = [] } = {}) {
+const quietVisibilityClient = `<script id="dsh-peer-quiet-visibility">(()=>{if(window.__dshPeerQuietVisibility)return;window.__dshPeerQuietVisibility=true;const Native=window.WebSocket,sockets=new Set();function report(ws){if(ws.readyState===Native.OPEN)ws.send(JSON.stringify({type:'dsh-peer-visibility',hidden:document.hidden}));}window.WebSocket=class extends Native{constructor(...args){super(...args);let url;try{url=new URL(args[0],location.href)}catch{return}if(url.host!==location.host||url.pathname!=='/api/remote.mux')return;sockets.add(this);this.addEventListener('open',()=>report(this));this.addEventListener('close',()=>sockets.delete(this),{once:true});}};document.addEventListener('visibilitychange',()=>{for(const ws of sockets)report(ws)});window.addEventListener('pagehide',()=>sockets.clear(),{once:true});})();</script>`;
+export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, uiHeaders = async () => ({}), gatewayPort = 8326, gatewayKey = async () => undefined, allowGateway = () => true, transformHtml = html => html, assets = new Map(), reusableScripts = [], quietAfterMs = 30000 } = {}) {
   const reusable = new Map(reusableScripts.filter(bytes => Buffer.isBuffer(bytes) && bytes.length > 0 && bytes.length <= MAX_BODY / 2).slice(0, 1).map(bytes => [digest(bytes), bytes]));
   const outgoing = new Map(), incoming = new Map(), localWs = new Map(), remoteWs = new Map();
-  const partialWs = new WeakMap();
-  const sendWs = (type, id, ws, data, binary) => {
-    if (data.length > WS_MESSAGE_LIMIT) throw Error('Socket message too large');
-    if (!ws.peerChunks || data.length <= WS_CHUNK_BYTES) {
-      tunnel.send({ type, id, binary, data: data.toString('base64') }); return;
-    }
-    // Keep each encrypted envelope below MAX_FRAME; the browser still gets
-    // one original WebSocket message, including its binary/text flag.
-    for (let offset=0,index=0;offset<data.length;offset+=WS_CHUNK_BYTES,index++) {
-      tunnel.send({type:type+'.chunk',id,binary,index,final:offset+WS_CHUNK_BYTES>=data.length,data:data.subarray(offset,offset+WS_CHUNK_BYTES).toString('base64')});
-    }
-  };
-  const receiveWs = (ws, m, chunked) => {
-    try {
-      if (typeof m.data !== 'string' || m.data.length > Math.ceil((chunked?WS_CHUNK_BYTES:WS_MESSAGE_LIMIT)/3)*4) throw Error('Socket message too large');
-      const bytes=Buffer.from(m.data,'base64');
-      if (bytes.toString('base64')!==m.data) throw Error('Invalid socket data');
-      if (chunked) {
-        if (!ws.peerChunks || !Number.isInteger(m.index) || m.index<0 || typeof m.final!=='boolean' || typeof m.binary!=='boolean' || bytes.length>WS_CHUNK_BYTES) throw Error('Invalid socket chunk');
-        const partial=partialWs.get(ws);
-        if (m.index!==(partial?.next??0) || (partial&&m.binary!==partial.binary)) throw Error('Socket chunk order changed');
-        const state=partial??{next:0,size:0,binary:m.binary,parts:[]};
-        state.next++;state.size+=bytes.length;
-        if (state.size>WS_MESSAGE_LIMIT || state.next>Math.ceil(WS_MESSAGE_LIMIT/WS_CHUNK_BYTES)) throw Error('Socket message too large');
-        state.parts.push(bytes);
-        if (!m.final) { partialWs.set(ws,state);return; }
-        partialWs.delete(ws);
-        if (ws.bufferedAmount>4*1024*1024) throw Error('Socket congested');
-        ws.send(Buffer.concat(state.parts,state.size),{binary:state.binary});
-      } else {
-        if (partialWs.has(ws) || bytes.length>WS_MESSAGE_LIMIT || ws.bufferedAmount>4*1024*1024) throw Error('Socket message interrupted');
-        ws.send(bytes,{binary:m.binary===true});
-      }
-    } catch { partialWs.delete(ws);ws.terminate(); }
-  };
+  const wsMessages = createWsMessageBridge(tunnel);
+  const dropWs = ws => {ws.peerQuiet?.close();clearTimeout(ws.peerEndTimer);wsMessages.drop(ws);};
+  const sendWs = (type,id,ws,data,binary) => wsMessages.send(type,id,ws,data,binary);
+  const receiveWs = (ws,m,chunked) => wsMessages.receive(ws,m,chunked);
   // Bound all response chunks together, including concurrent asset downloads.
   // A small window avoids paying a full WAN round trip for every 48 KiB.
   let chunkCalls = 0;
@@ -268,33 +239,47 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
   const wsAction = async (action, value) => {
     const id = value?.id;
     if (typeof id !== 'string' || id.length > 64) throw Error('Invalid socket');
+    if(action==='ws.transfer'){
+      const uplink=value.type==='ws.uplink.chunk',downlink=value.type==='ws.data.chunk';
+      const ws=uplink?remoteWs.get(id):downlink?localWs.get(id):undefined;
+      if(!ws||!ws.peerAcknowledgedChunks||(uplink&&!ws.allowUplink)||ws.readyState!==WebSocket.OPEN)throw Error('Socket transfer unavailable');
+      if(!wsMessages.receive(ws,value,true))throw Error('Socket transfer rejected');
+      return {};
+    }
     if (action === 'ws.open') {
       if (remoteWs.size >= 8 || remoteWs.has(id)) throw Error('Too many sockets');
       const port = target('ui'), url = safePath(value.url);
       if (!['/api/events.mux', '/api/events.host', '/api/remote.mux'].includes(url)) throw Error('Socket path not shared');
-      const ws = new WebSocket(`ws://127.0.0.1:${port}${url}`, { origin: `http://127.0.0.1:${port}`, headers: await uiHeaders(), maxPayload: 1024 * 1024, perMessageDeflate: false });
+      const caps=wsCapabilities(value);
+      const ws = new WebSocket(`ws://127.0.0.1:${port}${url}`, { origin: `http://127.0.0.1:${port}`, headers: await uiHeaders(), maxPayload:caps.maxMessageBytes, perMessageDeflate: false });
       ws.allowUplink = url === '/api/remote.mux';
       remoteWs.set(id, ws); ws.on('error', () => {});
-      ws.peerChunks = value.chunks === true;
+      configureWs(ws,caps);
       let ready = false, queuedSize = 0; const queued = [];
       const forward = (data, binary) => { try { sendWs('ws.data',id,ws,data,binary); } catch { ws.terminate(); } };
       // DSH sends an initial state snapshot immediately on upgrade. Retain
       // it until the mobile browser has completed its own local upgrade.
       ws.on('message', (data, binary) => {
         if (ready) forward(data, binary);
-        else { queuedSize += data.length; if (queuedSize > 4 * 1024 * 1024) ws.terminate(); else queued.push([data, binary]); }
+        else { queuedSize += data.length; if (queuedSize > WS_QUEUE_LIMIT) ws.terminate(); else queued.push([data, binary]); }
       });
-      ws.activate = () => { ready = true; for (const frame of queued) forward(...frame); queued.length = 0; };
-      ws.on('close', () => { partialWs.delete(ws);remoteWs.delete(id); try { tunnel.send({ type: 'ws.close', id }); } catch {} });
+      const finish = () => wsMessages.finishSend(ws,()=>{
+        dropWs(ws);remoteWs.delete(id);try{tunnel.send({type:'ws.close',id})}catch{}
+      });
+      ws.activate = () => {clearTimeout(ws.peerEndTimer);ready=true;for(const frame of queued)forward(...frame);queued.length=0;if(ws.peerEnded)finish();};
+      ws.on('close', () => {
+        ws.peerEnded=true;
+        if(ready)finish();else{ws.peerEndTimer=setTimeout(finish,15000);ws.peerEndTimer.unref();}
+      });
       let timer;
       try { await new Promise((resolve, reject) => {
         ws.once('open', resolve); ws.once('error', reject); ws.once('close', () => reject(Error('Upstream socket closed')));
         timer = setTimeout(() => { ws.terminate(); reject(Error('Upstream socket timed out')); }, 15000); timer.unref();
       }); } catch (e) { remoteWs.delete(id); ws.terminate(); throw e; } finally { clearTimeout(timer); }
-      return {chunks:ws.peerChunks};
+      return caps;
     }
-    if (action === 'ws.ready') { const ws = remoteWs.get(id); if (!ws || ws.readyState !== WebSocket.OPEN) throw Error('Socket disconnected'); ws.activate(); return {}; }
-    if (action === 'ws.close') { remoteWs.get(id)?.terminate(); remoteWs.delete(id); return {}; }
+    if (action === 'ws.ready') { const ws = remoteWs.get(id); if (!ws || ws.readyState === WebSocket.CONNECTING) throw Error('Socket disconnected'); ws.activate(); return {}; }
+    if (action === 'ws.close') { const ws=remoteWs.get(id);if(ws){dropWs(ws);ws.terminate();}remoteWs.delete(id);return {}; }
     throw Error('Invalid socket operation');
   };
   const packet = m => {
@@ -305,7 +290,7 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
       return;
     }
     const ws = localWs.get(m.id);
-    if (m.type === 'ws.close') { if(ws)partialWs.delete(ws);ws?.close(); localWs.delete(m.id); }
+    if (m.type === 'ws.close') { if(ws)wsMessages.finishReceive(ws,()=>{dropWs(ws);ws.close();localWs.delete(m.id);}); }
     if ((m.type === 'ws.data'||m.type==='ws.data.chunk') && ws?.readyState === WebSocket.OPEN) {
       receiveWs(ws,m,m.type==='ws.data.chunk');
     }
@@ -314,7 +299,7 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
   const disconnected = () => {
     for (const stream of outgoing.values()) { stream.resolveHead(); if (stream.recover) stream.recover(); else stream.res.destroy(); }
     outgoing.clear(); for (const stream of incoming.values()) { stream.req.destroy(); stream.response?.destroy(); } incoming.clear();
-    for (const ws of [...localWs.values(), ...remoteWs.values()]) { partialWs.delete(ws);ws.terminate(); } localWs.clear(); remoteWs.clear();
+    for (const ws of [...localWs.values(), ...remoteWs.values()]) { dropWs(ws);ws.terminate(); } localWs.clear(); remoteWs.clear();
   };
   tunnel.on('offline', disconnected);
   const browserTrust = req => {
@@ -373,7 +358,8 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
         }
         // Older peers return an empty begin reply; retain compatibility.
         if (!head?.status) head = await tunnel.call('http.end', { id }, 600000);
-        const html = service === 'ui' && String(head.headers['content-type']).includes('text/html');
+        const attachment = /^\s*attachment(?:\s*;|\s*$)/i.test(String(head.headers['content-disposition'] ?? ''));
+        const html = service === 'ui' && !attachment && String(head.headers['content-type']).includes('text/html');
         if (head.reused) {
           const reused = head.reused, local = reusable.get(reused.hash);
           if (!offer || !local || reused.hash !== offer.hash || reused.size !== local.length ||
@@ -409,6 +395,7 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
           res.end = () => {
             res.write = originalWrite; res.end = originalEnd;
             let body = transformHtml(Buffer.concat(parts).toString());
+            if (role === 'phone' && stream.recover) body = body.replace('</body>',quietVisibilityClient+'</body>');
             if (stream.recover) body = body.replace(/<head(?:\s[^>]*)?>/i, head => head + bootstrapRecovery);
             originalEnd(body);
           };
@@ -433,22 +420,34 @@ export function createPeerProxy(tunnel, { role, webPort = 3080, localWebPort, ui
       }
     });
     if (service === 'ui') {
-      const acceptor = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+      const acceptor = new WebSocketServer({ noServer: true, maxPayload: WS_MESSAGE_LIMIT });
       server.on('upgrade', async (req, socket, head) => {
         try {
           if (!browserTrust(req) || !tunnel.online) throw Error();
-          const id = randomUUID(), negotiated=await tunnel.call('ws.open', { id, url: req.url, chunks:true });
+          const id = randomUUID(), negotiated=await tunnel.call('ws.open', { id, url: req.url, ...wsOffer() });
           if (socket.destroyed) { void tunnel.call('ws.close', { id }).catch(() => {}); return; }
           acceptor.handleUpgrade(req, socket, head, ws => {
             localWs.set(id, ws); ws.on('error', () => {});
-            ws.peerChunks=negotiated?.chunks===true;
+            configureWs(ws,negotiated);
+            if (role === 'phone' && req.url === '/api/remote.mux') {
+              const quiet = ws.peerQuiet = createQuietSessionBridge({quietAfterMs, send: message => sendWs('ws.uplink',id,ws,Buffer.from(JSON.stringify(message)),false)});
+              const originalSend = ws.send.bind(ws);
+              ws.send = (data,options,callback) => {
+                const transformed = quiet.downlink(data,options?.binary===true);
+                if (transformed===null) { (typeof options==='function'?options:callback)?.();return; }
+                return originalSend(transformed,options,callback);
+              };
+            }
             ws.on('message', (data, binary) => {
               if (req.url !== '/api/remote.mux') { ws.close(1008, 'downlink only'); return; }
-              if (data.length > 1024 * 1024) { ws.close(1009, 'frame too large'); return; }
-              try { sendWs('ws.uplink',id,ws,data,binary); }
+              if (data.length > ws.peerMessageBytes) { ws.close(1009, 'frame too large'); return; }
+              try {
+                if(ws.peerQuiet&&!binary){let value;try{value=JSON.parse(data.toString())}catch{}if(value?.type==='dsh-peer-visibility'){if(typeof value.hidden!=='boolean')throw Error('Invalid visibility');ws.peerQuiet.visibility(value.hidden);return;}}
+                sendWs('ws.uplink',id,ws,ws.peerQuiet?.uplink(data,binary)??data,binary);
+              }
               catch { ws.terminate(); }
             });
-            ws.on('close', () => { partialWs.delete(ws);localWs.delete(id); void tunnel.call('ws.close', { id }).catch(() => {}); });
+            ws.on('close', () => { dropWs(ws);localWs.delete(id); void tunnel.call('ws.close', { id }).catch(() => {}); });
             void tunnel.call('ws.ready', { id }).catch(() => ws.terminate());
           });
         } catch { socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n'); }

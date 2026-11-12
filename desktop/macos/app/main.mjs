@@ -5,6 +5,7 @@ import path from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {Backend, existingBackend, redact, coreVersion} from './backend.mjs';
 import {externalUrl, installPopupNavigation} from './popup-navigation.mjs';
+import {createUpdateAction} from './updates.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const home = process.env.DSH_HOME || path.join(homedir(), '.dsh');
@@ -19,6 +20,7 @@ const logDirectory = path.join(app.getPath('userData'), 'logs');
 let window, backend, origin, connecting = false, quitting = false;
 const splash = path.join(here, 'splash.html');
 const log = message => appendFile(path.join(logDirectory, 'desktop.log'), `${new Date().toISOString()} ${redact(message)}\n`, {mode: 0o600}).catch(() => {});
+const checkUpdates = createUpdateAction({dialog, shell, getWindow: () => window, appVersion: app.getVersion(), coreVersion, cacheDirectory: path.join(app.getPath('userData'), 'cache'), log});
 
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
@@ -35,7 +37,7 @@ else {
   app.whenReady().then(async () => {
     await mkdir(logDirectory, {recursive: true, mode: 0o700});
     Menu.setApplicationMenu(Menu.buildFromTemplate([
-      {label: 'DSH', submenu: [{label: '关于 DSH', role: 'about'}, {type: 'separator'},
+      {label: 'DSH', submenu: [{label: '关于 DSH', role: 'about'}, {label: '检查更新…', click: checkUpdates}, {type: 'separator'},
         {label: '重新连接', click: () => connect()},
         {label: '显示数据文件夹', click: () => shell.openPath(home)},
         ...(isWindows ? [] : [{type: 'separator'}, {role: 'hide', label: '隐藏 DSH'}, {role: 'hideOthers', label: '隐藏其他'},
@@ -49,7 +51,7 @@ else {
     app.setAboutPanelOptions({applicationName: 'DSH', applicationVersion: app.getVersion(), version: 'DSH '+coreVersion, copyright: 'DSH 桌面版'});
     createWindow();
     await connect();
-  }).catch(error => { log(error.message); dialog.showErrorBox('DSH 启动失败', redact(error.message)); });
+  }).catch(error => { if (!quitting) { log(error.message); dialog.showErrorBox('DSH 启动失败', redact(error.message)); } });
 }
 
 function allowedLocal(url) {
@@ -107,7 +109,7 @@ async function connect() {
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw Error('DSH 端口配置无效。');
     if (backend?.owned) {
       const live = await existingBackend(path.resolve(home), port);
-      if (live) { origin = new URL(live.url).origin; await window.loadURL(live.url); return; }
+      if (live) { if (!quitting && window && !window.isDestroyed()) { origin = new URL(live.url).origin; await window.loadURL(live.url); } return; }
       await backend.stop();
     }
     backend = new Backend({home, runtime: path.join(resources, 'runtime'), node: path.join(resources, 'bin', isWindows ? 'node.exe' : 'node'), port, cwd: homedir(), log});
@@ -120,9 +122,10 @@ async function connect() {
     let state;
     try { state = await current.start(); }
     finally { current.off('status', progress); }
+    if (quitting || !window || window.isDestroyed()) return;
     origin = new URL(state.url).origin;
     await window.loadURL(state.url);
-    window.setTitle('DSH');
+    if (!quitting && !window.isDestroyed()) window.setTitle('DSH');
   } catch (error) {
     log(error.message);
     await showSplash('暂时无法打开 DSH', redact(error.message));

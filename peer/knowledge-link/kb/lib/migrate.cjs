@@ -30,7 +30,9 @@ function migrate(c,opts={}) {
       for(const [id,g]of groups){const fingerprint=hash(raw),key=hash('legacy\0'+id+'\0'+fingerprint+'\0'+c.signature);const {cached}=require('./store.cjs');caches.push(cached(c,key)||writeCache(c,key,g.source,{rows:g.rows,fingerprint,mtime:0,size:raw.length,warnings:[]},g.vectors,dim));}
     }
     if(!caches.length)throw new Error('旧索引为空，没有修改当前索引');
-    return commit(c,caches,dim,warnings);
+    const result=commit(c,caches,dim,warnings);
+    try{result.cleanup=require('./retention.cjs').collectLocked(c,{apply:true});}catch(e){result.cleanup={error:e.message};}
+    return result;
   }finally{release();}
 }
 module.exports={migrate};

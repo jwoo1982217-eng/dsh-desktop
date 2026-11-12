@@ -1,0 +1,8 @@
+# Bundle patch for dsh-meow-constellation.
+#
+# `dsh.bundle.patch` in package.json points here. The row below mounts the
+# plugin into the profile's layer stack; `dsh.client` in package.json is what
+# gets the browser half (lib/client.js) served and applied.
+- insert:
+    - id: meow-constellation
+      name: 'dsh-meow-constellation'

@@ -1,7 +1,7 @@
 {
   "name": "dsh-mac",
   "productName": "DSH",
-  "version": "0.1.7",
+  "version": "0.1.11",
   "private": true,
   "type": "module",
   "main": "main.mjs",

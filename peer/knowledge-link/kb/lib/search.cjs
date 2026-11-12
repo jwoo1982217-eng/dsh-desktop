@@ -1,5 +1,6 @@
 'use strict';
-const {current,shardRows}=require('./store.cjs');
+const {acquireCurrent,shardRows,cached}=require('./store.cjs');
+const path=require('node:path');
 const {discover,readSource}=require('./sources.cjs');
 const {redact}=require('./redact.cjs');
 function terms(text) {
@@ -17,12 +18,25 @@ function matches(row,opts) {return(!opts.cat||row.cat===opts.cat)&&(!opts.sub||r
 function topCount(opts) {const n=Number(opts.top||6);if(!Number.isInteger(n)||n<1||n>100)throw new Error('--top 必须为 1..100');return n;}
 async function search(c,query,opts={},embed) {
   if(!query.trim())throw new Error('查询不能为空');
-  const index=current(c);if(!index)throw new Error('尚未建库，请先运行 index');
+  const index=acquireCurrent(c);if(!index)throw new Error('尚未建库，请先运行 index');
+  try {
   if(index.manifest.signature!==c.signature)throw new Error('模型或分块配置变化，请先运行 index');
   const top=topCount(opts),dim=index.manifest.dim;
+  // Reuse the current generation's verified per-source cache for a narrow KB
+  // lookup. Its generation lease also protects these caches from reclamation.
+  let scoped;
+  if(opts['source-root']){
+    const root=path.resolve(opts['source-root']);
+    scoped=index.manifest.sources.filter(s=>typeof s.file==='string'&&(s.file===root||s.file.startsWith(root+path.sep))).map(s=>{
+      if(!/^[a-f0-9]{64}$/.test(s.key))throw Error('索引来源缓存标识无效');
+      const cache=cached(c,s.key);if(!cache||cache.dim!==dim)throw Error('知识库来源索引不可用，请重新建库');return cache;
+    });
+    if(!scoped.length)return [];
+  }
+  function* rows(){for(const part of scoped||index.manifest.shards)yield* shardRows(scoped?part.dir:index.dir,scoped?part.shard:part,dim);}
   // Corpus-specific term weights keep rare identifiers and project terms useful.
   const keys=terms(query),df=new Map(keys.map(k=>[k,0]));let total=0;
-  for(const shard of index.manifest.shards)for(const {row}of shardRows(index.dir,shard,dim))if(matches(row,opts)){total++;const text=row.text.toLowerCase();for(const key of keys)if(text.includes(key))df.set(key,df.get(key)+1);}
+  for(const {row}of rows())if(matches(row,opts)){total++;const text=row.text.toLowerCase();for(const key of keys)if(text.includes(key))df.set(key,df.get(key)+1);}
   const weights=new Map([...df].filter(([,n])=>n>0).map(([key,n])=>[key,Math.log(1+(total-n+0.5)/(n+0.5))]));
   const weightSum=[...weights.values()].reduce((s,x)=>s+x,0)||1;
   const qv=opts.lexical?null:(await embed([query],'query'))[0];
@@ -30,7 +44,7 @@ async function search(c,query,opts={},embed) {
   const qn=qv?Math.sqrt(qv.reduce((s,x)=>s+x*x,0)):1;
   if(!qn)throw new Error('查询向量不能为零');
   let best=[];
-  for(const shard of index.manifest.shards)for(const {row,bin,offset}of shardRows(index.dir,shard,dim)) {
+  for(const {row,bin,offset}of rows()) {
     if(!matches(row,opts))continue;
     const text=row.text.toLowerCase();
     const lexical=text.includes(query.toLowerCase())?1:[...weights].reduce((s,[key,w])=>s+(text.includes(key)?w:0),0)/weightSum;let cosine=0;
@@ -44,8 +58,9 @@ async function search(c,query,opts={},embed) {
   const out=[];
   for(const row of best){if(out.some(r=>r.file===row.file&&(r.text===row.text||(r.kind==='md'&&Math.abs(r.chunk-row.chunk)<=1))))continue;out.push({...row,context:[]});if(out.length>=top)break;}
   // Adjacent evidence often contains the subject or qualification of a hit.
-  for(const shard of index.manifest.shards)for(const {row}of shardRows(index.dir,shard,dim))for(const hit of out)if(row.file===hit.file && row.kind==='md' && Math.abs(row.chunk-hit.chunk)===1)hit.context.push({text:row.text,file:row.file,lineStart:row.lineStart,lineEnd:row.lineEnd,chunk:row.chunk});
+  for(const {row}of rows())for(const hit of out)if(row.file===hit.file && row.kind==='md' && Math.abs(row.chunk-hit.chunk)===1)hit.context.push({text:row.text,file:row.file,lineStart:row.lineStart,lineEnd:row.lineEnd,chunk:row.chunk});
   return out.map(row=>({...row,text:redact(row.text),context:row.context.map(x=>({...x,text:redact(x.text)}))}));
+  }finally{index.release();}
 }
 function mentions(c,query,opts={}) {
   if(!query.trim())throw new Error('查询不能为空');

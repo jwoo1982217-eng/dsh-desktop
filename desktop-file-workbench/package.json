@@ -1,0 +1,30 @@
+{
+  "name": "dsh-desktop-file-workbench",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.mjs",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22",
+    "dsh": "0.2.1-alpha.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": "0.2.1-alpha.4"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  }
+}

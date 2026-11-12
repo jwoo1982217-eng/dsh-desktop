@@ -44,14 +44,14 @@ test('real Team tools preserve explicit model routes, authority, quota and reuse
   const calls=[];let active=0,maxActive=0;
   class Fixture extends LlmAdapter {
     async resolveModel(provider,id){if(id==='unknown')throw Error('unknown fixture model');return {provider,id,name:id,contextWindow:32768,maxTokens:2048,inputModalities:['text'],...(id==='strong'?{reasoning:{efforts:[{id:'low',name:'Low'},{id:'high',name:'High'}],defaultEffort:'low'}}:{})};}
-    async *stream(o){calls.push({id:o.sessionId,provider:o.provider,model:o.model,effort:o.reasoningEffort});active++;maxActive=Math.max(maxActive,active);try{await delay(20);yield {type:'text-delta',index:0,text:'LOCAL_'+o.model};yield {type:'finish',reason:{kind:'stop'}};}finally{active--;}}
+    async *stream(o){calls.push({id:o.sessionId,provider:o.provider,model:o.model,effort:o.reasoningEffort});const child=o.sessionId!=='team-main';if(child){active++;maxActive=Math.max(maxActive,active);}try{await delay(20);yield {type:'text-delta',index:0,text:'LOCAL_'+o.model};yield {type:'finish',reason:{kind:'stop'}};}finally{if(child)active--;}}
   }
   ctx.llm.registerAdapter(['fixture'],new Fixture());
   const h=await ctx.agents.create({sessionId:'team-main',meta:{cwd:home},agentOptions:{provider:'fixture',model:'parent'}});handles.push(h);
   const parent=h.agent;
   NativeTool.apply(ctx,{provider:'spawn',modelSelectionSettings:true,toolName:'subagent'},parent.session);
   const scheduler=apply(ctx);
-  scheduler.save({...scheduler.config,minIntervalMs:0,routes:routes.map(r=>({...r,tasks:['general'],quotaGroup:'one-account'}))},0);
+  scheduler.save({...scheduler.config,delegationEnabled:true,minIntervalMs:0,routes:routes.map(r=>({...r,tasks:['general'],quotaGroup:'one-account'}))},0);
   let callNumber=0;
   const invoke=(name,args,agent=parent,signal=AbortSignal.timeout(10000))=>ctx.tools.execute({callId:'fixture-'+(++callNumber),name,arguments:args,agent,signal});
   const text=r=>r.content?.filter(b=>b.type==='text').map(b=>b.text).join('\n')??JSON.stringify(r);
@@ -115,7 +115,7 @@ test('real Team tools preserve explicit model routes, authority, quota and reuse
     const abort=new AbortController();abort.abort();const count=members().length;
     const cancelled=await invoke('spawn_teammate',{name:'cancelled-child',description:'local',prompt:'local',...routes[0]},parent,abort.signal);assert(cancelled.isError);assert.equal(members().length,count);
     const start=route=>typeof ctx.subagents.startActivation==='function'?ctx.subagents.startActivation({provider:'spawn',request:{parent,prompt:[],agentOptions:route},delivery:'caller',signal:AbortSignal.timeout(10000)}):ctx.subagents.startContinuable({provider:'spawn',request:{parent,prompt:[],agentOptions:route},signal:AbortSignal.timeout(10000)});
-    for(const route of [{provider:'fixture'},{provider:'fixture',model:'outside'}])await assert.rejects(async()=>start(route),/必须同时|授权列表/);
+    for(const route of [{provider:'fixture'},{provider:'fixture',model:'outside'}])await assert.rejects(async()=>start(route),/明确选择|必须同时|授权列表/);
     const recovered=await spawn('retryable-name',routes[0]);assert(!recovered.isError,text(recovered));await wait();
     assert(members().some(m=>m.name==='retryable-name'&&m.status==='inactive'));
     assert.equal(scheduler.status().queued.length,0);assert.equal(scheduler.status().active.length,0);

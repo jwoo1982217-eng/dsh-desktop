@@ -1,0 +1,26 @@
+{
+  "owner": "dsh-wallpaper-prewarm-patch-v1",
+  "package": "dsh-plugin-wallpaper-engine",
+  "version": "1.3.3",
+  "relativeTarget": "lib/faststart.js",
+  "before": {
+    "sha256": "9af9ceb3e8f88a8e9bb2d09713116d2379ba47d106253c5341afa4d7f73b2622",
+    "bytes": 11450
+  },
+  "after": {
+    "sha256": "90dece6d7ac7b0b007553b31cb707b95ec8ac696e5e04d089b680f0789fac4a6",
+    "bytes": 11746
+  },
+  "patchSha256": "33b7a76d554cea37db697f6533c7b121fd34ae5a8ca11805d510627453f98333",
+  "scope": "Only optional warmFaststartFavorites loop rejects final-component symlinks/non-regular/missing files via lstat; explicit playback/import/layout APIs and all settings unchanged",
+  "limits": "Not an OS sandbox or a guarantee against concurrent replacement/linked parent directories. Does not add permissions or import user media.",
+  "syntheticMp4Fixture": {
+    "path": "fixtures/ordinary.mp4",
+    "bytes": 1551,
+    "sha256": "b9e65d2f08cf8c5d1c820388c63968b6c0e657e8498dd7d8d4599c029a115c38",
+    "dimensions": "16x16",
+    "durationSeconds": 1,
+    "codec": "avc1",
+    "generation": "existing local ffmpeg, blue synthetic frame; no user media"
+  }
+}

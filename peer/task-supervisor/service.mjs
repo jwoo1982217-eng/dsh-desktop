@@ -8,7 +8,7 @@ import {caseChain} from './case-chain.mjs';
 
 export class TaskSupervisor{
  constructor(ctx,home){this.ctx=ctx;this.store=new TaskStore(home);this.experience=new Experience(ctx,this.store);this.facts=new Facts(this.store);this.continuity=new Continuity(this.store,ctx);this.live=new Map();this.reviewing=new Set();this.workAbort=new Map();this.retryTimers=new Map();this.fault='';this.closed=false;this.reviewAbort=new AbortController();
-  for(const job of this.store.jobs()){if(['复盘中','验证中'].includes(job.learning))job.learning='待重试';if(job.phase==='子代理协作'||job.nodes.some(n=>n.status==='执行中')){job.phase='主代理接管';for(const n of job.nodes.filter(n=>n.status==='执行中'||n.status==='等待')){n.status='主代理接管';n.reason='运行中断，保留原子代理身份，避免重复执行';}}this.facts.interrupt(job);this.store.put(job);this.live.set(job.id,job);}
+  for(const job of this.store.jobs()){const before=JSON.stringify(job);if(['复盘中','验证中'].includes(job.learning))job.learning='待重试';if(job.phase==='子代理协作'||job.nodes.some(n=>n.status==='执行中')){job.phase='主代理接管';for(const n of job.nodes.filter(n=>n.status==='执行中'||n.status==='等待')){n.status='主代理接管';n.reason='运行中断，保留原子代理身份，避免重复执行';}}this.facts.interrupt(job,{persist:false});if(JSON.stringify(job)!==before)this.store.put(job);this.live.set(job.id,job);}
  }
  enabled(){return !this.closed&&!this.store.frozen()&&(this.store.config.learning||this.store.config.swarm||this.store.config.continuity);}
  find(agent,turn){let owner;try{owner=ownerOf(agent);}catch{return;}return this.live.get(hash(owner.id+':'+turn));}
